@@ -24,5 +24,7 @@ else
 fi
 echo "shard $k of $n: $(wc -l < /tmp/shard.txt) of $(wc -l < /tmp/collected.txt) tests"
 mapfile -t ids < /tmp/shard.txt
+# A failed test is rerun once (pytest-rerunfailures, which Neon's own CI used with
+# --reruns 2): the rule Peat's suite is judged by reruns each failure once.
 ./scripts/pytest --junitxml="$junit" --tb=short -rA -n"$workers" --dist=loadgroup \
-  --session-timeout=10800 "${deselect[@]}" "${ids[@]}"
+  --reruns 1 --session-timeout=10800 "${deselect[@]}" "${ids[@]}"
