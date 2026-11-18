@@ -52,7 +52,19 @@ Found by Peat's replica test before publishing and published as a known defect; 
 
 **The fix** (`pgxn/neon/pagestore_smgr.c`, `neon_writev`): on 18, an unlogged write to an init fork during recovery, with no local `_init` file, takes the path 17 took. Nothing else changes: the primary, and a replica that has the local file, write it locally as before.
 
-**Tested:** `test_unlogged_init_fork_on_replica` covers an unlogged sequence, an unlogged table's `serial` column and a hash index on an unlogged table, each followed by a replica restart and one more such change replayed after it. On an arm64 Linux machine, release build: before the fix its three cases failed on 18.7 with the error above and passed on 17.8; after it they pass on both. The replica, standby and pg_regress test files (`test_unlogged`, `test_hot_standby`, `test_physical_replication`, `test_physical_and_logical_replicaiton`, `test_replica_promotes`, `test_replica_start`, `test_gin_redo`, `test_pg_regress`: 50 tests) pass on 18.7 and 17.8 with the fix. *Not tested:* identity columns and the other `ALTER SEQUENCE` forms (they reach the same redo); a replica promoted after replaying such a change, beyond what `test_replica_promotes` covers.
+**Tested:** `test_unlogged_init_fork_on_replica` covers an unlogged sequence, an unlogged table's `serial` column and a hash index on an unlogged table, each followed by a replica restart and one more such change replayed after it. On an arm64 Linux machine, release build: before the fix its three cases failed on 18.7 with the error above and passed on 17.8; after it they pass on both. The replica, standby and pg_regress test files (`test_unlogged`, `test_hot_standby`, `test_physical_replication`, `test_physical_and_logical_replicaiton`, `test_replica_promotes`, `test_replica_start`, `test_gin_redo`, `test_pg_regress`: 50 tests) pass on 18.7 and 17.8 with the fix. *Not tested:* identity columns and the other `ALTER SEQUENCE` forms (they reach the same redo). A replica promoted after replaying such a change was tested since: it is a limit Neon already had (next section).
+
+## A known limit, as in Neon: a promoted replica cannot read an unlogged table it replayed
+
+Found by `test_unlogged_serial_on_promoted_replica` (Peat's, pull request 3); **not fixed, and not Peat's**: it fails the same way on Postgres 17.8 and 18.7 from the same build.
+
+**What triggers it.** An unlogged table is created on the primary while a read replica is replaying the primary's WAL (in the test, `CREATE UNLOGGED TABLE userial (id serial, v int)`, then two rows inserted on the primary), and the replica is then promoted to primary.
+
+**What it does.** Promotion succeeds, and the promoted node serves its logged tables. Reading the unlogged table fails with `could not open file "base/N/M": No such file or directory`, where PostgreSQL would show it empty. Run, by the test: the `SELECT count(*)` on it, on both versions. Inferred and not run: inserts into it, and any other unlogged relation created while the node was a replica, would fail the same way.
+
+**Why** (read from the code, not traced): ending recovery resets every unlogged relation by copying its init fork, from the local data directory, over its main fork. A Neon replica replays an unlogged relation's creation through Neon's storage, which makes no local file, so promotion has nothing to copy, and the unlogged relation's reads look for a local main fork that was never made. A compute started afresh does not have this limit: the pageserver sends the init fork's contents as the main fork in its basebackup (`test_unlogged`). Not tested: an unlogged table that already existed when the replica started (its basebackup carries the files, so it probably works).
+
+The test is an expected failure for that error only, and not strict, so a fix will show as an unexpected pass. Fixing it is not planned in this piece.
 
 ## What has been tested
 
