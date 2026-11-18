@@ -24,7 +24,8 @@
 	branch = REL_17_STABLE_neon
 [submodule "vendor/postgres-v18"]
 	path = vendor/postgres-v18
-	# The relative URL resolves against this fork's own remote (which has no postgres repo)
-	# url = ../postgres.git
-	url = https://github.com/neondatabase/postgres.git
-	branch = REL_18_STABLE_neon
+	# Peat's Postgres 18 lives in its own repository, peat-postgres (a fork of Neon's
+	# neondatabase/postgres), published beside this one: the relative URL resolves
+	# against this repository's own remote.
+	url = ../peat-postgres.git
+	branch = REL_18_STABLE_peat
