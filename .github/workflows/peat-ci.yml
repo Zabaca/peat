@@ -85,9 +85,11 @@ jobs:
           compression-level: 0
 
       # The images' programs are built again with the default features, as Neon builds its
-      # release images: the suite's `--features testing` compiles in fail points and the
-      # HTTP API that sets them, which an image must not carry. After the pack above, since
-      # this overwrites target/release's copies of these five programs.
+      # release images: the suite's `--features testing` turns on the pageserver's test-only
+      # HTTP API (setting fail points, forcing checkpoints, marking a tenant broken and more),
+      # which an image must not carry. Fail points themselves are compiled into every build of
+      # this workspace (workspace_hack turns on fail/failpoints), Neon's release images too.
+      # After the pack above, since this overwrites target/release's copies of these programs.
       - name: Build the images' programs (default features)
         if: github.event_name != 'pull_request'
         run: mold -run cargo build --locked --release --bin storage_broker --bin storage_controller --bin safekeeper --bin pageserver --bin compute_ctl

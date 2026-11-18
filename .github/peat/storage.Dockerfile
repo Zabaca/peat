@@ -1,5 +1,5 @@
 # Peat's storage image: the four storage programs (storage broker, storage controller,
-# safekeeper, pageserver), built with the default features (no test-only fail points), and
+# safekeeper, pageserver), built with the default features (no test-only HTTP API), and
 # the part of Postgres 18 the pageserver runs itself (initdb for new timelines, postgres for
 # WAL redo, with their libraries and data files) at /usr/local/v18, where pg_distrib_dir
 # '/usr/local/' finds it, as in Neon's own image. Also sh and curl, which the lab's scripts

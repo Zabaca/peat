@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CI: pack the build context of Peat's images from a release build made with the default
-# features (not the regression suite's `--features testing`, which compiles in fail points
-# and their HTTP API): the four storage programs, compute_ctl, and Postgres 18's install
+# features (not the regression suite's `--features testing`, which turns on the pageserver's
+# test-only HTTP API and other test-only code): the four storage programs, compute_ctl, and Postgres 18's install
 # without its headers and static libraries, with debug information stripped (symbol names
 # stay, so a backtrace still names its functions). Usage: package-images.sh <out.tar.zst>
 set -euo pipefail
