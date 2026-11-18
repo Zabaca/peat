@@ -119,7 +119,7 @@ jobs:
           sudo apt-get update -q
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
             libreadline8 libicu74 libseccomp2 libpq5 zstd lsof
-          python -m pip install --quiet 'poetry==2.5.1'
+          python -m pip install --quiet --require-hashes --no-deps -r .github/peat/poetry-requirements.txt
           ./scripts/pysync
 
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
