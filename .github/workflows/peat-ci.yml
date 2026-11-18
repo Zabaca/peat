@@ -368,7 +368,9 @@ jobs:
           zstd -dc "$RUNNER_TEMP/peat-images.tar.zst" | docker load
           loaded_s=$(docker image inspect --format '{{.Id}}' peat-storage:ci)
           loaded_c=$(docker image inspect --format '{{.Id}}' peat-compute:ci)
-          test -n "$STORAGE_ID" && test -n "$COMPUTE_ID"
+          # Not "test -n a && test -n b": a failed && list does not stop a bash -e script.
+          [ -n "$STORAGE_ID" ] || { echo "::error::no checked storage image ID"; exit 1; }
+          [ -n "$COMPUTE_ID" ] || { echo "::error::no checked compute image ID"; exit 1; }
           [ "$loaded_s" = "$STORAGE_ID" ] || { echo "::error::storage image $loaded_s is not the checked $STORAGE_ID"; exit 1; }
           [ "$loaded_c" = "$COMPUTE_ID" ] || { echo "::error::compute image $loaded_c is not the checked $COMPUTE_ID"; exit 1; }
 
@@ -388,15 +390,17 @@ jobs:
           dest="$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
           docker tag peat-storage:ci "$dest/storage:$TAG"
           docker tag peat-compute:ci "$dest/compute-pg18:$TAG"
-          docker push "$dest/storage:$TAG"
-          docker push "$dest/compute-pg18:$TAG"
           {
             echo "### Published"
             echo
             echo "| Image | Tag | Digest |"
             echo "|---|---|---|"
-            for image in storage compute-pg18; do
-              digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$dest/$image:$TAG")
-              echo "| $dest/$image | $TAG | ${digest#*@} |"
-            done
           } >> "$GITHUB_STEP_SUMMARY"
+          for image in storage compute-pg18; do
+            # The digest the registry gave this push, from the push's own output.
+            out=$(docker push "$dest/$image:$TAG")
+            echo "$out"
+            digest=$(echo "$out" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | tail -1)
+            [ -n "$digest" ] || { echo "::error::no digest in the push output for $image"; exit 1; }
+            echo "| $dest/$image | $TAG | $digest |" >> "$GITHUB_STEP_SUMMARY"
+          done
