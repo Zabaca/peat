@@ -52,7 +52,9 @@ use tracing::{info, info_span};
 /// backwards-compatible changes to the metadata format.
 pub const STORAGE_FORMAT_VERSION: u16 = 3;
 
-pub const DEFAULT_PG_VERSION: PgMajorVersion = PgMajorVersion::PG17;
+/// The Postgres version of a timeline created without one. Peat: 18, the only version its
+/// storage image carries an initdb for (Neon: 17).
+pub const DEFAULT_PG_VERSION: PgMajorVersion = PgMajorVersion::PG18;
 
 // Magic constants used to identify different kinds of files
 pub const IMAGE_FILE_MAGIC: u16 = 0x5A60;

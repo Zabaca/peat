@@ -54,22 +54,42 @@ jobs:
       - name: Free disk space
         run: .github/peat/free-disk.sh
 
+      # The Rust dependencies' build, restored on every run and written only from pushes to
+      # main: a pull request (an outsider's included) restores main's cache but never writes
+      # one that main restores.
+      # Keyed by Cargo.lock and the pinned toolchain only: rust-cache's own environment key
+      # hashes every installed toolchain, and the runners' preinstalled stable one differs
+      # between runner images, so no run restored the last one's cache (runs 44332625075
+      # and 44338592127). A restore across a compiler change is safe: cargo rebuilds what
+      # another rustc built.
+      # Restored before install-deps.sh, so the nextest it downloads and checks is the one
+      # that runs, not a copy from the cache's ~/.cargo/bin.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          add-rust-environment-hash-key: false
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       - name: Install build dependencies
         run: .github/peat/install-deps.sh
 
-      # Peat builds and tests Postgres 18 only (James, 2026-11-18). What else the tree needs
-      # to compile: Postgres 17 in full, because the walproposer library the safekeeper's
-      # simulation tests link is built against 17 (Makefile, libs/walproposer/build.rs); and
-      # the headers of 14 to 16, from which postgres_ffi generates its bindings. Postgres is
-      # cached by the commits of its five trees and the build rules; the cache is only
+      # Peat builds and tests Postgres 18 only (James, 2026-11-18). The walproposer library
+      # the safekeeper's simulation tests link is built against 18 too (Makefile,
+      # libs/walproposer/build.rs; Neon builds it against 17). What else the tree needs to
+      # compile: the headers of 14 to 17, from which postgres_ffi generates its bindings.
+      # Postgres is cached by the commits of its five trees, the build rules and what else
+      # decides the build (runner image, compiler, build type); the cache is only
       # written from pushes to main, so nothing a pull request builds is restored elsewhere
       # (a pull request's own caches are confined to its merge ref anyway).
       - name: Postgres cache key
         id: pg
         run: |
           trees=$(git submodule status vendor/postgres-v14 vendor/postgres-v15 vendor/postgres-v16 vendor/postgres-v17 vendor/postgres-v18 | sha256sum | cut -c1-16)
-          rules=$(cat Makefile postgres.mk | sha256sum | cut -c1-16)
-          echo "key=postgres-18full-17full-hdr14to16-${ImageOS:-ubuntu24}-$(uname -m)-$trees-$rules" >> "$GITHUB_OUTPUT"
+          rules=$(cat Makefile postgres.mk .github/peat/install-deps.sh | sha256sum | cut -c1-16)
+          # The runner image (its system libraries), the C compiler and the build type also
+          # decide what the cached Postgres is, and it feeds the published images.
+          compiler=$( (cc --version | head -1; mold --version) | sha256sum | cut -c1-12)
+          echo "key=postgres-18full-hdr14to17-$BUILD_TYPE-${ImageOS:-unknown}-${ImageVersion:-unknown}-$(uname -m)-$compiler-$trees-$rules" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: pg-cache
@@ -80,9 +100,9 @@ jobs:
             build/v18/src/test/isolation
           key: ${{ steps.pg.outputs.key }}
 
-      - name: Build Postgres (18 and 17 in full, headers of 14 to 16)
+      - name: Build Postgres (18 in full, headers of 14 to 17)
         if: steps.pg-cache.outputs.cache-hit != 'true'
-        run: mold -run make -j"$(nproc)" postgres-install-v18 postgres-install-v17 postgres-headers-install
+        run: mold -run make -j"$(nproc)" postgres-install-v18 postgres-headers-install
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.pg-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -93,20 +113,6 @@ jobs:
             build/v18/src/test/isolation
           key: ${{ steps.pg.outputs.key }}
 
-      # The Rust dependencies' build, restored on every run and written only from pushes to
-      # main: a pull request (an outsider's included) restores main's cache but never writes
-      # one that main restores.
-      # Keyed by Cargo.lock and the pinned toolchain only: rust-cache's own environment key
-      # hashes every installed toolchain, and the runners' preinstalled stable one differs
-      # between runner images, so no run restored the last one's cache (runs 44332625075
-      # and 44338592127). A restore across a compiler change is safe: cargo rebuilds what
-      # another rustc built.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          add-rust-environment-hash-key: false
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-
       - name: Build (Neon, Neon's extension for 18, walproposer, Rust test binaries)
         run: |
           mold -run make -j"$(nproc)" PG_INSTALL_CACHED=1 neon neon-pg-ext-v18 CARGO_BUILD_FLAGS="$CARGO_FLAGS"
@@ -114,13 +120,15 @@ jobs:
           mold -run cargo build "${flags[@]}" --release --tests
           df -h /
 
-      # Twelve Rust tests run Postgres 14's to 16's programs, which Peat no longer builds:
-      # wal_craft's WAL crafting for 14 to 16 (nine; 17's and 18's run) and three of the
-      # pageserver's walredo tests, written against 14. They are left out here, not removed.
+      # Fourteen Rust tests run programs of Postgres 14 to 17, which Peat does not build:
+      # wal_craft's WAL crafting for 14 to 17 (twelve; 18's run) and the pageserver's two
+      # short walredo tests, whose WAL records and expected page were made on 14 (18 rejects
+      # those records). They are left out here, not removed. walredo's ping and stderr tests
+      # run on 18.
       - name: Rust tests
         run: |
           read -ra flags <<< "$CARGO_FLAGS"
-          old_pg='(package(wal_craft) & test(/^v1[456]::xlog_utils_test::test_find_end_of_wal/)) | (package(pageserver) & test(/^walredo::tests::(test_ping|short_v14_redo|short_v14_fails_for_wrong_key_but_returns_zero_page)$/))'
+          old_pg='(package(wal_craft) & test(/^v1[4567]::xlog_utils_test::test_find_end_of_wal/)) | (package(pageserver) & test(/^walredo::tests::(short_v14_redo|short_v14_fails_for_wrong_key_but_returns_zero_page)$/))'
           cargo nextest run "${flags[@]}" --release --no-fail-fast -E "!package(pageserver) & !binary(test_real_gcs) & !($old_pg)"
           cargo nextest run "${flags[@]}" --release --no-fail-fast -E "package(pageserver) & !($old_pg)"
           cargo test --doc "${flags[@]}" --release
@@ -360,7 +368,9 @@ jobs:
           zstd -dc "$RUNNER_TEMP/peat-images.tar.zst" | docker load
           loaded_s=$(docker image inspect --format '{{.Id}}' peat-storage:ci)
           loaded_c=$(docker image inspect --format '{{.Id}}' peat-compute:ci)
-          test -n "$STORAGE_ID" && test -n "$COMPUTE_ID"
+          # Not "test -n a && test -n b": a failed && list does not stop a bash -e script.
+          [ -n "$STORAGE_ID" ] || { echo "::error::no checked storage image ID"; exit 1; }
+          [ -n "$COMPUTE_ID" ] || { echo "::error::no checked compute image ID"; exit 1; }
           [ "$loaded_s" = "$STORAGE_ID" ] || { echo "::error::storage image $loaded_s is not the checked $STORAGE_ID"; exit 1; }
           [ "$loaded_c" = "$COMPUTE_ID" ] || { echo "::error::compute image $loaded_c is not the checked $COMPUTE_ID"; exit 1; }
 
@@ -380,15 +390,17 @@ jobs:
           dest="$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
           docker tag peat-storage:ci "$dest/storage:$TAG"
           docker tag peat-compute:ci "$dest/compute-pg18:$TAG"
-          docker push "$dest/storage:$TAG"
-          docker push "$dest/compute-pg18:$TAG"
           {
             echo "### Published"
             echo
             echo "| Image | Tag | Digest |"
             echo "|---|---|---|"
-            for image in storage compute-pg18; do
-              digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$dest/$image:$TAG")
-              echo "| $dest/$image | $TAG | ${digest#*@} |"
-            done
           } >> "$GITHUB_STEP_SUMMARY"
+          for image in storage compute-pg18; do
+            # The digest the registry gave this push, from the push's own output.
+            out=$(docker push "$dest/$image:$TAG")
+            echo "$out"
+            digest=$(echo "$out" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | tail -1)
+            [ -n "$digest" ] || { echo "::error::no digest in the push output for $image"; exit 1; }
+            echo "| $dest/$image | $TAG | $digest |" >> "$GITHUB_STEP_SUMMARY"
+          done

@@ -22,8 +22,14 @@ ExceptionalCondition(const char *conditionName,
 	exit(1);
 }
 
+/* Since Postgres 18 (upstream 454c182f85) libpq/pqformat.h declares the buffer as void *. */
+#if PG_MAJORVERSION_NUM >= 18
+void
+pq_copymsgbytes(StringInfo msg, void *buf, int datalen)
+#else
 void
 pq_copymsgbytes(StringInfo msg, char *buf, int datalen)
+#endif
 {
 	if (datalen < 0 || datalen > (msg->len - msg->cursor))
 		ExceptionalCondition("insufficient data left in message", __FILE__, __LINE__);
