@@ -280,8 +280,8 @@ jobs:
           REPO: ghcr.io/${{ github.repository }}
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
         run: |
-          repo="$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
-          docker tag peat-storage:ci "$repo/storage:$TAG"
-          docker tag peat-compute:ci "$repo/compute-pg18:$TAG"
-          docker push "$repo/storage:$TAG"
-          docker push "$repo/compute-pg18:$TAG"
+          dest="$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
+          docker tag peat-storage:ci "$dest/storage:$TAG"
+          docker tag peat-compute:ci "$dest/compute-pg18:$TAG"
+          docker push "$dest/storage:$TAG"
+          docker push "$dest/compute-pg18:$TAG"
