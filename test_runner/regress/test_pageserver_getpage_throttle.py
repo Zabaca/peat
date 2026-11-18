@@ -8,7 +8,6 @@ import pytest
 from anyio import Path
 from fixtures.common_types import TenantId, TimelineId
 from fixtures.log_helper import log
-from fixtures.pg_version import PgVersion
 from fixtures.utils import wait_until
 
 if TYPE_CHECKING:
@@ -48,7 +47,8 @@ def test_pageserver_getpage_throttle(neon_env_builder: NeonEnvBuilder, pg_bin: P
 
     ps_http = env.pageserver.http_client()
 
-    ps_http.timeline_create(PgVersion.V16, tenant_id, timeline_id)
+    # Peat builds Postgres 18 only; the test's version (any one would do) is the run's.
+    ps_http.timeline_create(env.pg_version, tenant_id, timeline_id)
 
     def run_pagebench_at_max_speed_and_get_total_requests_completed(duration_secs: int):
         cmd = [

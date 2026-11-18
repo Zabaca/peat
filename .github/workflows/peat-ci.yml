@@ -57,10 +57,52 @@ jobs:
       - name: Install build dependencies
         run: .github/peat/install-deps.sh
 
-      - name: Build (Neon, Postgres 14 to 18, walproposer, Rust test binaries)
+      # Peat builds and tests Postgres 18 only (James, 2026-11-18). What else the tree needs
+      # to compile: Postgres 17 in full, because the walproposer library the safekeeper's
+      # simulation tests link is built against 17 (Makefile, libs/walproposer/build.rs); and
+      # the headers of 14 to 16, from which postgres_ffi generates its bindings. Postgres is
+      # cached by the commits of its five trees and the build rules; the cache is only
+      # written from pushes to main, so nothing a pull request builds is restored elsewhere
+      # (a pull request's own caches are confined to its merge ref anyway).
+      - name: Postgres cache key
+        id: pg
         run: |
-          mold -run make all -j"$(nproc)" CARGO_BUILD_FLAGS="$CARGO_FLAGS"
-          mold -run make walproposer-lib -j"$(nproc)"
+          trees=$(git submodule status vendor/postgres-v14 vendor/postgres-v15 vendor/postgres-v16 vendor/postgres-v17 vendor/postgres-v18 | sha256sum | cut -c1-16)
+          rules=$(cat Makefile postgres.mk | sha256sum | cut -c1-16)
+          echo "key=postgres-18full-17full-hdr14to16-${ImageOS:-ubuntu24}-$(uname -m)-$trees-$rules" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: pg-cache
+        with:
+          path: |
+            pg_install
+            build/v18/src/test/regress
+            build/v18/src/test/isolation
+          key: ${{ steps.pg.outputs.key }}
+
+      - name: Build Postgres (18 and 17 in full, headers of 14 to 16)
+        if: steps.pg-cache.outputs.cache-hit != 'true'
+        run: mold -run make -j"$(nproc)" postgres-install-v18 postgres-install-v17 postgres-headers-install
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.pg-cache.outputs.cache-hit != 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+        with:
+          path: |
+            pg_install
+            build/v18/src/test/regress
+            build/v18/src/test/isolation
+          key: ${{ steps.pg.outputs.key }}
+
+      # The Rust dependencies' build, restored on every run and written only from pushes to
+      # main: a pull request (an outsider's included) restores main's cache but never writes
+      # one that main restores.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+
+      - name: Build (Neon, Neon's extension for 18, walproposer, Rust test binaries)
+        run: |
+          mold -run make -j"$(nproc)" PG_INSTALL_CACHED=1 neon neon-pg-ext-v18 CARGO_BUILD_FLAGS="$CARGO_FLAGS"
           read -ra flags <<< "$CARGO_FLAGS"
           mold -run cargo build "${flags[@]}" --release --tests
           df -h /
