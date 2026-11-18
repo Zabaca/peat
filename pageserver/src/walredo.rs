@@ -645,7 +645,7 @@ mod tests {
         let h = RedoHarness::new().unwrap();
 
         h.manager
-            .ping(PgMajorVersion::PG14)
+            .ping(PgMajorVersion::PG18)
             .instrument(h.span())
             .await
             .expect("ping should work");
@@ -722,7 +722,7 @@ mod tests {
                 Lsn::INVALID,
                 None,
                 short_records(),
-                PgMajorVersion::PG16, /* 16 currently produces stderr output on startup, which adds a nice extra edge */
+                PgMajorVersion::PG18, /* Peat builds 18 only; Neon used 16 here, which printed to stderr on startup */
                 RedoAttemptType::ReadPage,
             )
             .instrument(h.span())

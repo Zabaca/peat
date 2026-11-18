@@ -142,14 +142,15 @@ neon-pg-ext-%: postgres-install-% cargo-target-dir
 # they depend on openssl and other libraries that are not included in our
 # Rust build.
 .PHONY: walproposer-lib
-walproposer-lib: neon-pg-ext-v17
+# Peat: built against Postgres 18, the only version Peat builds in full (Neon: 17).
+walproposer-lib: neon-pg-ext-v18
 	+@echo "Compiling walproposer-lib"
 	mkdir -p $(BUILD_DIR)/walproposer-lib
-	$(MAKE) PG_CONFIG=$(POSTGRES_INSTALL_DIR)/v17/bin/pg_config COPT='$(COPT)' \
+	$(MAKE) PG_CONFIG=$(POSTGRES_INSTALL_DIR)/v18/bin/pg_config COPT='$(COPT)' \
 		-C $(BUILD_DIR)/walproposer-lib \
 		-f $(ROOT_PROJECT_DIR)/pgxn/neon/Makefile walproposer-lib
-	cp $(POSTGRES_INSTALL_DIR)/v17/lib/libpgport.a $(BUILD_DIR)/walproposer-lib
-	cp $(POSTGRES_INSTALL_DIR)/v17/lib/libpgcommon.a $(BUILD_DIR)/walproposer-lib
+	cp $(POSTGRES_INSTALL_DIR)/v18/lib/libpgport.a $(BUILD_DIR)/walproposer-lib
+	cp $(POSTGRES_INSTALL_DIR)/v18/lib/libpgcommon.a $(BUILD_DIR)/walproposer-lib
 	$(AR) d $(BUILD_DIR)/walproposer-lib/libpgport.a \
 		pg_strong_random.o
 	$(AR) d $(BUILD_DIR)/walproposer-lib/libpgcommon.a \

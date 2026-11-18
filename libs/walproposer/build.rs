@@ -7,7 +7,9 @@ use std::process::Command;
 
 use anyhow::{Context, anyhow};
 
-const WALPROPOSER_PG_VERSION: &str = "v17";
+// Peat: 18, the only version Peat builds in full (Neon: 17); keep it equal to the
+// Makefile's walproposer-lib.
+const WALPROPOSER_PG_VERSION: &str = "v18";
 
 fn main() -> anyhow::Result<()> {
     // Tell cargo to invalidate the built crate whenever the wrapper changes
