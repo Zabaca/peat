@@ -61,9 +61,6 @@ jobs:
         run: |
           mold -run make all -j"$(nproc)" CARGO_BUILD_FLAGS="$CARGO_FLAGS"
           mold -run make walproposer-lib -j"$(nproc)"
-          # The Postgres build trees (about 4.5 GB) are not needed once installed;
-          # build/walproposer-lib stays: the walproposer crate links it.
-          rm -rf build/v1* build/pgxn-v1*
           mold -run cargo build $CARGO_FLAGS --release --tests
           df -h /
 
