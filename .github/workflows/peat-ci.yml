@@ -107,11 +107,15 @@ jobs:
           mold -run cargo build "${flags[@]}" --release --tests
           df -h /
 
+      # Twelve Rust tests run Postgres 14's to 16's programs, which Peat no longer builds:
+      # wal_craft's WAL crafting for 14 to 16 (nine; 17's and 18's run) and three of the
+      # pageserver's walredo tests, written against 14. They are left out here, not removed.
       - name: Rust tests
         run: |
           read -ra flags <<< "$CARGO_FLAGS"
-          cargo nextest run "${flags[@]}" --release --no-fail-fast -E '!package(pageserver) & !binary(test_real_gcs)'
-          cargo nextest run "${flags[@]}" --release --no-fail-fast -E 'package(pageserver)'
+          old_pg='(package(wal_craft) & test(/^v1[456]::xlog_utils_test::test_find_end_of_wal/)) | (package(pageserver) & test(/^walredo::tests::(test_ping|short_v14_redo|short_v14_fails_for_wrong_key_but_returns_zero_page)$/))'
+          cargo nextest run "${flags[@]}" --release --no-fail-fast -E "!package(pageserver) & !binary(test_real_gcs) & !($old_pg)"
+          cargo nextest run "${flags[@]}" --release --no-fail-fast -E "package(pageserver) & !($old_pg)"
           cargo test --doc "${flags[@]}" --release
 
       - name: Pack the binaries for the regression suite
