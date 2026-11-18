@@ -2,55 +2,46 @@ name: Lint GitHub Workflows
 
 on:
   push:
-    branches:
-      - main
-      - release
+    branches: [ main ]
     paths:
       - '.github/workflows/*.ya?ml'
+      - '.github/actionlint.yml'
   pull_request:
     paths:
       - '.github/workflows/*.ya?ml'
+      - '.github/actionlint.yml'
+
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check-permissions:
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'run-no-ci') }}
-    uses: ./.github/workflows/check-permissions.yml
-    with:
-      github-event-name: ${{ github.event_name}}
-
   actionlint:
-    needs: [ check-permissions ]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@4d991eb9b905ef189e4c376166672c3f2f230481 # v2.11.0
-        with:
-          egress-policy: audit
-
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: reviewdog/action-actionlint@a5524e1c19e62881d79c1f1b9b6f09f16356e281 # v1.65.2
-        env:
-          # SC2046 - Quote this to prevent word splitting. - https://www.shellcheck.net/wiki/SC2046
-          # SC2086 - Double quote to prevent globbing and word splitting. - https://www.shellcheck.net/wiki/SC2086
-          SHELLCHECK_OPTS: --exclude=SC2046,SC2086
         with:
-          fail_level: error
-          filter_mode: nofilter
-          level: error
+          persist-credentials: false
 
-      - name: Disallow 'ubuntu-latest' runners
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.7
+          # SC2046 and SC2086 (unquoted expansions) are allowed, as in upstream Neon.
+          SHELLCHECK_OPTS: --exclude=SC2046,SC2086
         run: |
-          PAT='^\s*runs-on:.*-latest'
-          if grep -ERq $PAT .github/workflows; then
-            grep -ERl $PAT .github/workflows |\
-            while read -r f
-            do
-              l=$(grep -nE $PAT $f | awk -F: '{print $1}' | head -1)
-              echo "::error file=$f,line=$l::Please use 'ubuntu-22.04' instead of 'ubuntu-latest'"
-            done
+          curl -sSLo actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
+      - name: Workflows run only on GitHub-hosted runners
+        run: |
+          if grep -nE '^\s*runs-on:.*self-hosted' .github/workflows/*.yml; then
+            echo "::error::A workflow asks for a self-hosted runner; this repository has none"
             exit 1
           fi

@@ -1,0 +1,6 @@
+# Tests that each need most of a hosted runner's disk to themselves, so they run one at a
+# time in a job of their own instead of in a shard. Node id prefixes, one per line.
+# Measured on Postgres 18.7, release, alone: each variant's test output peaked at about
+# 12 GB (12.0 GB logged for v1; v2 about the same); Neon's pageserver fails its log check when its
+# filesystem is over 80% full, so it needs a filesystem of at least 15 GB.
+test_runner/regress/test_pg_regress.py::test_tx_abort_with_many_relations
