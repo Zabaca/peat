@@ -85,7 +85,9 @@ jobs:
           compression-level: 0
 
   regress:
-    name: regression suite, Postgres 18, ${{ matrix.shard == 'solo' && 'solo tests' || format('shard {0}', matrix.shard) }}
+    # No expression in the name: GitHub does not evaluate a skipped job's name (pull requests
+    # skip this job), and appends the shard (1 to 8, or solo) to a plain one.
+    name: regression suite, Postgres 18
     needs: [ build ]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
