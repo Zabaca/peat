@@ -61,14 +61,16 @@ jobs:
         run: |
           mold -run make all -j"$(nproc)" CARGO_BUILD_FLAGS="$CARGO_FLAGS"
           mold -run make walproposer-lib -j"$(nproc)"
-          mold -run cargo build $CARGO_FLAGS --release --tests
+          read -ra flags <<< "$CARGO_FLAGS"
+          mold -run cargo build "${flags[@]}" --release --tests
           df -h /
 
       - name: Rust tests
         run: |
-          cargo nextest run $CARGO_FLAGS --release --no-fail-fast -E '!package(pageserver) & !binary(test_real_gcs)'
-          cargo nextest run $CARGO_FLAGS --release --no-fail-fast -E 'package(pageserver)'
-          cargo test --doc $CARGO_FLAGS --release
+          read -ra flags <<< "$CARGO_FLAGS"
+          cargo nextest run "${flags[@]}" --release --no-fail-fast -E '!package(pageserver) & !binary(test_real_gcs)'
+          cargo nextest run "${flags[@]}" --release --no-fail-fast -E 'package(pageserver)'
+          cargo test --doc "${flags[@]}" --release
 
       - name: Pack the binaries for the regression suite
         if: github.event_name != 'pull_request'
@@ -203,6 +205,6 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}/storage
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
         run: |
-          image="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
-          docker build -f .github/peat/storage.Dockerfile -t "$image:$TAG" "$RUNNER_TEMP/image"
-          docker push "$image:$TAG"
+          ref="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]'):$TAG"
+          docker build -f .github/peat/storage.Dockerfile -t "$ref" "$RUNNER_TEMP/image"
+          docker push "$ref"
