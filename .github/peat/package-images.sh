@@ -14,6 +14,10 @@ done
 cp -a pg_install/v18 "$stage/pg/v18"
 rm -rf "$stage/pg/v18/include"
 rm -f "$stage/pg/v18"/lib/*.a
+# neon_test_utils is a test extension marked trusted: a database owner could create it and
+# crash or stall the compute (trigger_panic, test_consume_memory and others). The suite's
+# build keeps it; the images leave it out.
+rm -f "$stage/pg/v18"/lib/postgresql/neon_test_utils.so "$stage/pg/v18"/share/postgresql/extension/neon_test_utils[.-]*
 find "$stage/bin" "$stage/pg" -type f -print0 | while IFS= read -r -d '' f; do
   if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' ')" = 7f454c46 ]; then
     strip --strip-debug "$f"

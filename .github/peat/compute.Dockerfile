@@ -23,7 +23,7 @@ RUN apt-get update \
  && mkdir -p -m 0750 /var/db/postgres/compute \
  && mkdir -p /var/db/postgres/specs /usr/local/download_extensions \
  && chown -R postgres:postgres /var/db/postgres /usr/local/download_extensions \
- && mkdir -p -m 777 /neon/cache
+ && install -d -o postgres -g postgres -m 0700 /neon/cache
 COPY pg/v18/bin /usr/local/bin
 COPY pg/v18/lib /usr/local/lib
 COPY pg/v18/share /usr/local/share
