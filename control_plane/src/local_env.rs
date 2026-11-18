@@ -28,9 +28,6 @@ use crate::endpoint_storage::{
 use crate::pageserver::{PAGESERVER_REMOTE_STORAGE_DIR, PageServerNode};
 use crate::safekeeper::SafekeeperNode;
 
-// Peat: 18, the only version Peat builds (Neon: 17).
-pub const DEFAULT_PG_VERSION: u32 = 18;
-
 //
 // This data structures represents neon_local CLI config
 //
