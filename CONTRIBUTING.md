@@ -19,6 +19,7 @@ What it means here:
 - **A test that fails twice** fails its shard, and the change does not merge.
 - **A test that passed only on its rerun** is read before the change merges. If its first error could come from the change, or the test touches what the change touches, it is run again on 18 and on the previous major from the same build (as the port's own gate was), and it counts as a failure if it fails on 18 only.
 - **A test that keeps being rerun** across runs, on changes that do not touch it, gets a follow-up: an allowance with its reason, a fix, or a note in the README, rather than reruns forever.
+- **A job rerun by hand** (GitHub's "Re-run failed jobs") is another attempt, and is read like a rerun: it is done only by a maintainer (someone with write access to this repository, including the agents working for Zabaca), only after the failed attempt has been read and its failing tests judged not to come from the change, at most once per run, and it is listed in the pull request with the tests that failed and why they are not the change's. The failed attempt's summary, warnings and artifacts stay on the run. If the same test fails again in the hand rerun, the change does not merge.
 
 ## Pull requests from outside
 
