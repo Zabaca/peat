@@ -84,6 +84,26 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+      # The images' programs are built again with the default features, as Neon builds its
+      # release images: the suite's `--features testing` compiles in fail points and the
+      # HTTP API that sets them, which an image must not carry. After the pack above, since
+      # this overwrites target/release's copies of these five programs.
+      - name: Build the images' programs (default features)
+        if: github.event_name != 'pull_request'
+        run: mold -run cargo build --locked --release --bin storage_broker --bin storage_controller --bin safekeeper --bin pageserver --bin compute_ctl
+
+      - name: Pack the images' build context
+        if: github.event_name != 'pull_request'
+        run: .github/peat/package-images.sh "$RUNNER_TEMP/peat-images-arm64.tar.zst"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          name: peat-images-arm64
+          path: ${{ runner.temp }}/peat-images-arm64.tar.zst
+          retention-days: 7
+          compression-level: 0
+
   regress:
     name: regression suite, Postgres 18, ${{ matrix.shard == 'solo' && 'solo tests' || format('shard {0}', matrix.shard) }}
     needs: [ build ]
@@ -163,12 +183,62 @@ jobs:
           path: ${{ runner.temp }}/results
           retention-days: 7
 
+  # The images are built and checked on every run but a pull request's, and saved as an
+  # artifact; the job after it pushes exactly those images.
+  images:
+    name: build and check the images (arm64)
+    needs: [ build ]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: peat-images-arm64
+          path: ${{ runner.temp }}
+
+      - name: Unpack the build context
+        run: |
+          mkdir -p "$RUNNER_TEMP/ctx"
+          zstd -dc "$RUNNER_TEMP/peat-images-arm64.tar.zst" | tar -C "$RUNNER_TEMP/ctx" -xf -
+          cat "$RUNNER_TEMP/ctx/PROVENANCE"
+
+      - name: Build the images
+        run: |
+          for image in storage compute; do
+            docker build --build-arg REVISION="$GITHUB_SHA" \
+              -f ".github/peat/$image.Dockerfile" -t "peat-$image:ci" "$RUNNER_TEMP/ctx"
+          done
+          docker image ls 'peat-*'
+
+      - name: Check the images
+        run: .github/peat/check-images.sh peat-storage:ci peat-compute:ci
+
+      - name: Save the images
+        run: |
+          mkdir -p "$RUNNER_TEMP/images"
+          docker save peat-storage:ci peat-compute:ci | zstd -T0 -3 -q -o "$RUNNER_TEMP/images/peat-images.tar.zst"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: peat-images-docker-arm64
+          path: ${{ runner.temp }}/images/peat-images.tar.zst
+          retention-days: 1
+          compression-level: 0
+
   # Images are published only from this repository's own merges to main and release tags,
-  # never from a pull request, and only once the PUBLISH_IMAGES repository variable is
-  # set to 'true'. This is the only job whose token can write (to the package registry).
-  publish-storage-image:
-    name: publish the storage image (arm64)
-    needs: [ build, regress ]
+  # never from a pull request or a manual run, only after the regression suite passed, and
+  # only once the PUBLISH_IMAGES repository variable is 'true'. This is the only job whose
+  # token can write (to the package registry). Names and tags: README.md, "Images".
+  publish-images:
+    name: publish the images (arm64)
+    needs: [ images, regress ]
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release-')) &&
@@ -179,20 +249,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: peat-release-arm64
+          name: peat-images-docker-arm64
           path: ${{ runner.temp }}
 
-      - name: Unpack the binaries
-        run: |
-          mkdir -p "$RUNNER_TEMP/image"
-          zstd -dc "$RUNNER_TEMP/peat-release-arm64.tar.zst" | tar -C "$RUNNER_TEMP/image" -xf -
-          cp LICENSE NOTICE "$RUNNER_TEMP/image/"
+      - name: Load the checked images
+        run: zstd -dc "$RUNNER_TEMP/peat-images.tar.zst" | docker load
 
       - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
@@ -200,11 +263,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      # ghcr.io/zabaca/peat/storage and ghcr.io/zabaca/peat/compute-pg18, tagged with the
+      # full commit hash on a merge to main, or with the release tag's name.
+      - name: Push
         env:
-          IMAGE: ghcr.io/${{ github.repository }}/storage
+          REPO: ghcr.io/${{ github.repository }}
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
         run: |
-          ref="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]'):$TAG"
-          docker build -f .github/peat/storage.Dockerfile -t "$ref" "$RUNNER_TEMP/image"
-          docker push "$ref"
+          repo="$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
+          docker tag peat-storage:ci "$repo/storage:$TAG"
+          docker tag peat-compute:ci "$repo/compute-pg18:$TAG"
+          docker push "$repo/storage:$TAG"
+          docker push "$repo/compute-pg18:$TAG"
