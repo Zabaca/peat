@@ -59,58 +59,63 @@ def test_unlogged(neon_simple_env: NeonEnv):
 
 
 #
-# A read replica replays an unlogged sequence's init fork. Since PostgreSQL 18.7
-# (upstream 62760571307) sequence redo flushes that init-fork page at once; on a
-# Neon replica the flush goes through Neon's storage manager. The replica must
-# replay it and keep serving reads. Unlogged sequences exist from v15.
+# A read replica replays the init fork of an unlogged relation. Since PostgreSQL 18.7
+# (upstream 62760571307) sequence redo flushes an unlogged sequence's init-fork page at
+# once, and the hash index's init-page redo does the same; since v18 Neon flushes
+# init-fork buffers as unlogged, that is to a local file, which a replica never created.
+# The replica must replay each case, keep serving reads, and come back after a restart.
+# Unlogged sequences exist from v15.
 #
-class ReplicaInitForkDefect(Exception):
-    """The known Peat 18.7 defect: the replica died on a missing local _init file."""
-
-
-def test_unlogged_sequence_on_replica(neon_simple_env: NeonEnv, request: pytest.FixtureRequest):
+@pytest.mark.parametrize("case", ["sequence", "serial", "hash_index"])
+def test_unlogged_init_fork_on_replica(neon_simple_env: NeonEnv, case: str):
     env = neon_simple_env
-    if env.pg_version <= PgVersion.V14:
-        return
-    if env.pg_version >= PgVersion.V18:
-        # A known defect of Peat's Postgres 18.7, found by this test (see README.md):
-        # the replica's startup process fails with 'could not open file
-        # "base/N/M_init"' when it replays the sequence's init-fork flush, and the
-        # replica goes down. 17 passes. Only that failure counts as expected: any
-        # other failure of this test still fails it.
-        request.node.add_marker(
-            pytest.mark.xfail(
-                strict=True,
-                raises=ReplicaInitForkDefect,
-                reason="Peat 18.7: a replica dies replaying an unlogged sequence's init-fork flush",
-            )
-        )
+    if case != "hash_index" and env.pg_version <= PgVersion.V14:
+        pytest.skip("unlogged sequences exist from v15")
 
     primary = env.endpoints.create_start("main", endpoint_id="primary")
     replica = env.endpoints.new_replica_start(origin=primary, endpoint_id="replica")
 
     pcur = primary.connect().cursor()
     pcur.execute("CREATE TABLE logged_marker (id int)")
-    pcur.execute("CREATE UNLOGGED SEQUENCE useq")
-    pcur.execute("SELECT nextval('useq'), nextval('useq'), nextval('useq')")
-    pcur.execute("ALTER SEQUENCE useq RESTART WITH 100")
-    pcur.execute("SELECT nextval('useq')")
-    assert pcur.fetchone() == (100,)
+    if case == "sequence":
+        # Creation writes the init fork; RESTART rewrites the sequence.
+        pcur.execute("CREATE UNLOGGED SEQUENCE useq")
+        pcur.execute("SELECT nextval('useq')")
+        pcur.execute("ALTER SEQUENCE useq RESTART WITH 100")
+        relname = "useq"
+    elif case == "serial":
+        # A serial column of an unlogged table makes an unlogged sequence;
+        # TRUNCATE ... RESTART IDENTITY rewrites it.
+        pcur.execute("CREATE UNLOGGED TABLE userial (id serial, v int)")
+        pcur.execute("INSERT INTO userial (v) VALUES (1), (2)")
+        pcur.execute("TRUNCATE userial RESTART IDENTITY")
+        relname = "userial_id_seq"
+    else:
+        pcur.execute("CREATE UNLOGGED TABLE uhash (v int)")
+        pcur.execute("CREATE INDEX uhash_idx ON uhash USING hash (v)")
+        relname = "uhash_idx"
     pcur.execute("INSERT INTO logged_marker VALUES (1)")
 
-    try:
+    def replica_serves() -> None:
         wait_replica_caughtup(primary, replica)
         rcur = replica.connect().cursor()
         rcur.execute("SELECT count(*) FROM logged_marker")
         assert rcur.fetchone() == (1,)
-        rcur.execute("SELECT relpersistence FROM pg_class WHERE relname = 'useq'")
+        rcur.execute("SELECT relpersistence FROM pg_class WHERE relname = %s", (relname,))
         assert rcur.fetchone() == ("u",)
-    except Exception as e:
-        found = replica.log_contains(r'could not open file "base/\d+/\d+_init"')
-        if found is not None:
-            raise ReplicaInitForkDefect(found[0].strip()) from e
-        raise
 
-    # The primary's sequence still works after the replica replayed it.
-    pcur.execute("SELECT nextval('useq')")
-    assert pcur.fetchone() == (101,)
+    replica_serves()
+    assert replica.log_contains(r'could not open file "base/\d+/\d+_init"') is None
+
+    # The replica comes back after a restart, and replays the next such change too.
+    replica.stop()
+    replica.start()
+    if case == "hash_index":
+        pcur.execute("CREATE INDEX uhash_idx2 ON uhash USING hash (v)")
+    else:
+        pcur.execute("CREATE UNLOGGED SEQUENCE useq2")
+    pcur.execute("INSERT INTO logged_marker VALUES (2)")
+    wait_replica_caughtup(primary, replica)
+    rcur = replica.connect().cursor()
+    rcur.execute("SELECT count(*) FROM logged_marker")
+    assert rcur.fetchone() == (2,)

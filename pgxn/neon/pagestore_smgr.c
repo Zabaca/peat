@@ -1735,9 +1735,31 @@ neon_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			break;
 
 		case RELPERSISTENCE_TEMP:
-		case RELPERSISTENCE_UNLOGGED:
 			mdwritev(reln, forknum, blkno, buffers, nblocks, skipFsync);
 			return;
+
+		case RELPERSISTENCE_UNLOGGED:
+#if PG_MAJORVERSION_NUM >= 18
+			/*
+			 * Since v18, FlushBuffer() writes every init-fork buffer as
+			 * unlogged. On a hot-standby replica, redo can dirty an init-fork
+			 * page that has no local file: the redo filter hands back a zeroed
+			 * buffer for a page the replica has not cached, and redo's
+			 * smgrcreate() opened the relation as permanent, which makes no
+			 * local file. PostgreSQL 18.7's sequence redo (and the hash
+			 * index's init-page redo) then flushes it at once, and writing to
+			 * the missing local file would stop the startup process. Before
+			 * v18, FlushBuffer() opened the relation with unknown persistence
+			 * (case 0 above), which found no local file and took the path
+			 * below; do the same here.
+			 */
+			if (forknum == INIT_FORKNUM && RecoveryInProgress() &&
+				!mdexists(reln, INIT_FORKNUM))
+				break;
+#endif
+			mdwritev(reln, forknum, blkno, buffers, nblocks, skipFsync);
+			return;
+
 		default:
 			neon_log(ERROR, "unknown relpersistence '%c'", reln->smgr_relpersistence);
 	}
