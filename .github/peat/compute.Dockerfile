@@ -18,6 +18,7 @@ RUN apt-get update \
       ca-certificates libcurl4t64 libicu74 libldap2 libgssapi-krb5-2 liblz4-1 \
       libreadline8t64 libseccomp2 libssl3t64 libxml2 libzstd1 zlib1g \
  && rm -rf /var/lib/apt/lists/* \
+ && userdel --remove ubuntu \
  && useradd --uid 1000 --create-home --home-dir /var/db/postgres postgres \
  && mkdir -p -m 0750 /var/db/postgres/compute \
  && mkdir -p /var/db/postgres/specs /usr/local/download_extensions \

@@ -17,13 +17,16 @@ RUN apt-get update \
       ca-certificates curl libcurl4t64 libicu74 libldap2 libgssapi-krb5-2 liblz4-1 \
       libreadline8t64 libseccomp2 libssl3t64 libxml2 libzstd1 zlib1g \
  && rm -rf /var/lib/apt/lists/* \
+ && userdel --remove ubuntu \
  && useradd --uid 1000 --home-dir /data --create-home peat
 COPY bin/storage_broker bin/storage_controller bin/safekeeper bin/pageserver /usr/local/bin/
 COPY pg/v18/bin/initdb pg/v18/bin/postgres /usr/local/v18/bin/
 COPY pg/v18/lib /usr/local/v18/lib
 COPY pg/v18/share /usr/local/v18/share
 COPY LICENSE NOTICE PROVENANCE /usr/share/doc/peat/
-# Fail the build if any program or library is missing a shared library.
-RUN ! (ldd /usr/local/bin/* /usr/local/v18/bin/* /usr/local/v18/lib/*.so* /usr/local/v18/lib/postgresql/*.so | grep 'not found')
+# Fail the build if any program or library is missing a shared library. The pageserver runs
+# initdb and postgres with LD_LIBRARY_PATH set to /usr/local/v18/lib, so the check does too.
+RUN ! (LD_LIBRARY_PATH=/usr/local/v18/lib ldd /usr/local/bin/* /usr/local/v18/bin/* \
+         /usr/local/v18/lib/*.so* /usr/local/v18/lib/postgresql/*.so | grep 'not found')
 USER peat
 WORKDIR /data
