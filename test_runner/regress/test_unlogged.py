@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import psycopg2.errors
 import pytest
 from fixtures.neon_fixtures import NeonEnv, fork_at_current_lsn, wait_replica_caughtup
 from fixtures.pg_version import PgVersion
+from fixtures.utils import USE_LFC
 
 
 #
@@ -119,3 +121,65 @@ def test_unlogged_init_fork_on_replica(neon_simple_env: NeonEnv, case: str):
     rcur = replica.connect().cursor()
     rcur.execute("SELECT count(*) FROM logged_marker")
     assert rcur.fetchone() == (2,)
+
+
+#
+# The fourth case of the replica test: promotion. A replica replays the creation of an
+# unlogged table with a serial column, and the primary writes to it; the replica is
+# then promoted and written to. Promotion ends recovery, which resets every unlogged
+# relation to its init fork (ResetUnloggedRelations), so the promoted node must see the
+# table empty and its sequence restarted, and take inserts.
+#
+# A known limit, already in Neon on 17: the promoted node has no local file for the
+# unlogged table (its creation was replayed through Neon's storage, which makes none),
+# so promotion has nothing to reset it from, and reading it fails with 'could not open
+# file "base/N/M"'. It fails the same way on 17.8 and 18.7 (see README.md), so it is an
+# expected failure for that error only, not strict: a fix will show as XPASS.
+#
+@pytest.mark.skipif(not USE_LFC, reason="promotion is tested with LFC, as test_replica_promotes")
+@pytest.mark.xfail(
+    strict=False,
+    raises=psycopg2.errors.UndefinedFile,
+    reason="known limit, as in Neon: a promoted replica cannot read an unlogged table it replayed",
+)
+def test_unlogged_serial_on_promoted_replica(neon_simple_env: NeonEnv):
+    env = neon_simple_env
+    if env.pg_version <= PgVersion.V14:
+        pytest.skip("unlogged sequences exist from v15")
+
+    primary = env.endpoints.create_start("main", endpoint_id="primary")
+    replica = env.endpoints.new_replica_start(origin=primary, endpoint_id="replica")
+
+    pcur = primary.connect().cursor()
+    pcur.execute("CREATE TABLE logged_marker (id int)")
+    pcur.execute("CREATE UNLOGGED TABLE userial (id serial, v int)")
+    pcur.execute("INSERT INTO userial (v) VALUES (1), (2)")
+    pcur.execute("INSERT INTO logged_marker VALUES (1)")
+    pcur.execute("SHOW neon.safekeepers")
+    row = pcur.fetchone()
+    assert row is not None
+    safekeepers = row[0]
+
+    wait_replica_caughtup(primary, replica)
+    rcur = replica.connect().cursor()
+    rcur.execute("SELECT relpersistence FROM pg_class WHERE relname = 'userial'")
+    assert rcur.fetchone() == ("u",)
+
+    # Promote as test_replica_promotes does with PromoteMethod.POSTGRES.
+    primary.stop(mode="immediate-terminate")
+    promo_conn = replica.connect()
+    promo_cur = promo_conn.cursor()
+    promo_cur.execute(f"ALTER SYSTEM SET neon.safekeepers='{safekeepers}'")
+    promo_cur.execute("SELECT pg_reload_conf()")
+    promo_cur.execute("SELECT pg_promote()")
+    assert promo_cur.fetchone() == (True,)
+
+    with replica.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM logged_marker")
+        assert cur.fetchone() == (1,)
+        cur.execute("SELECT count(*) FROM userial")
+        assert cur.fetchone() == (0,)
+        cur.execute("INSERT INTO userial (v) VALUES (3) RETURNING id")
+        assert cur.fetchone() == (1,)
+        cur.execute("SELECT nextval('userial_id_seq')")
+        assert cur.fetchone() == (2,)
