@@ -600,11 +600,21 @@ async fn timeline_create_handler(
         TimelineCreateRequestMode::Bootstrap {
             existing_initdb_timeline_id,
             pg_version,
-        } => tenant::CreateTimelineParams::Bootstrap(tenant::CreateTimelineParamsBootstrap {
-            new_timeline_id,
-            existing_initdb_timeline_id,
-            pg_version: pg_version.unwrap_or(DEFAULT_PG_VERSION),
-        }),
+        } => {
+            // Peat: a bootstrap from another timeline's initdb must say that initdb's version.
+            // The default would otherwise label that initdb's data with the default version,
+            // whatever version made it.
+            if existing_initdb_timeline_id.is_some() && pg_version.is_none() {
+                return Err(ApiError::BadRequest(anyhow!(
+                    "pg_version is required with existing_initdb_timeline_id"
+                )));
+            }
+            tenant::CreateTimelineParams::Bootstrap(tenant::CreateTimelineParamsBootstrap {
+                new_timeline_id,
+                existing_initdb_timeline_id,
+                pg_version: pg_version.unwrap_or(DEFAULT_PG_VERSION),
+            })
+        }
         TimelineCreateRequestMode::Branch {
             ancestor_timeline_id,
             ancestor_start_lsn,
