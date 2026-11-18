@@ -119,6 +119,13 @@ DEFAULT_PAGESERVER_ALLOWED_ERRORS = (
     # Expected warnings when pageserver has not refreshed GC info yet
     ".*pitr LSN/interval not found, skipping force image creation LSN calculation.*",
     ".*No broker updates received for a while.*",
+    # Peat: at shutdown the pageserver gives its deletion queue a hard-coded 5 seconds to
+    # flush (pageserver/src/lib.rs), warns if that runs out and carries on. On GitHub's
+    # 4-CPU hosted runners it has run out after tests that write many layers just before
+    # shutdown, failing their teardown on this warning (Peat CI, 2026-11-18). Deletions are
+    # validated before they are executed, so ones still pending at shutdown leave objects
+    # behind rather than delete wrongly: read from deletion_queue.rs, not tested.
+    ".*Timed out flushing deletion queue on shutdown.*",
     *(
         [
             r".*your platform is not a supported production platform, ignoing request for O_DIRECT; this could hide alignment bugs.*"
