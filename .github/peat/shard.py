@@ -26,7 +26,6 @@ import statistics
 import sys
 from pathlib import Path
 
-
 NODE_ID = re.compile(r"^test_runner/\S+\.py::\S+$")
 
 

@@ -85,7 +85,9 @@ jobs:
           compression-level: 0
 
   regress:
-    name: regression suite, Postgres 18, ${{ matrix.shard == 'solo' && 'solo tests' || format('shard {0}', matrix.shard) }}
+    # No expression in the name: GitHub does not evaluate a skipped job's name (pull requests
+    # skip this job), and appends the shard (1 to 8, or solo) to a plain one.
+    name: regression suite, Postgres 18
     needs: [ build ]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
@@ -142,6 +144,12 @@ jobs:
         env:
           TEST_OUTPUT: /mnt/test-output/out
         run: .github/peat/run-shard.sh "${{ matrix.shard }}" "$REGRESS_SHARDS" 18 "${{ matrix.shard == 'solo' && '1' || '4' }}" "$RUNNER_TEMP/junit.xml"
+
+      # Every rerun as a warning annotation and in the job's summary, its first attempt's
+      # logs kept, even when the rerun passed and the job is green.
+      - name: Report reruns
+        if: ${{ !cancelled() }}
+        run: python3 -I .github/peat/report_reruns.py "$RUNNER_TEMP/reruns.jsonl" /mnt/test-output/out "$RUNNER_TEMP/results"
 
       - name: Keep the shard's results
         if: ${{ !cancelled() }}
