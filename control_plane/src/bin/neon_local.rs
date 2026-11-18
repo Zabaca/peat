@@ -66,8 +66,9 @@ const DEFAULT_BRANCH_NAME: &str = "main";
 project_git_version!(GIT_VERSION);
 
 #[allow(dead_code)]
-const DEFAULT_PG_VERSION: PgMajorVersion = PgMajorVersion::PG17;
-const DEFAULT_PG_VERSION_NUM: &str = "17";
+// Peat: 18, the only version Peat builds (Neon: 17).
+const DEFAULT_PG_VERSION: PgMajorVersion = PgMajorVersion::PG18;
+const DEFAULT_PG_VERSION_NUM: &str = "18";
 
 const DEFAULT_PAGESERVER_CONTROL_PLANE_API: &str = "http://127.0.0.1:1234/upcall/v1/";
 

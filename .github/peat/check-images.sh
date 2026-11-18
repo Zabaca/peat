@@ -12,6 +12,8 @@ for bin in storage_broker storage_controller safekeeper pageserver; do
   run --entrypoint "/usr/local/bin/$bin" "$storage" --help > /dev/null
   echo "storage: $bin starts"
 done
+# Postgres 18 is the only version in the storage image, so it creates 18 timelines only.
+run --entrypoint /bin/sh "$storage" -c 'for v in /usr/local/v*; do [ "$v" = /usr/local/v18 ] || { echo "unexpected $v"; exit 1; }; done; echo "storage: Postgres 18 only"'
 run --entrypoint /usr/local/v18/bin/postgres "$storage" --version | tee /dev/stderr | grep -q '^postgres (PostgreSQL) 18\.7 '
 run --entrypoint /bin/sh "$storage" -c \
   'LD_LIBRARY_PATH=/usr/local/v18/lib /usr/local/v18/bin/initdb -D /tmp/check --locale C.UTF-8 --locale-provider builtin -U cloud_admin --no-instructions > /tmp/initdb.log 2>&1 || { cat /tmp/initdb.log; exit 1; }; echo "storage: initdb made $(cat /tmp/check/PG_VERSION)"'
