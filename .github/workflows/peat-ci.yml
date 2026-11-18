@@ -96,8 +96,15 @@ jobs:
       # The Rust dependencies' build, restored on every run and written only from pushes to
       # main: a pull request (an outsider's included) restores main's cache but never writes
       # one that main restores.
+      # Keyed by Cargo.lock and the pinned toolchain only: rust-cache's own environment key
+      # hashes every installed toolchain, and the runners' preinstalled stable one differs
+      # between runner images, so no run restored the last one's cache (runs 44332625075
+      # and 44338592127). A restore across a compiler change is safe: cargo rebuilds what
+      # another rustc built.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          add-rust-environment-hash-key: false
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
 
       - name: Build (Neon, Neon's extension for 18, walproposer, Rust test binaries)
