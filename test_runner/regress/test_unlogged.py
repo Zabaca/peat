@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import re
+from typing import TYPE_CHECKING
+
 import psycopg2.errors
 import pytest
 from fixtures.neon_fixtures import NeonEnv, fork_at_current_lsn, wait_replica_caughtup
 from fixtures.pg_version import PgVersion
 from fixtures.utils import USE_LFC
+
+if TYPE_CHECKING:
+    from psycopg2.extensions import cursor as Cursor
 
 
 #
@@ -125,32 +131,46 @@ def test_unlogged_init_fork_on_replica(neon_simple_env: NeonEnv, case: str):
 
 #
 # The fourth case of the replica test: promotion. A replica replays the creation of an
-# unlogged table with a serial column, and the primary writes to it; the replica is
-# then promoted and written to. Promotion ends recovery, which resets every unlogged
-# relation to its init fork (ResetUnloggedRelations), so the promoted node must see the
-# table empty and its sequence restarted, and take inserts.
+# unlogged table with a serial column while the primary writes to it; the replica is then
+# promoted, by pg_promote() and by compute_ctl's /promote (the two ways
+# test_replica_promotes promotes), and used. Promotion ends recovery, which resets every
+# unlogged relation to its init fork, so the promoted node should see the table empty, its
+# sequence restarted, and take inserts.
 #
-# A known limit, already in Neon on 17: the promoted node has no local file for the
-# unlogged table (its creation was replayed through Neon's storage, which makes none),
-# so promotion has nothing to reset it from, and reading it fails with 'could not open
-# file "base/N/M"'. It fails the same way on 17.8 and 18.7 (see README.md), so it is an
-# expected failure for that error only, not strict: a fix will show as XPASS.
+# A known limit, already in Neon on 17 (see README.md): the promoted node has no local file
+# for the unlogged table (its creation was replayed through Neon's storage, which makes
+# none), so the end of recovery has nothing to reset it from, and reading it fails with
+# 'could not open file "base/N/M"' (the main fork). The test then restarts the promoted
+# compute as a primary, which takes a fresh base backup carrying the table's files, and
+# checks that the table works again; only after that does it raise PromotedUnloggedLimit,
+# the one failure the marker expects. The marker is strict: a fix fails it.
 #
+class PromotedUnloggedLimit(Exception):
+    """The known limit: a promoted hot standby cannot read an unlogged table it replayed."""
+
+
 @pytest.mark.skipif(not USE_LFC, reason="promotion is tested with LFC, as test_replica_promotes")
-@pytest.mark.xfail(
-    strict=False,
-    raises=psycopg2.errors.UndefinedFile,
-    reason="known limit, as in Neon: a promoted replica cannot read an unlogged table it replayed",
-)
-def test_unlogged_serial_on_promoted_replica(neon_simple_env: NeonEnv):
+@pytest.mark.parametrize("method", ["postgres", "compute-ctl"])
+def test_unlogged_serial_on_promoted_replica(
+    neon_simple_env: NeonEnv, method: str, request: pytest.FixtureRequest
+):
     env = neon_simple_env
     if env.pg_version <= PgVersion.V14:
         pytest.skip("unlogged sequences exist from v15")
+    request.node.add_marker(
+        pytest.mark.xfail(
+            strict=True,
+            raises=PromotedUnloggedLimit,
+            reason="known limit, as in Neon: a promoted replica cannot read an unlogged table it replayed",
+        )
+    )
 
     primary = env.endpoints.create_start("main", endpoint_id="primary")
     replica = env.endpoints.new_replica_start(origin=primary, endpoint_id="replica")
 
     pcur = primary.connect().cursor()
+    if method == "compute-ctl":
+        pcur.execute("CREATE SCHEMA neon; CREATE EXTENSION neon WITH SCHEMA neon")
     pcur.execute("CREATE TABLE logged_marker (id int)")
     pcur.execute("CREATE UNLOGGED TABLE userial (id serial, v int)")
     pcur.execute("INSERT INTO userial (v) VALUES (1), (2)")
@@ -165,21 +185,54 @@ def test_unlogged_serial_on_promoted_replica(neon_simple_env: NeonEnv):
     rcur.execute("SELECT relpersistence FROM pg_class WHERE relname = 'userial'")
     assert rcur.fetchone() == ("u",)
 
-    # Promote as test_replica_promotes does with PromoteMethod.POSTGRES.
+    # Promote as test_replica_promotes does.
+    if method == "compute-ctl":
+        primary.http_client().offload_lfc()
+    primary_spec = primary.get_compute_spec()
+    primary_endpoint_id = primary.endpoint_id
     primary.stop(mode="immediate-terminate")
-    promo_conn = replica.connect()
-    promo_cur = promo_conn.cursor()
-    promo_cur.execute(f"ALTER SYSTEM SET neon.safekeepers='{safekeepers}'")
-    promo_cur.execute("SELECT pg_reload_conf()")
-    promo_cur.execute("SELECT pg_promote()")
-    assert promo_cur.fetchone() == (True,)
+    if method == "compute-ctl":
+        client = replica.http_client()
+        client.prewarm_lfc(primary_endpoint_id)
+        assert (lsn := primary.terminate_flush_lsn)
+        assert (
+            client.promote({"spec": primary_spec, "wal_flush_lsn": str(lsn)})["status"]
+            == "completed"
+        )
+    else:
+        promo_cur = replica.connect().cursor()
+        promo_cur.execute(f"ALTER SYSTEM SET neon.safekeepers='{safekeepers}'")
+        promo_cur.execute("SELECT pg_reload_conf()")
+        promo_cur.execute("SELECT pg_promote()")
+        assert promo_cur.fetchone() == (True,)
 
-    with replica.connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM logged_marker")
-        assert cur.fetchone() == (1,)
+    def unlogged_table_works(cur: Cursor) -> None:
         cur.execute("SELECT count(*) FROM userial")
         assert cur.fetchone() == (0,)
         cur.execute("INSERT INTO userial (v) VALUES (3) RETURNING id")
         assert cur.fetchone() == (1,)
-        cur.execute("SELECT nextval('userial_id_seq')")
-        assert cur.fetchone() == (2,)
+
+    limit = None
+    with replica.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM logged_marker")
+        assert cur.fetchone() == (1,)
+        try:
+            unlogged_table_works(cur)
+        except psycopg2.errors.UndefinedFile as e:
+            # Only the table's own main fork counts: a path with no fork suffix.
+            if not re.search(r'could not open file "base/\d+/\d+"', str(e)):
+                raise
+            limit = str(e).splitlines()[0]
+
+    # The way out: restarted as a primary, the compute takes a fresh base backup, which
+    # carries the unlogged table's files, so the table works again.
+    replica.stop()
+    replica.respec(mode="Primary")
+    replica.start()
+    with replica.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM logged_marker")
+        assert cur.fetchone() == (1,)
+        unlogged_table_works(cur)
+
+    if limit is not None:
+        raise PromotedUnloggedLimit(limit)
