@@ -24,7 +24,11 @@ else
 fi
 echo "shard $k of $n: $(wc -l < /tmp/shard.txt) of $(wc -l < /tmp/collected.txt) tests"
 mapfile -t ids < /tmp/shard.txt
-# A failed test is rerun once (pytest-rerunfailures, which Neon's own CI used with
-# --reruns 2): the rule Peat's suite is judged by reruns each failure once.
+# A failed test is rerun once (pytest-rerunfailures; Neon's own CI used --reruns 2), so a
+# timing failure on a shared runner does not fail the shard. A rerun that passes leaves the
+# job green, so every rerun is recorded (.github/peat/peat_reruns.py, into $PEAT_RERUNS)
+# and reported by .github/peat/report_reruns.py; CONTRIBUTING.md says what a rerun means.
+export PEAT_RERUNS=${PEAT_RERUNS:-${RUNNER_TEMP:-/tmp}/reruns.jsonl}
+export PYTHONPATH=$PWD/.github/peat${PYTHONPATH:+:$PYTHONPATH}
 ./scripts/pytest --junitxml="$junit" --tb=short -rA -n"$workers" --dist=loadgroup \
-  --reruns 1 --session-timeout=10800 "${deselect[@]}" "${ids[@]}"
+  -p peat_reruns --reruns 1 --session-timeout=10800 "${deselect[@]}" "${ids[@]}"
