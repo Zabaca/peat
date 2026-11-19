@@ -272,7 +272,8 @@ jobs:
   # architecture on a native runner, and saved as artifacts; the job after them pushes
   # exactly those images.
   images:
-    name: build and check the images (${{ matrix.arch }})
+    # A plain name, for the reason the regression job's says: GitHub appends the architecture.
+    name: build and check the images
     needs: [ build ]
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
