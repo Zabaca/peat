@@ -47,6 +47,7 @@ run_push t1 || die "first publish"
 for n in storage compute-pg18; do
   [ "$(docker buildx imagetools inspect --raw "$reg/$n:t1" | jq '.manifests | length')" = 2 ] || die "$n:t1 is not two images"
 done
+grep -Eq "storage:t1 read back: linux/arm64 sha256:[0-9a-f]{64}, linux/amd64 sha256:" "$work/out.txt" || die "the read-back did not list both platforms"
 s1=$(index_digest storage t1); c1=$(index_digest compute-pg18 t1)
 pass "first publish: both indexes hold two images"
 

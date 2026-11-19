@@ -96,7 +96,9 @@ for name in "${names[@]}"; do
   [ -z "${done_already[$name]:-}" ] || continue
   docker buildx imagetools create --tag "$dest/$name:$tag" \
     "$dest/$name@${digest[$name,arm64]}" "$dest/$name@${digest[$name,amd64]}"
-  check_index "$(inspect_raw "$dest/$name:$tag")" "$name" "${digest[$name,arm64]}" "${digest[$name,amd64]}"
+  readback=$(inspect_raw "$dest/$name:$tag")
+  check_index "$readback" "$name" "${digest[$name,arm64]}" "${digest[$name,amd64]}"
+  echo "$name:$tag read back: $(echo "$readback" | jq -r '[.manifests[] | "\(.platform.os)/\(.platform.architecture) \(.digest)"] | join(", ")')"
   index[$name]=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$dest/$name:$tag" | jq -r .digest)
 done
 
