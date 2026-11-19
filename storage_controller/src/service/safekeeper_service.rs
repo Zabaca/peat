@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::safekeeper_reconciler::ScheduleRequest;
+use super::safekeeper_reconciler::{self, ScheduleRequest};
 use crate::compute_hook;
 use crate::heartbeater::SafekeeperState;
 use crate::id_lock_map::trace_shared_lock;
@@ -856,9 +856,41 @@ impl Service {
             .set_safekeeper_scheduling_policy(id, scheduling_policy)
             .await?;
         let node_id = NodeId(id as u64);
+        let was_active = self
+            .inner
+            .read()
+            .unwrap()
+            .safekeepers
+            .get(&node_id)
+            .is_some_and(|sk| sk.scheduling_policy() == SkSchedulingPolicy::Active);
         // After the change has been persisted successfully, update the in-memory state
         self.set_safekeeper_scheduling_policy_in_mem(node_id, scheduling_policy)
-            .await
+            .await?;
+        if scheduling_policy == SkSchedulingPolicy::Active && !was_active {
+            self.schedule_pending_safekeeper_ops(node_id).await;
+        }
+        Ok(())
+    }
+
+    /// A safekeeper that has just become Active gets a reconciler with an empty queue. The operations
+    /// that were asked of it while it had none (skipped by `schedule_request`) are still persisted:
+    /// schedule them now, instead of leaving them to the next start of the controller.
+    async fn schedule_pending_safekeeper_ops(self: &Arc<Service>, node_id: NodeId) {
+        let safekeepers = self.inner.read().unwrap().safekeepers.clone();
+        match safekeeper_reconciler::load_schedule_requests(self, &safekeepers, Some(node_id)).await
+        {
+            Ok(requests) => {
+                if !requests.is_empty() {
+                    let locked = self.inner.read().unwrap();
+                    locked.safekeeper_reconcilers.schedule_request_vec(requests);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "couldn't load the pending operations of safekeeper {node_id} after it became active: {err}"
+                );
+            }
+        }
     }
 
     pub(crate) async fn set_safekeeper_scheduling_policy_in_mem(
