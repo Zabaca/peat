@@ -4,7 +4,8 @@
 # alone, nothing pushed); other images under an existing tag (refused, tag unchanged); an
 # index that would not name one linux/arm64 and one linux/amd64 image (refused before anything is put
 # under the tag); a push that fails for the second image (neither image under the tag),
-# then the rerun that completes; an existing tag that is not an index (refused).
+# then the rerun that completes; an existing tag that is not an index (refused); storage's
+# index made and compute's not, then the rerun that finishes compute.
 # Needs docker with buildx, curl and jq. Usage: test-push-images.sh
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -71,7 +72,8 @@ build_images four
 mkdir "$work/shim"
 cat > "$work/shim/docker" <<SHIM
 #!/usr/bin/env bash
-if [ "\${1:-}" = push ] && [[ "\${2:-}" == *compute-pg18:*-amd64 ]]; then echo "simulated push failure" >&2; exit 1; fi
+if [ "\${1:-}" = push ] && [[ "\${2:-}" == *compute-pg18:t3-amd64 ]]; then echo "simulated push failure" >&2; exit 1; fi
+if [ "\${1:-} \${2:-} \${3:-}" = "buildx imagetools create" ] && [[ "\$*" == *compute-pg18:t5* && "\$*" != *--dry-run* ]]; then echo "simulated index failure" >&2; exit 1; fi
 exec "$real_docker" "\$@"
 SHIM
 chmod +x "$work/shim/docker"
@@ -87,4 +89,13 @@ docker tag peat-storage:ci-arm64 "$reg/storage:t4"
 docker push -q "$reg/storage:t4" > /dev/null
 expect_fail t4 "not an index"
 pass "an existing tag that is not an index: refused"
+# Half published: storage's index is made, compute's creation fails.
+if PATH="$work/shim:$PATH" run_push t5; then die "a failed index creation did not fail the job"; fi
+grep -q "simulated index failure" "$work/out.txt" || die "the index creation did not fail where it was made to"
+published storage t5 && ! published compute-pg18 t5 || die "expected storage published and compute not"
+s5=$(index_digest storage t5)
+run_push t5 || die "rerun of a half-published tag"
+grep -q "storage:t5 is already published" "$work/out.txt" || die "the rerun did not leave storage's index"
+published compute-pg18 t5 && [ "$(index_digest storage t5)" = "$s5" ] || die "the rerun did not finish compute, or changed storage"
+pass "storage's index made and compute's not: the rerun leaves storage and completes compute"
 echo "all cases passed"

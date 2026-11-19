@@ -362,7 +362,10 @@ jobs:
         with:
           name: peat-images-docker-${{ matrix.arch }}
           path: ${{ runner.temp }}/images/peat-images.tar.zst
-          retention-days: 1
+          # Seven days, so a publish that stopped half way can be finished by "Re-run failed
+          # jobs" (the job loads these archives, and they are the checked images); the
+          # README says how.
+          retention-days: 7
           compression-level: 0
 
   # Images are published only from this repository's own merges to main and release tags,
