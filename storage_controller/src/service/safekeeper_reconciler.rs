@@ -21,7 +21,7 @@ use utils::{
 
 use crate::{
     metrics::{METRICS_REGISTRY, SafekeeperReconcilerLabelGroup},
-    persistence::SafekeeperTimelineOpKind,
+    persistence::{SafekeeperTimelineOpKind, TimelinePendingOpPersistence, TimelinePersistence},
     safekeeper::Safekeeper,
     safekeeper_client::SafekeeperClient,
 };
@@ -72,15 +72,15 @@ impl SafekeeperReconcilers {
             // off such a safekeeper (a membership change) still asks for an Exclude on it, which
             // used to panic here and take the whole storage controller down.
             //
-            // Nothing is lost by skipping the request: the operation is already persisted, and
-            // `load_schedule_requests` loads it again at the next start of the controller, after
-            // a reconciler has been started for every known safekeeper.
+            // Nothing is lost by skipping the request: the operation is already persisted. It is
+            // loaded again (`load_schedule_requests`) when the safekeeper becomes Active
+            // (`set_safekeeper_scheduling_policy`) and at the next start of the controller.
             tracing::warn!(
                 tenant_id = %req.tenant_id,
                 timeline_id = ?req.timeline_id,
                 kind = ?req.kind,
                 "not scheduling a safekeeper operation: safekeeper {node_id} has no reconciler \
-                (it is paused, decomissioned or not active); it stays pending in the database"
+                (it is paused, decomissioned or not active); it stays pending in the database until it is active again"
             );
             return;
         };
@@ -104,18 +104,41 @@ impl SafekeeperReconcilers {
     }
 }
 
-/// Initial load of the pending operations from the db
-pub(crate) async fn load_schedule_requests(
-    service: &Arc<Service>,
+/// Whether a pending `Exclude` of `sk_id` from a timeline is stale: the safekeeper is a member of the
+/// timeline's current set (`sk_set`) or of the set it is moving to (`new_sk_set`). An exclusion is run as a
+/// delete of the timeline on that safekeeper, and the safekeeper's delete carries no generation, so an
+/// exclusion queued while the safekeeper was out of the timeline must never run once it is back in.
+pub(crate) fn exclude_is_stale(timeline: &TimelinePersistence, sk_id: NodeId) -> bool {
+    let id = sk_id.0 as i64;
+    timeline.sk_set.contains(&id)
+        || timeline
+            .new_sk_set
+            .as_ref()
+            .is_some_and(|set| set.contains(&id))
+}
+
+/// What to do with the pending operations read from the db.
+pub(crate) struct PlannedOps {
+    /// Requests to schedule.
+    pub(crate) requests: Vec<ScheduleRequest>,
+    /// Stale `Exclude`s: to be dropped, row included, and not run.
+    pub(crate) stale: Vec<TimelinePendingOpPersistence>,
+}
+
+/// Turns pending operations (joined with their timelines) into requests, dropping the stale `Exclude`s.
+/// `only` limits it to one safekeeper's operations. Pure: it reads and writes nothing.
+pub(crate) fn plan_schedule_requests(
+    pending_ops_timelines: Vec<(TimelinePendingOpPersistence, Option<TimelinePersistence>)>,
     safekeepers: &HashMap<NodeId, Safekeeper>,
-) -> anyhow::Result<Vec<ScheduleRequest>> {
-    let pending_ops_timelines = service
-        .persistence
-        .list_pending_ops_with_timelines()
-        .await?;
+    only: Option<NodeId>,
+) -> anyhow::Result<PlannedOps> {
     let mut res = Vec::with_capacity(pending_ops_timelines.len());
+    let mut stale = Vec::new();
     for (op_persist, timeline_persist) in pending_ops_timelines {
         let node_id = NodeId(op_persist.sk_id as u64);
+        if only.is_some_and(|only| only != node_id) {
+            continue;
+        }
         let Some(sk) = safekeepers.get(&node_id) else {
             // This shouldn't happen, at least the safekeeper should exist as decomissioned.
             tracing::warn!(
@@ -125,6 +148,19 @@ pub(crate) async fn load_schedule_requests(
             );
             continue;
         };
+        if op_persist.op_kind == SafekeeperTimelineOpKind::Exclude
+            && timeline_persist
+                .as_ref()
+                .is_some_and(|timeline| exclude_is_stale(timeline, node_id))
+        {
+            tracing::info!(
+                tenant_id = op_persist.tenant_id,
+                timeline_id = op_persist.timeline_id,
+                "dropping a pending exclusion of safekeeper {node_id}: it is a member of the timeline again"
+            );
+            stale.push(op_persist);
+            continue;
+        }
         let sk = Box::new(sk.clone());
         let tenant_id = TenantId::from_str(&op_persist.tenant_id)?;
         let timeline_id = if !op_persist.timeline_id.is_empty() {
@@ -181,7 +217,38 @@ pub(crate) async fn load_schedule_requests(
         };
         res.push(req);
     }
-    Ok(res)
+    Ok(PlannedOps {
+        requests: res,
+        stale,
+    })
+}
+
+/// Load the pending operations from the db (at the start of the controller, or for one safekeeper that
+/// is active again: `only`), drop the stale `Exclude`s with their rows, and return the requests.
+pub(crate) async fn load_schedule_requests(
+    service: &Arc<Service>,
+    safekeepers: &HashMap<NodeId, Safekeeper>,
+    only: Option<NodeId>,
+) -> anyhow::Result<Vec<ScheduleRequest>> {
+    let pending_ops_timelines = service
+        .persistence
+        .list_pending_ops_with_timelines()
+        .await?;
+    let planned = plan_schedule_requests(pending_ops_timelines, safekeepers, only)?;
+    for op in planned.stale {
+        let tenant_id = TenantId::from_str(&op.tenant_id)?;
+        let timeline_id = TimelineId::from_str(&op.timeline_id)?;
+        service
+            .persistence
+            .remove_pending_op(
+                tenant_id,
+                Some(timeline_id),
+                NodeId(op.sk_id as u64),
+                op.generation as u32,
+            )
+            .await?;
+    }
+    Ok(planned.requests)
 }
 
 pub(crate) struct ScheduleRequest {
@@ -414,6 +481,42 @@ impl SafekeeperReconcilerInner {
                     );
                     return;
                 };
+                // Check again just before the delete: the exclusion may have been queued long ago, and
+                // the safekeeper may have rejoined the timeline since (see `exclude_is_stale`).
+                match self
+                    .service
+                    .persistence
+                    .get_timeline(tenant_id, timeline_id)
+                    .await
+                {
+                    Ok(Some(timeline)) if exclude_is_stale(&timeline, req.safekeeper.get_id()) => {
+                        tracing::info!(
+                            "not deleting the timeline from {req_host}: it is a member of the timeline again; dropping the exclusion"
+                        );
+                        if let Err(err) = self
+                            .service
+                            .persistence
+                            .remove_pending_op(
+                                tenant_id,
+                                Some(timeline_id),
+                                req.safekeeper.get_id(),
+                                req.generation,
+                            )
+                            .await
+                        {
+                            tracing::warn!("couldn't remove the stale pending op: {err}");
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        // Do not delete on a guess: the op stays pending and is loaded again later.
+                        tracing::warn!(
+                            "couldn't read the timeline before an exclusion, not running it: {err}"
+                        );
+                        return;
+                    }
+                }
                 success = self
                     .reconcile_inner(
                         &req,
@@ -604,13 +707,14 @@ impl SafekeeperReconcilerInner {
 #[cfg(test)]
 mod tests {
     use pageserver_api::controller_api::SkSchedulingPolicy;
+    use utils::lsn::Lsn;
 
     use super::*;
-    use crate::persistence::SafekeeperPersistence;
+    use crate::persistence::LsnWrapper;
 
     fn test_safekeeper(id: i64, policy: SkSchedulingPolicy) -> Safekeeper {
         Safekeeper::from_persistence(
-            SafekeeperPersistence {
+            crate::persistence::SafekeeperPersistence {
                 id,
                 region_id: "test".to_string(),
                 version: 1,
@@ -627,20 +731,164 @@ mod tests {
         .expect("a test safekeeper loads")
     }
 
+    fn test_timeline(
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+        sk_set: &[i64],
+        new_sk_set: Option<&[i64]>,
+    ) -> TimelinePersistence {
+        TimelinePersistence {
+            tenant_id: tenant_id.to_string(),
+            timeline_id: timeline_id.to_string(),
+            start_lsn: LsnWrapper(Lsn(0)),
+            generation: 1,
+            sk_set: sk_set.to_vec(),
+            new_sk_set: new_sk_set.map(|s| s.to_vec()),
+            cplane_notified_generation: 0,
+            deleted_at: None,
+            sk_set_notified_generation: 0,
+        }
+    }
+
+    fn test_op(
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+        sk_id: i64,
+        kind: SafekeeperTimelineOpKind,
+    ) -> TimelinePendingOpPersistence {
+        TimelinePendingOpPersistence {
+            sk_id,
+            tenant_id: tenant_id.to_string(),
+            timeline_id: timeline_id.to_string(),
+            generation: 3,
+            op_kind: kind,
+        }
+    }
+
+    fn safekeepers(ids: &[i64]) -> HashMap<NodeId, Safekeeper> {
+        ids.iter()
+            .map(|id| {
+                (
+                    NodeId(*id as u64),
+                    test_safekeeper(*id, SkSchedulingPolicy::Pause),
+                )
+            })
+            .collect()
+    }
+
     /// Scheduling an operation for a safekeeper that has no reconciler (it is Paused or Decomissioned)
     /// must not panic: it happens when a timeline is moved off such a safekeeper.
     #[test]
     fn schedule_request_for_a_safekeeper_without_reconciler_does_not_panic() {
         let reconcilers = SafekeeperReconcilers::new(CancellationToken::new());
-        for policy in [SkSchedulingPolicy::Pause, SkSchedulingPolicy::Decomissioned] {
-            reconcilers.schedule_request(ScheduleRequest {
-                safekeeper: Box::new(test_safekeeper(3, policy)),
-                host_list: Vec::new(),
-                tenant_id: TenantId::generate(),
-                timeline_id: Some(TimelineId::generate()),
-                generation: 3,
-                kind: SafekeeperTimelineOpKind::Exclude,
-            });
+        reconcilers.schedule_request(ScheduleRequest {
+            safekeeper: Box::new(test_safekeeper(3, SkSchedulingPolicy::Pause)),
+            host_list: Vec::new(),
+            tenant_id: TenantId::generate(),
+            timeline_id: Some(TimelineId::generate()),
+            generation: 3,
+            kind: SafekeeperTimelineOpKind::Exclude,
+        });
+    }
+
+    /// A skipped request leaves the persisted operation as it was: planning again from the same rows
+    /// (which is what happens when the safekeeper becomes Active, or at the next start) yields it.
+    #[test]
+    fn a_skipped_exclude_is_planned_again_from_the_database() {
+        let (tenant, timeline) = (TenantId::generate(), TimelineId::generate());
+        let rows = || {
+            vec![(
+                test_op(tenant, timeline, 3, SafekeeperTimelineOpKind::Exclude),
+                Some(test_timeline(tenant, timeline, &[1, 2, 4], None)),
+            )]
+        };
+        let sks = safekeepers(&[1, 2, 3, 4]);
+        // the skip: no reconciler, nothing happens to the rows
+        SafekeeperReconcilers::new(CancellationToken::new()).schedule_request(
+            plan_schedule_requests(rows(), &sks, None)
+                .unwrap()
+                .requests
+                .pop()
+                .unwrap(),
+        );
+        // later: the same rows give the same request, and nothing is dropped
+        let planned = plan_schedule_requests(rows(), &sks, Some(NodeId(3))).unwrap();
+        assert_eq!(planned.requests.len(), 1);
+        assert_eq!(planned.requests[0].kind, SafekeeperTimelineOpKind::Exclude);
+        assert_eq!(planned.requests[0].safekeeper.get_id(), NodeId(3));
+        assert!(planned.stale.is_empty());
+    }
+
+    /// The exclusion of a safekeeper that is a member of the timeline again (in its current set, or in the
+    /// set it is moving to) is dropped and no request is made, so nothing is deleted on that safekeeper.
+    #[test]
+    fn a_stale_exclude_for_a_current_member_is_dropped_and_deletes_nothing() {
+        let (tenant, timeline) = (TenantId::generate(), TimelineId::generate());
+        let sks = safekeepers(&[1, 2, 3, 4]);
+        for (sk_set, new_sk_set) in [
+            (vec![1, 2, 3], None),                // moved back
+            (vec![1, 2, 4], Some(vec![1, 2, 3])), // moving back
+        ] {
+            let rows = vec![(
+                test_op(tenant, timeline, 3, SafekeeperTimelineOpKind::Exclude),
+                Some(test_timeline(
+                    tenant,
+                    timeline,
+                    &sk_set,
+                    new_sk_set.as_deref(),
+                )),
+            )];
+            let planned = plan_schedule_requests(rows, &sks, None).unwrap();
+            assert!(
+                planned.requests.is_empty(),
+                "no request: {sk_set:?} {new_sk_set:?}"
+            );
+            assert_eq!(planned.stale.len(), 1);
+            assert_eq!(planned.stale[0].sk_id, 3);
         }
+    }
+
+    /// Only an `Exclude` is checked against the sets, and only a safekeeper's own operations are planned
+    /// when one safekeeper becomes Active.
+    #[test]
+    fn only_excludes_are_dropped_and_only_the_named_safekeeper_is_planned() {
+        let (tenant, timeline) = (TenantId::generate(), TimelineId::generate());
+        let sks = safekeepers(&[1, 2, 3, 4]);
+        let tl = || Some(test_timeline(tenant, timeline, &[1, 2, 3], None));
+        let rows = vec![
+            // a Delete of a member's copy is not an exclusion: it is planned
+            (
+                test_op(tenant, timeline, 3, SafekeeperTimelineOpKind::Delete),
+                tl(),
+            ),
+            // an exclusion of a safekeeper that is not a member: planned
+            (
+                test_op(tenant, timeline, 4, SafekeeperTimelineOpKind::Exclude),
+                tl(),
+            ),
+            // an exclusion of a member: dropped
+            (
+                test_op(tenant, timeline, 2, SafekeeperTimelineOpKind::Exclude),
+                tl(),
+            ),
+        ];
+        let all = plan_schedule_requests(rows, &sks, None).unwrap();
+        assert_eq!(all.requests.len(), 2);
+        assert_eq!(all.stale.len(), 1);
+        assert_eq!(all.stale[0].sk_id, 2);
+
+        let rows = vec![
+            (
+                test_op(tenant, timeline, 4, SafekeeperTimelineOpKind::Exclude),
+                tl(),
+            ),
+            (
+                test_op(tenant, timeline, 3, SafekeeperTimelineOpKind::Delete),
+                tl(),
+            ),
+        ];
+        let only4 = plan_schedule_requests(rows, &sks, Some(NodeId(4))).unwrap();
+        assert_eq!(only4.requests.len(), 1);
+        assert_eq!(only4.requests[0].safekeeper.get_id(), NodeId(4));
     }
 }

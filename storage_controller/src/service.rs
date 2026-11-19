@@ -914,7 +914,7 @@ impl Service {
 
         let safekeepers = self.inner.read().unwrap().safekeepers.clone();
         let sk_schedule_requests =
-            match safekeeper_reconciler::load_schedule_requests(self, &safekeepers).await {
+            match safekeeper_reconciler::load_schedule_requests(self, &safekeepers, None).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(
