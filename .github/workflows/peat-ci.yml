@@ -1,9 +1,11 @@
 name: Peat CI
 
-# Every change (pull requests, pushes to main): the release build and Neon's Rust tests.
+# Every change (pull requests, pushes to main): the release build and Neon's Rust tests,
+# on arm64 and on amd64, each on its own native runner.
 # Merges to main, release tags and manual runs: also Neon's Python regression suite on
-# Postgres 18, split into shards that each fit one standard GitHub-hosted arm64 runner
-# (4 vCPU, 16 GB of memory, 14 GB of disk, free and unlimited for public repositories).
+# Postgres 18 on both, split into shards that each fit one standard GitHub-hosted runner
+# (4 vCPU, 16 GB of memory, free and unlimited for public repositories), and the images,
+# one per architecture, which the publish job joins into one multi-arch image per tag.
 # No job needs a machine of ours. See README.md, "Continuous integration".
 
 on:
@@ -40,11 +42,17 @@ env:
 
 jobs:
   build:
-    name: build and Rust tests (arm64, release)
-    runs-on: ubuntu-24.04-arm
+    name: build and Rust tests (${{ matrix.arch }}, release)
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 240
     permissions:
       contents: read
+    # Each architecture is built and tested on a native runner, never emulated; one failing
+    # does not cancel the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ arm64, amd64 ]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -64,6 +72,9 @@ jobs:
       # another rustc built.
       # Restored before install-deps.sh, so the nextest it downloads and checks is the one
       # that runs, not a copy from the cache's ~/.cargo/bin.
+      # The action adds the runner's operating system and CPU architecture to the key itself
+      # (v0-rust-<key>-build-Linux-arm64 and -Linux-x64), so the two architectures never
+      # share a cache.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           add-rust-environment-hash-key: false
@@ -135,13 +146,13 @@ jobs:
 
       - name: Pack the binaries for the regression suite
         if: github.event_name != 'pull_request'
-        run: .github/peat/package-binaries.sh "$RUNNER_TEMP/peat-release-arm64.tar.zst"
+        run: .github/peat/package-binaries.sh "$RUNNER_TEMP/peat-release-${{ matrix.arch }}.tar.zst"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.event_name != 'pull_request'
         with:
-          name: peat-release-arm64
-          path: ${{ runner.temp }}/peat-release-arm64.tar.zst
+          name: peat-release-${{ matrix.arch }}
+          path: ${{ runner.temp }}/peat-release-${{ matrix.arch }}.tar.zst
           retention-days: 1
           compression-level: 0
 
@@ -157,29 +168,32 @@ jobs:
 
       - name: Pack the images' build context
         if: github.event_name != 'pull_request'
-        run: .github/peat/package-images.sh "$RUNNER_TEMP/peat-images-arm64.tar.zst"
+        run: .github/peat/package-images.sh "$RUNNER_TEMP/peat-images-${{ matrix.arch }}.tar.zst"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.event_name != 'pull_request'
         with:
-          name: peat-images-arm64
-          path: ${{ runner.temp }}/peat-images-arm64.tar.zst
+          name: peat-images-${{ matrix.arch }}
+          path: ${{ runner.temp }}/peat-images-${{ matrix.arch }}.tar.zst
           retention-days: 7
           compression-level: 0
 
   regress:
     # No expression in the name: GitHub does not evaluate a skipped job's name (pull requests
-    # skip this job), and appends the shard (1 to 8, or solo) to a plain one.
+    # skip this job), and appends the matrix (architecture, then shard 1 to 8 or solo) to a
+    # plain one. Waits for both architectures' builds (a matrix job's needs cannot name one
+    # leg), so a failed build of either skips every shard.
     name: regression suite, Postgres 18
     needs: [ build ]
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 150
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
+        arch: [ arm64, amd64 ]
         # 'solo': the tests of .github/peat/solo-tests.txt, one at a time on a larger
         # filesystem (each peaks at about 12 GB of test output).
         shard: [ '1', '2', '3', '4', '5', '6', '7', '8', 'solo' ]
@@ -209,13 +223,13 @@ jobs:
 
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: peat-release-arm64
+          name: peat-release-${{ matrix.arch }}
           path: ${{ runner.temp }}
 
       - name: Unpack the binaries
         run: |
-          zstd -dc "$RUNNER_TEMP/peat-release-arm64.tar.zst" | tar -xf -
-          rm "$RUNNER_TEMP/peat-release-arm64.tar.zst"
+          zstd -dc "$RUNNER_TEMP/peat-release-${{ matrix.arch }}.tar.zst" | tar -xf -
+          rm "$RUNNER_TEMP/peat-release-${{ matrix.arch }}.tar.zst"
 
       # Sizes from measurements of each shard on 4 CPUs and 16 GiB: a shard's test output
       # peaked at 6.7 GB (11 GB keeps it under the pageserver's 80%); each solo test
@@ -250,25 +264,34 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
-          name: regress-pg18-shard-${{ matrix.shard }}
+          name: regress-pg18-${{ matrix.arch }}-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/results
           retention-days: 7
 
-  # The images are built and checked on every run but a pull request's, and saved as an
-  # artifact; the job after it pushes exactly those images.
+  # The images are built and checked on every run but a pull request's, one per
+  # architecture on a native runner, and saved as artifacts; the job after them pushes
+  # exactly those images.
   images:
-    name: build and check the images (arm64)
+    # A plain name, for the reason the regression job's says: GitHub appends the architecture.
+    name: build and check the images
     needs: [ build ]
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     permissions:
       contents: read
-    # The IDs of the images this job checked: the publish job pushes only images with
-    # these IDs, whatever the artifact it downloads holds.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ arm64, amd64 ]
+    # The IDs of the images this job checked, one pair per architecture (each leg writes
+    # only its own names, which GitHub merges across the matrix): the publish job pushes
+    # only images with these IDs, whatever the artifacts it downloads hold.
     outputs:
-      storage-id: ${{ steps.ids.outputs.storage }}
-      compute-id: ${{ steps.ids.outputs.compute }}
+      storage-id-arm64: ${{ steps.ids.outputs.storage-id-arm64 }}
+      compute-id-arm64: ${{ steps.ids.outputs.compute-id-arm64 }}
+      storage-id-amd64: ${{ steps.ids.outputs.storage-id-amd64 }}
+      compute-id-amd64: ${{ steps.ids.outputs.compute-id-amd64 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -276,35 +299,36 @@ jobs:
 
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: peat-images-arm64
+          name: peat-images-${{ matrix.arch }}
           path: ${{ runner.temp }}
 
       - name: Unpack the build context
         run: |
           mkdir -p "$RUNNER_TEMP/ctx"
-          zstd -dc "$RUNNER_TEMP/peat-images-arm64.tar.zst" | tar -C "$RUNNER_TEMP/ctx" -xf -
+          zstd -dc "$RUNNER_TEMP/peat-images-${{ matrix.arch }}.tar.zst" | tar -C "$RUNNER_TEMP/ctx" -xf -
           cat "$RUNNER_TEMP/ctx/PROVENANCE"
 
+      # The local tags carry the architecture, so the publish job can hold both.
       - name: Build the images
         run: |
           for image in storage compute; do
             docker build --build-arg REVISION="$GITHUB_SHA" \
-              -f ".github/peat/$image.Dockerfile" -t "peat-$image:ci" "$RUNNER_TEMP/ctx"
+              -f ".github/peat/$image.Dockerfile" -t "peat-$image:ci-${{ matrix.arch }}" "$RUNNER_TEMP/ctx"
           done
           docker image ls 'peat-*'
 
       - name: Check the images
-        run: .github/peat/check-images.sh peat-storage:ci peat-compute:ci
+        run: .github/peat/check-images.sh peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }}
 
       - name: Record the checked images' IDs
         id: ids
         run: |
-          storage=$(docker image inspect --format '{{.Id}}' peat-storage:ci)
-          compute=$(docker image inspect --format '{{.Id}}' peat-compute:ci)
-          echo "storage=$storage" >> "$GITHUB_OUTPUT"
-          echo "compute=$compute" >> "$GITHUB_OUTPUT"
+          storage=$(docker image inspect --format '{{.Id}}' peat-storage:ci-${{ matrix.arch }})
+          compute=$(docker image inspect --format '{{.Id}}' peat-compute:ci-${{ matrix.arch }})
+          echo "storage-id-${{ matrix.arch }}=$storage" >> "$GITHUB_OUTPUT"
+          echo "compute-id-${{ matrix.arch }}=$compute" >> "$GITHUB_OUTPUT"
           {
-            echo "### Checked images"
+            echo "### Checked images (${{ matrix.arch }})"
             echo
             echo "| Image | ID |"
             echo "|---|---|"
@@ -315,24 +339,24 @@ jobs:
       - name: Save the images
         run: |
           mkdir -p "$RUNNER_TEMP/images"
-          docker save peat-storage:ci peat-compute:ci | zstd -T0 -3 -q -o "$RUNNER_TEMP/images/peat-images.tar.zst"
+          docker save peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }} | zstd -T0 -3 -q -o "$RUNNER_TEMP/images/peat-images.tar.zst"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: peat-images-docker-arm64
+          name: peat-images-docker-${{ matrix.arch }}
           path: ${{ runner.temp }}/images/peat-images.tar.zst
           retention-days: 1
           compression-level: 0
 
   # Images are published only from this repository's own merges to main and release tags,
-  # never from a pull request or a manual run, only after the regression suite passed, and
-  # only once the PUBLISH_IMAGES repository variable is 'true'. This is the only job whose
-  # token can write (to the package registry). Names and tags: README.md, "Images".
-  # Who can push to main or make a release-* tag is set by the repository's rulesets
-  # (main through pull requests only; release tags created by admins only, never moved);
-  # the job also refuses a commit that is not on main.
+  # never from a pull request or a manual run, only after the regression suite passed on
+  # both architectures, and only once the PUBLISH_IMAGES repository variable is 'true'.
+  # This is the only job whose token can write (to the package registry). Names and tags:
+  # README.md, "Images". Who can push to main or make a release-* tag is set by the
+  # repository's rulesets (main through pull requests only; release tags created by admins
+  # only, never moved); the job also refuses a commit that is not on main.
   publish-images:
-    name: publish the images (arm64)
+    name: publish the images (arm64 and amd64)
     needs: [ images, regress ]
     if: >-
       github.event_name == 'push' &&
@@ -357,22 +381,32 @@ jobs:
 
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: peat-images-docker-arm64
-          path: ${{ runner.temp }}
+          pattern: peat-images-docker-*
+          path: ${{ runner.temp }}/archives
 
+      # Both architectures' images, each compared with the ID its own images job checked.
       - name: Load the checked images
         env:
-          STORAGE_ID: ${{ needs.images.outputs.storage-id }}
-          COMPUTE_ID: ${{ needs.images.outputs.compute-id }}
+          STORAGE_ID_ARM64: ${{ needs.images.outputs.storage-id-arm64 }}
+          COMPUTE_ID_ARM64: ${{ needs.images.outputs.compute-id-arm64 }}
+          STORAGE_ID_AMD64: ${{ needs.images.outputs.storage-id-amd64 }}
+          COMPUTE_ID_AMD64: ${{ needs.images.outputs.compute-id-amd64 }}
         run: |
-          zstd -dc "$RUNNER_TEMP/peat-images.tar.zst" | docker load
-          loaded_s=$(docker image inspect --format '{{.Id}}' peat-storage:ci)
-          loaded_c=$(docker image inspect --format '{{.Id}}' peat-compute:ci)
-          # Not "test -n a && test -n b": a failed && list does not stop a bash -e script.
-          [ -n "$STORAGE_ID" ] || { echo "::error::no checked storage image ID"; exit 1; }
-          [ -n "$COMPUTE_ID" ] || { echo "::error::no checked compute image ID"; exit 1; }
-          [ "$loaded_s" = "$STORAGE_ID" ] || { echo "::error::storage image $loaded_s is not the checked $STORAGE_ID"; exit 1; }
-          [ "$loaded_c" = "$COMPUTE_ID" ] || { echo "::error::compute image $loaded_c is not the checked $COMPUTE_ID"; exit 1; }
+          for arch in arm64 amd64; do
+            zstd -dc "$RUNNER_TEMP/archives/peat-images-docker-$arch/peat-images.tar.zst" | docker load
+          done
+          for arch in arm64 amd64; do
+            up=$(echo "$arch" | tr '[:lower:]' '[:upper:]')
+            want_s=STORAGE_ID_$up; want_c=COMPUTE_ID_$up
+            loaded_s=$(docker image inspect --format '{{.Id}}' "peat-storage:ci-$arch")
+            loaded_c=$(docker image inspect --format '{{.Id}}' "peat-compute:ci-$arch")
+            # Not "test -n a && test -n b": a failed && list does not stop a bash -e script.
+            [ -n "${!want_s}" ] || { echo "::error::no checked storage image ID ($arch)"; exit 1; }
+            [ -n "${!want_c}" ] || { echo "::error::no checked compute image ID ($arch)"; exit 1; }
+            [ "$loaded_s" = "${!want_s}" ] || { echo "::error::storage image ($arch) $loaded_s is not the checked ${!want_s}"; exit 1; }
+            [ "$loaded_c" = "${!want_c}" ] || { echo "::error::compute image ($arch) $loaded_c is not the checked ${!want_c}"; exit 1; }
+            echo "$arch: both loaded images are the checked ones"
+          done
 
       - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
@@ -381,26 +415,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # ghcr.io/zabaca/peat/storage and ghcr.io/zabaca/peat/compute-pg18, tagged with the
-      # full commit hash on a merge to main, or with the release tag's name.
+      # full commit hash on a merge to main, or with the release tag's name: each tag one
+      # multi-arch image (arm64 and amd64), made by .github/peat/push-images.sh.
       - name: Push
         env:
           REPO: ghcr.io/${{ github.repository }}
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
-        run: |
-          dest="$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
-          docker tag peat-storage:ci "$dest/storage:$TAG"
-          docker tag peat-compute:ci "$dest/compute-pg18:$TAG"
-          {
-            echo "### Published"
-            echo
-            echo "| Image | Tag | Digest |"
-            echo "|---|---|---|"
-          } >> "$GITHUB_STEP_SUMMARY"
-          for image in storage compute-pg18; do
-            # The digest the registry gave this push, from the push's own output.
-            out=$(docker push "$dest/$image:$TAG")
-            echo "$out"
-            digest=$(echo "$out" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | tail -1)
-            [ -n "$digest" ] || { echo "::error::no digest in the push output for $image"; exit 1; }
-            echo "| $dest/$image | $TAG | $digest |" >> "$GITHUB_STEP_SUMMARY"
-          done
+        run: .github/peat/push-images.sh "$(echo "$REPO" | tr '[:upper:]' '[:lower:]')" "$TAG"
