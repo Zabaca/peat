@@ -66,7 +66,24 @@ impl SafekeeperReconcilers {
     }
     pub(crate) fn schedule_request(&self, req: ScheduleRequest) {
         let node_id = req.safekeeper.get_id();
-        let reconciler_handle = self.reconcilers.get(&node_id).unwrap();
+        let Some(reconciler_handle) = self.reconcilers.get(&node_id) else {
+            // A safekeeper that is Paused, Decomissioned or still Activating has no reconciler
+            // (`stop_reconciler` removes it when the scheduling policy changes). Moving a timeline
+            // off such a safekeeper (a membership change) still asks for an Exclude on it, which
+            // used to panic here and take the whole storage controller down.
+            //
+            // Nothing is lost by skipping the request: the operation is already persisted, and
+            // `load_schedule_requests` loads it again at the next start of the controller, after
+            // a reconciler has been started for every known safekeeper.
+            tracing::warn!(
+                tenant_id = %req.tenant_id,
+                timeline_id = ?req.timeline_id,
+                kind = ?req.kind,
+                "not scheduling a safekeeper operation: safekeeper {node_id} has no reconciler \
+                (it is paused, decomissioned or not active); it stays pending in the database"
+            );
+            return;
+        };
         reconciler_handle.schedule_reconcile(req);
     }
     /// Cancel ongoing reconciles for the given timeline
@@ -580,6 +597,50 @@ impl SafekeeperReconcilerInner {
                     tokio::time::sleep(SLEEP_TIME).await;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pageserver_api::controller_api::SkSchedulingPolicy;
+
+    use super::*;
+    use crate::persistence::SafekeeperPersistence;
+
+    fn test_safekeeper(id: i64, policy: SkSchedulingPolicy) -> Safekeeper {
+        Safekeeper::from_persistence(
+            SafekeeperPersistence {
+                id,
+                region_id: "test".to_string(),
+                version: 1,
+                host: format!("safekeeper-{id}.test"),
+                port: 5454,
+                http_port: 7676,
+                availability_zone_id: format!("sk-{id}"),
+                scheduling_policy: policy.into(),
+                https_port: None,
+            },
+            CancellationToken::new(),
+            false,
+        )
+        .expect("a test safekeeper loads")
+    }
+
+    /// Scheduling an operation for a safekeeper that has no reconciler (it is Paused or Decomissioned)
+    /// must not panic: it happens when a timeline is moved off such a safekeeper.
+    #[test]
+    fn schedule_request_for_a_safekeeper_without_reconciler_does_not_panic() {
+        let reconcilers = SafekeeperReconcilers::new(CancellationToken::new());
+        for policy in [SkSchedulingPolicy::Pause, SkSchedulingPolicy::Decomissioned] {
+            reconcilers.schedule_request(ScheduleRequest {
+                safekeeper: Box::new(test_safekeeper(3, policy)),
+                host_list: Vec::new(),
+                tenant_id: TenantId::generate(),
+                timeline_id: Some(TimelineId::generate()),
+                generation: 3,
+                kind: SafekeeperTimelineOpKind::Exclude,
+            });
         }
     }
 }
