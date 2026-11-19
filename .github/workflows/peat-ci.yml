@@ -268,6 +268,23 @@ jobs:
           path: ${{ runner.temp }}/results
           retention-days: 7
 
+  # The publish script, tried against a throwaway registry on the runner with stand-in
+  # images: the cases are listed in .github/peat/test-push-images.sh. Every run, and the
+  # publish job needs it.
+  test-push-images:
+    name: test the publish script
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Run the cases
+        run: .github/peat/test-push-images.sh
+
   # The images are built and checked on every run but a pull request's, one per
   # architecture on a native runner, and saved as artifacts; the job after them pushes
   # exactly those images.
@@ -357,7 +374,7 @@ jobs:
   # only, never moved); the job also refuses a commit that is not on main.
   publish-images:
     name: publish the images (arm64 and amd64)
-    needs: [ images, regress ]
+    needs: [ images, regress, test-push-images ]
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release-')) &&
