@@ -3,8 +3,9 @@ CI: report the reruns that .github/peat/peat_reruns.py recorded during a shard.
 
 For each rerun it prints a GitHub `::warning::` annotation and adds a row to the job's
 step summary; it copies the record into the results directory, and the logs of each
-rerun test's first attempt (its test output directory ends in "-1") into
-rerun-first-attempts.tar.gz there, so the first failure survives a green job.
+rerun test's first attempt into rerun-first-attempts.tar.gz there, so the first failure
+survives a green job. Those logs are the ones peat_reruns.py kept when it removed the failed
+attempt's directory before the rerun (PEAT_RERUN_LOGS), and any still in a "-1" directory.
 
 Usage: report_reruns.py <reruns.jsonl> <test output dir> <results dir>
 """
@@ -19,6 +20,10 @@ import tarfile
 from pathlib import Path
 
 LOG_LIMIT = 20 * 1024 * 1024
+KEPT_LOGS = Path(
+    os.environ.get("PEAT_RERUN_LOGS")
+    or f"{os.environ.get('RUNNER_TEMP') or '/tmp'}/rerun-first-attempts"
+)
 
 
 def escape_data(s: str) -> str:
@@ -79,6 +84,9 @@ def main() -> int:
     results.mkdir(parents=True, exist_ok=True)
     shutil.copy(reruns_file, results / "reruns.jsonl")
     with tarfile.open(results / "rerun-first-attempts.tar.gz", "w:gz") as tar:
+        if KEPT_LOGS.is_dir():
+            for log in sorted(KEPT_LOGS.rglob("*.log")):
+                tar.add(log, arcname=str(log.relative_to(KEPT_LOGS)))
         for name in sorted({r["nodeid"].split("::")[-1].replace("/", "-") for r in records}):
             first = test_output / f"{name}-1"
             if not first.is_dir():

@@ -30,5 +30,8 @@ mapfile -t ids < /tmp/shard.txt
 # and reported by .github/peat/report_reruns.py; CONTRIBUTING.md says what a rerun means.
 export PEAT_RERUNS=${PEAT_RERUNS:-${RUNNER_TEMP:-/tmp}/reruns.jsonl}
 export PYTHONPATH=$PWD/.github/peat${PYTHONPATH:+:$PYTHONPATH}
+# A failed attempt's test output is removed before its rerun starts (the rerun of a test
+# that writes 12 GB needs the room); its logs go to PEAT_RERUN_LOGS, for report_reruns.py.
+export PEAT_RERUN_LOGS=${PEAT_RERUN_LOGS:-${RUNNER_TEMP:-/tmp}/rerun-first-attempts}
 ./scripts/pytest --junitxml="$junit" --tb=short -rA -n"$workers" --dist=loadgroup \
   -p peat_reruns --reruns 1 --session-timeout=10800 "${deselect[@]}" "${ids[@]}"

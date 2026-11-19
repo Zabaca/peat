@@ -12,7 +12,7 @@ Peat is a fork of Neon's open-source code, kept on the latest PostgreSQL release
 
 ## Reruns
 
-The regression suite reruns a failed test once, so a test that fails on a shared four-CPU runner for timing alone does not fail its shard. A rerun is not a pass: it is a failure that did not repeat. Every rerun is listed in the job's summary and as a warning on the run (`.github/peat/peat_reruns.py`, `.github/peat/report_reruns.py`), with the first attempt's error and logs kept in the shard's artifact (`reruns.jsonl`, `rerun-first-attempts.tar.gz`), whether the rerun passed or not.
+The regression suite reruns a failed test once, so a test that fails on a shared four-CPU runner for timing alone does not fail its shard. A rerun is not a pass: it is a failure that did not repeat. Every rerun is listed in the job's summary and as a warning on the run (`.github/peat/peat_reruns.py`, `.github/peat/report_reruns.py`), with the first attempt's error and logs kept in the shard's artifact (`reruns.jsonl`, `rerun-first-attempts.tar.gz`), whether the rerun passed or not. The failed attempt's test output directory is removed when its rerun is about to start (its logs are kept first), so a rerun has the room a first attempt had; a test that writes 12 GB could not otherwise be rerun on the 16 GB filesystem of the solo job.
 
 What it means here:
 
