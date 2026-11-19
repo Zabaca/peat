@@ -241,6 +241,7 @@ jobs:
         env:
           TEST_OUTPUT: /mnt/test-output/out
           PYTEST_ADDOPTS: -p peat_force_teardown_fail  # TEMPORARY
+          PYTHONPATH: ${{ github.workspace }}/.github/peat  # TEMPORARY
         run: .github/peat/run-shard.sh "${{ matrix.shard }}" "$REGRESS_SHARDS" 18 "${{ matrix.shard == 'solo' && '1' || '4' }}" "$RUNNER_TEMP/junit.xml"
 
       # Every rerun as a warning annotation and in the job's summary, its first attempt's
