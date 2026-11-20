@@ -4972,6 +4972,14 @@ def test_re_attach_with_stuck_secondary(neon_env_builder: NeonEnvBuilder):
     """
 
     neon_env_builder.num_pageservers = 2
+    # Peat: two availability zones, so that the attachment goes back to the node it was on.
+    # The scheduler ranks nodes by availability zone first, then by the nodes' reported
+    # utilization. Without zones, the test depended on the second: once the first node's
+    # utilization (it holds the tenant's timeline) was refreshed, the scheduler attached the
+    # tenant to the node whose secondary is stuck, and the timeline creation below failed with
+    # "NotFound: tenant". That happened on about half of the runs on a hosted runner. With the
+    # shard's preferred zone that of its first attachment, the choice no longer varies.
+    neon_env_builder.num_azs = 2
 
     env = neon_env_builder.init_configs()
     env.start()
