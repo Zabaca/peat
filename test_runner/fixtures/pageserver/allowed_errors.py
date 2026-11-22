@@ -105,6 +105,9 @@ DEFAULT_PAGESERVER_ALLOWED_ERRORS = (
     # Can happen during shutdown
     ".*scheduling deletion on drop failed: queue is in state Stopped.*",
     ".*scheduling deletion on drop failed: queue is shutting down.*",
+    # gc-compaction under sustained L0 pressure (Peat: a preempted sub-compaction job is queued again, then given up)
+    ".*abandoning gc-compaction subcompaction job .* preempted by L0 compaction.*",
+    ".*not updating l2_lsn .* sub-compaction jobs did not complete.*",
     # L0 flush backpressure delays are expected under heavy ingest load. We want to exercise
     # this backpressure in tests.
     ".*delaying layer flush by \\S+ for compaction backpressure.*",
