@@ -10773,6 +10773,331 @@ mod tests {
         Ok(())
     }
 
+    /// A small timeline for the gc-compaction queue tests: an image layer at 0x10, three delta layers,
+    /// and a GC horizon of 0x30 that the compaction can work on (the setup of
+    /// `test_simple_bottom_most_compaction_images`).
+    #[cfg(feature = "testing")]
+    async fn gc_compaction_queue_test_timeline(
+        tenant: &Arc<TenantShard>,
+        ctx: &RequestContext,
+    ) -> anyhow::Result<Arc<Timeline>> {
+        fn get_key(id: u32) -> Key {
+            // using aux key here b/c they are guaranteed to be inside `collect_keyspace`.
+            let mut key = Key::from_hex("620000000033333333444444445500000000").unwrap();
+            key.field6 = id;
+            key
+        }
+        let img_layer = (0..10)
+            .map(|id| (get_key(id), Bytes::from(format!("value {id}@0x10"))))
+            .collect_vec();
+        let delta1 = vec![
+            (
+                get_key(1),
+                Lsn(0x20),
+                Value::Image(Bytes::from("value 1@0x20")),
+            ),
+            (
+                get_key(2),
+                Lsn(0x30),
+                Value::Image(Bytes::from("value 2@0x30")),
+            ),
+            (
+                get_key(3),
+                Lsn(0x40),
+                Value::Image(Bytes::from("value 3@0x40")),
+            ),
+        ];
+        let delta2 = vec![
+            (
+                get_key(5),
+                Lsn(0x20),
+                Value::Image(Bytes::from("value 5@0x20")),
+            ),
+            (
+                get_key(6),
+                Lsn(0x20),
+                Value::Image(Bytes::from("value 6@0x20")),
+            ),
+        ];
+        let delta3 = vec![
+            (
+                get_key(8),
+                Lsn(0x48),
+                Value::Image(Bytes::from("value 8@0x48")),
+            ),
+            (
+                get_key(9),
+                Lsn(0x48),
+                Value::Image(Bytes::from("value 9@0x48")),
+            ),
+        ];
+        let tline = tenant
+            .create_test_timeline_with_layers(
+                TIMELINE_ID,
+                Lsn(0x10),
+                DEFAULT_PG_VERSION,
+                ctx,
+                Vec::new(), // in-memory layers
+                vec![
+                    DeltaLayerTestDesc::new_with_inferred_key_range(Lsn(0x20)..Lsn(0x48), delta1),
+                    DeltaLayerTestDesc::new_with_inferred_key_range(Lsn(0x20)..Lsn(0x48), delta2),
+                    DeltaLayerTestDesc::new_with_inferred_key_range(Lsn(0x48)..Lsn(0x50), delta3),
+                ], // delta layers
+                vec![(Lsn(0x10), img_layer)], // image layers
+                Lsn(0x50),
+            )
+            .await?;
+        {
+            tline
+                .applied_gc_cutoff_lsn
+                .lock_for_write()
+                .store_and_unlock(Lsn(0x30))
+                .wait()
+                .await;
+            let mut guard = tline.gc_info.write().unwrap();
+            guard.cutoffs.time = Some(Lsn(0x30));
+            guard.cutoffs.space = Lsn(0x30);
+        }
+        Ok(tline)
+    }
+
+    /// The options of a sub-compaction job the way the queue makes them for an automatic gc-compaction:
+    /// gc-compaction that yields to L0 compaction.
+    #[cfg(feature = "testing")]
+    fn preemptible_gc_compaction_options() -> CompactOptions {
+        let mut flags = EnumSet::default();
+        flags |= CompactFlags::EnhancedGcBottomMostCompaction;
+        flags |= CompactFlags::YieldForL0;
+        CompactOptions {
+            flags,
+            ..CompactOptions::default_for_gc_compaction_unit_tests()
+        }
+    }
+
+    /// A sub-compaction job that L0 compaction preempts writes nothing and is queued again, and the second
+    /// run (nothing preempts it) compacts. Before the retry the queue counted the preempted job as done and
+    /// never ran it again.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn test_gc_compaction_queue_retries_a_preempted_sub_compaction_job() -> anyhow::Result<()>
+    {
+        use crate::tenant::timeline::compaction::GcCompactionQueueItem;
+
+        let harness = TenantHarness::create(
+            "test_gc_compaction_queue_retries_a_preempted_sub_compaction_job",
+        )
+        .await?;
+        let (tenant, ctx) = harness.load().await;
+        let tline = gc_compaction_queue_test_timeline(&tenant, &ctx).await?;
+        let layers_before = inspect_and_sort(&tline, None).await;
+
+        let queue = GcCompactionQueue::new();
+        queue.schedule_sub_compaction_job_for_test(preemptible_gc_compaction_options());
+        let cancel = CancellationToken::new();
+
+        // L0 compaction asks gc-compaction to yield: the stored permit is taken by the first run.
+        tline.ask_compaction_to_yield_for_l0_for_test();
+        let first = queue
+            .iteration(&cancel, &ctx, &tenant.gc_block, &tline)
+            .await
+            .unwrap();
+        assert_eq!(first, CompactionOutcome::YieldForL0);
+        assert_eq!(
+            inspect_and_sort(&tline, None).await,
+            layers_before,
+            "a preempted job writes nothing"
+        );
+        let (running, queued) = queue.remaining_jobs();
+        assert!(running.is_none());
+        assert_eq!(queued.len(), 1, "the preempted job is queued again");
+        match &queued[0].1 {
+            GcCompactionQueueItem::SubCompactionJob { attempt, .. } => assert_eq!(*attempt, 2),
+            other => panic!("expected a sub-compaction job, got {other:?}"),
+        }
+
+        // Nothing preempts the second run.
+        let second = queue
+            .iteration(&cancel, &ctx, &tenant.gc_block, &tline)
+            .await
+            .unwrap();
+        assert_eq!(second, CompactionOutcome::Done);
+        assert_eq!(queue.remaining_jobs_num(), 0);
+        assert_ne!(
+            inspect_and_sort(&tline, None).await,
+            layers_before,
+            "the retried job compacted"
+        );
+        Ok(())
+    }
+
+    /// Under sustained L0 pressure a job is tried three times and then given up, so that gc-compaction does
+    /// not redo its work for ever.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn test_gc_compaction_queue_gives_up_a_sub_compaction_job_after_three_preemptions()
+    -> anyhow::Result<()> {
+        let harness = TenantHarness::create(
+            "test_gc_compaction_queue_gives_up_a_sub_compaction_job_after_three_preemptions",
+        )
+        .await?;
+        let (tenant, ctx) = harness.load().await;
+        let tline = gc_compaction_queue_test_timeline(&tenant, &ctx).await?;
+        let layers_before = inspect_and_sort(&tline, None).await;
+
+        let queue = GcCompactionQueue::new();
+        queue.schedule_sub_compaction_job_for_test(preemptible_gc_compaction_options());
+        let cancel = CancellationToken::new();
+
+        for attempt in 1..=3 {
+            tline.ask_compaction_to_yield_for_l0_for_test();
+            let outcome = queue
+                .iteration(&cancel, &ctx, &tenant.gc_block, &tline)
+                .await
+                .unwrap();
+            assert_eq!(outcome, CompactionOutcome::YieldForL0, "attempt {attempt}");
+            let expected_left = if attempt < 3 { 1 } else { 0 };
+            assert_eq!(
+                queue.remaining_jobs_num(),
+                expected_left,
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(
+            inspect_and_sort(&tline, None).await,
+            layers_before,
+            "no attempt wrote anything"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn test_simple_bottom_most_compaction_drops_history_below_base_image()
+    -> anyhow::Result<()> {
+        let harness = TenantHarness::create(
+            "test_simple_bottom_most_compaction_drops_history_below_base_image",
+        )
+        .await?;
+        let (tenant, ctx) = harness.load().await;
+
+        fn get_key(id: u32) -> Key {
+            // using aux key here b/c they are guaranteed to be inside `collect_keyspace`.
+            let mut key = Key::from_hex("620000000033333333444444445500000000").unwrap();
+            key.field6 = id;
+            key
+        }
+
+        let img_layer = (0..10)
+            .map(|id| (get_key(id), Bytes::from(format!("value {id}@0x10"))))
+            .collect_vec();
+        // key 1 gets a new base image at 0x18, below the lowest retain LSN: its older history is not
+        // needed by anyone and gc-compaction must not keep it in memory.
+        let rebased_img_layer = vec![(get_key(1), Bytes::from_static(b"rebased 1@0x18"))];
+
+        let delta1 = vec![(
+            get_key(1),
+            Lsn(0x12),
+            Value::WalRecord(NeonWalRecord::wal_append("@0x12")),
+        )];
+        let delta2 = vec![
+            (
+                get_key(1),
+                Lsn(0x20),
+                Value::WalRecord(NeonWalRecord::wal_append("@0x20")),
+            ),
+            (
+                get_key(1),
+                Lsn(0x28),
+                Value::WalRecord(NeonWalRecord::wal_append("@0x28")),
+            ),
+            (
+                get_key(1),
+                Lsn(0x38),
+                Value::WalRecord(NeonWalRecord::wal_append("@0x38")),
+            ),
+        ];
+
+        let tline = tenant
+            .create_test_timeline_with_layers(
+                TIMELINE_ID,
+                Lsn(0x10),
+                DEFAULT_PG_VERSION,
+                &ctx,
+                Vec::new(), // in-memory layers
+                vec![
+                    DeltaLayerTestDesc::new_with_inferred_key_range(Lsn(0x10)..Lsn(0x18), delta1),
+                    DeltaLayerTestDesc::new_with_inferred_key_range(Lsn(0x18)..Lsn(0x50), delta2),
+                ], // delta layers
+                vec![(Lsn(0x10), img_layer), (Lsn(0x18), rebased_img_layer)], // image layers
+                Lsn(0x50),
+            )
+            .await?;
+        {
+            tline
+                .applied_gc_cutoff_lsn
+                .lock_for_write()
+                .store_and_unlock(Lsn(0x30))
+                .wait()
+                .await;
+            let mut guard = tline.gc_info.write().unwrap();
+            *guard = GcInfo {
+                retain_lsns: vec![(Lsn(0x20), tline.timeline_id, MaybeOffloaded::No)],
+                cutoffs: GcCutoffs {
+                    time: Some(Lsn(0x30)),
+                    space: Lsn(0x30),
+                },
+                leases: Default::default(),
+                within_ancestor_pitr: false,
+            };
+        }
+
+        let verify_result = || async {
+            for (lsn, expected) in [
+                (Lsn(0x50), "rebased 1@0x18@0x20@0x28@0x38"),
+                (Lsn(0x30), "rebased 1@0x18@0x20@0x28"),
+                (Lsn(0x20), "rebased 1@0x18@0x20"),
+            ] {
+                assert_eq!(
+                    tline.get(get_key(1), lsn, &ctx).await.unwrap(),
+                    Bytes::from(expected),
+                    "key 1 at {lsn}"
+                );
+            }
+            for idx in [0, 2, 9] {
+                assert_eq!(
+                    tline.get(get_key(idx), Lsn(0x50), &ctx).await.unwrap(),
+                    Bytes::from(format!("value {idx}@0x10")),
+                );
+            }
+        };
+
+        verify_result().await;
+
+        let cancel = CancellationToken::new();
+        tline
+            .compact_with_gc(
+                &cancel,
+                CompactOptions::default_for_gc_compaction_unit_tests(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        verify_result().await;
+
+        // compact again
+        tline
+            .compact_with_gc(
+                &cancel,
+                CompactOptions::default_for_gc_compaction_unit_tests(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        verify_result().await;
+
+        Ok(())
+    }
+
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn test_simple_bottom_most_compaction_on_branch() -> anyhow::Result<()> {
