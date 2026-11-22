@@ -79,6 +79,10 @@ const COMPACTION_DELTA_THRESHOLD: usize = 5;
 /// shard split, which gets expensive for large tenants.
 const ANCESTOR_COMPACTION_REWRITE_THRESHOLD: f64 = 0.3;
 
+/// How many times a gc-compaction sub-compaction job is attempted when it keeps getting preempted
+/// by L0 compaction before it is abandoned for the current meta job.
+const MAX_GC_COMPACTION_SUB_JOB_ATTEMPTS: usize = 3;
+
 #[derive(Default, Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize)]
 pub struct GcCompactionJobId(pub usize);
 
@@ -107,6 +111,8 @@ pub enum GcCompactionQueueItem {
         i: usize,
         total: usize,
         options: CompactOptions,
+        /// 1-based attempt number; incremented each time the job is re-queued after yielding to L0.
+        attempt: usize,
     },
     Notify(GcCompactionJobId, Option<Lsn>),
 }
@@ -120,6 +126,10 @@ pub struct GcCompactionMetaStatistics {
     pub failed_sub_compaction_jobs: usize,
     /// The total number of sub compaction jobs that succeeded.
     pub succeeded_sub_compaction_jobs: usize,
+    /// The number of times a sub compaction job yielded to L0 compaction (and was re-queued or abandoned).
+    pub yielded_sub_compaction_jobs: usize,
+    /// The number of sub compaction jobs abandoned after yielding to L0 compaction too many times.
+    pub abandoned_sub_compaction_jobs: usize,
     /// The layer size before compaction.
     pub before_compaction_layer_size: u64,
     /// The layer size after compaction.
@@ -274,6 +284,26 @@ impl GcCompactionQueue {
             },
         ));
         guard.guards.entry(id).or_default().permit = Some(permit);
+        id
+    }
+
+    /// Schedule one sub-compaction job on its own, as a meta job's split would (tests of the retry of a preempted job).
+    #[cfg(test)]
+    pub(crate) fn schedule_sub_compaction_job_for_test(
+        &self,
+        options: CompactOptions,
+    ) -> GcCompactionJobId {
+        let mut guard = self.inner.lock().unwrap();
+        let id = guard.next_id();
+        guard.queued.push_back((
+            id,
+            GcCompactionQueueItem::SubCompactionJob {
+                options,
+                i: 0,
+                total: 1,
+                attempt: 1,
+            },
+        ));
         id
     }
 
@@ -519,6 +549,7 @@ impl GcCompactionQueue {
                     options,
                     i,
                     total: jobs_len,
+                    attempt: 1,
                 });
             }
 
@@ -663,7 +694,12 @@ impl GcCompactionQueue {
                     }
                 }
             }
-            GcCompactionQueueItem::SubCompactionJob { options, i, total } => {
+            GcCompactionQueueItem::SubCompactionJob {
+                options,
+                i,
+                total,
+                attempt,
+            } => {
                 // TODO: error handling, clear the queue if any task fails?
                 let _gc_guard = match gc_block.start().await {
                     Ok(guard) => guard,
@@ -675,8 +711,13 @@ impl GcCompactionQueue {
                         )));
                     }
                 };
-                info!("running gc-compaction subcompaction job {}/{}", i, total);
-                let res = timeline.compact_with_options(cancel, options, ctx).await;
+                info!(
+                    "running gc-compaction subcompaction job {}/{} (attempt {})",
+                    i, total, attempt
+                );
+                let res = timeline
+                    .compact_with_options(cancel, options.clone(), ctx)
+                    .await;
                 let compaction_result = match res {
                     Ok(res) => res,
                     Err(err) => {
@@ -690,12 +731,52 @@ impl GcCompactionQueue {
                     }
                 };
                 if compaction_result == CompactionOutcome::YieldForL0 {
-                    // We will permenantly give up a task if we yield for L0 compaction: the preempted subcompaction job won't be running
-                    // again. This ensures that we don't keep doing duplicated work within gc-compaction. Not directly returning here because
-                    // we need to clean things up before returning from the function.
+                    // A preempted sub-compaction job produced nothing. Instead of silently dropping it (which would
+                    // leave its key range uncompacted while the meta job still advances l2_lsn), re-queue it so it
+                    // runs again after L0 compaction, right before the meta job's Notify. Give up after a bounded
+                    // number of attempts so that we don't keep redoing work under sustained L0 pressure; an
+                    // abandoned job prevents the l2_lsn update in Notify. Not directly returning here because we
+                    // need to clean things up before returning from the function.
                     yield_for_l0 = true;
-                }
-                {
+                    let mut guard = self.inner.lock().unwrap();
+                    if let Some(ref mut meta_statistics) = guard.meta_statistics {
+                        meta_statistics.yielded_sub_compaction_jobs += 1;
+                    }
+                    if attempt < MAX_GC_COMPACTION_SUB_JOB_ATTEMPTS {
+                        info!(
+                            "re-queueing preempted gc-compaction subcompaction job {}/{} (attempt {})",
+                            i,
+                            total,
+                            attempt + 1
+                        );
+                        let retry_id = guard.next_id();
+                        let pos = guard
+                            .queued
+                            .iter()
+                            .position(|(_, item)| matches!(item, GcCompactionQueueItem::Notify(..)))
+                            .unwrap_or(guard.queued.len());
+                        guard.queued.insert(
+                            pos,
+                            (
+                                retry_id,
+                                GcCompactionQueueItem::SubCompactionJob {
+                                    options,
+                                    i,
+                                    total,
+                                    attempt: attempt + 1,
+                                },
+                            ),
+                        );
+                    } else {
+                        warn!(
+                            "abandoning gc-compaction subcompaction job {}/{} after {} attempts preempted by L0 compaction",
+                            i, total, attempt
+                        );
+                        if let Some(ref mut meta_statistics) = guard.meta_statistics {
+                            meta_statistics.abandoned_sub_compaction_jobs += 1;
+                        }
+                    }
+                } else {
                     let mut guard = self.inner.lock().unwrap();
                     if let Some(ref mut meta_statistics) = guard.meta_statistics {
                         meta_statistics.succeeded_sub_compaction_jobs += 1;
@@ -703,12 +784,16 @@ impl GcCompactionQueue {
                 }
             }
             GcCompactionQueueItem::Notify(id, l2_lsn) => {
-                let below_lsn = {
+                let (below_lsn, incomplete_sub_compaction_jobs) = {
                     let mut guard = self.inner.lock().unwrap();
                     if let Some(ref mut meta_statistics) = guard.meta_statistics {
-                        meta_statistics.below_lsn
+                        (
+                            meta_statistics.below_lsn,
+                            meta_statistics.failed_sub_compaction_jobs
+                                + meta_statistics.abandoned_sub_compaction_jobs,
+                        )
                     } else {
-                        Lsn::INVALID
+                        (Lsn::INVALID, 0)
                     }
                 };
                 let layer_size = if below_lsn != Lsn::INVALID {
@@ -724,6 +809,18 @@ impl GcCompactionQueue {
                     }
                 }
                 self.notify_and_unblock(id);
+                let l2_lsn = match l2_lsn {
+                    Some(l2_lsn) if incomplete_sub_compaction_jobs > 0 => {
+                        // Layers in the key ranges of failed/abandoned jobs were not compacted. Advancing l2_lsn
+                        // would count them as already compacted (l2) and delay the next auto-trigger indefinitely.
+                        warn!(
+                            "not updating l2_lsn to {}: {} sub-compaction jobs did not complete",
+                            l2_lsn, incomplete_sub_compaction_jobs
+                        );
+                        None
+                    }
+                    l2_lsn => l2_lsn,
+                };
                 if let Some(l2_lsn) = l2_lsn {
                     let current_l2_lsn = timeline
                         .get_gc_compaction_state()
@@ -1213,8 +1310,9 @@ impl Timeline {
             .flags
             .contains(CompactFlags::EnhancedGcBottomMostCompaction)
         {
-            self.compact_with_gc(cancel, options, ctx).await?;
-            return Ok(CompactionOutcome::Done);
+            // Propagate the outcome: a gc-compaction preempted by L0 compaction returns `YieldForL0` without
+            // having written anything, and the gc-compaction queue must not count it as done.
+            return self.compact_with_gc(cancel, options, ctx).await;
         }
 
         if options.flags.contains(CompactFlags::DryRun) {
@@ -3217,12 +3315,16 @@ impl Timeline {
             let jobs_len = jobs.len();
             for (idx, job) in jobs.into_iter().enumerate() {
                 let sub_compaction_progress = format!("{}/{}", idx + 1, jobs_len);
-                self.compact_with_gc_inner(cancel, job, ctx, yield_for_l0)
+                let outcome = self
+                    .compact_with_gc_inner(cancel, job, ctx, yield_for_l0)
                     .instrument(info_span!(
                         "sub_compaction",
                         sub_compaction_progress = sub_compaction_progress
                     ))
                     .await?;
+                if outcome == CompactionOutcome::YieldForL0 {
+                    return Ok(outcome);
+                }
             }
             if jobs_len == 0 {
                 info!("no jobs to run, skipping gc bottom-most compaction");

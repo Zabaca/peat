@@ -221,6 +221,8 @@ def test_pageserver_gc_compaction_preempt(
     workload.validate(env.pageserver.id)
     # ensure gc_compaction gets preempted and then resumed
     env.pageserver.assert_log_contains("preempt gc-compaction")
+    # a preempted sub-compaction job is queued again (Peat; before, the queue counted it as done)
+    env.pageserver.assert_log_contains("re-queueing preempted gc-compaction subcompaction job")
 
 
 @skip_in_debug_build("only run with release build")

@@ -7674,6 +7674,12 @@ impl Timeline {
         Ok(all_data)
     }
 
+    /// What L0 compaction does when layers pile up: the next compaction that yields for L0 does (once).
+    #[cfg(test)]
+    pub(crate) fn ask_compaction_to_yield_for_l0_for_test(&self) {
+        self.l0_compaction_trigger.notify_one();
+    }
+
     /// Get all historic layer descriptors in the layer map
     #[cfg(test)]
     pub(crate) async fn inspect_historic_layers(
