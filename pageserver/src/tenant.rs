@@ -10778,7 +10778,7 @@ mod tests {
     /// `test_simple_bottom_most_compaction_images`).
     #[cfg(feature = "testing")]
     async fn gc_compaction_queue_test_timeline(
-        tenant: &Arc<Tenant>,
+        tenant: &Arc<TenantShard>,
         ctx: &RequestContext,
     ) -> anyhow::Result<Arc<Timeline>> {
         fn get_key(id: u32) -> Key {
@@ -10896,7 +10896,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // L0 compaction asks gc-compaction to yield: the stored permit is taken by the first run.
-        tline.l0_compaction_trigger.notify_one();
+        tline.ask_compaction_to_yield_for_l0_for_test();
         let first = queue
             .iteration(&cancel, &ctx, &tenant.gc_block, &tline)
             .await
@@ -10949,7 +10949,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         for attempt in 1..=3 {
-            tline.l0_compaction_trigger.notify_one();
+            tline.ask_compaction_to_yield_for_l0_for_test();
             let outcome = queue
                 .iteration(&cancel, &ctx, &tenant.gc_block, &tline)
                 .await
