@@ -10972,6 +10972,134 @@ mod tests {
 
     #[cfg(feature = "testing")]
     #[tokio::test]
+    async fn test_simple_bottom_most_compaction_drops_history_below_base_image()
+    -> anyhow::Result<()> {
+        let harness = TenantHarness::create(
+            "test_simple_bottom_most_compaction_drops_history_below_base_image",
+        )
+        .await?;
+        let (tenant, ctx) = harness.load().await;
+
+        fn get_key(id: u32) -> Key {
+            // using aux key here b/c they are guaranteed to be inside `collect_keyspace`.
+            let mut key = Key::from_hex("620000000033333333444444445500000000").unwrap();
+            key.field6 = id;
+            key
+        }
+
+        let img_layer = (0..10)
+            .map(|id| (get_key(id), Bytes::from(format!("value {id}@0x10"))))
+            .collect_vec();
+        // key 1 gets a new base image at 0x18, below the lowest retain LSN: its older history is not
+        // needed by anyone and gc-compaction must not keep it in memory.
+        let rebased_img_layer = vec![(get_key(1), Bytes::from_static(b"rebased 1@0x18"))];
+
+        let delta1 = vec![(
+            get_key(1),
+            Lsn(0x12),
+            Value::WalRecord(NeonWalRecord::wal_append("@0x12")),
+        )];
+        let delta2 = vec![
+            (
+                get_key(1),
+                Lsn(0x20),
+                Value::WalRecord(NeonWalRecord::wal_append("@0x20")),
+            ),
+            (
+                get_key(1),
+                Lsn(0x28),
+                Value::WalRecord(NeonWalRecord::wal_append("@0x28")),
+            ),
+            (
+                get_key(1),
+                Lsn(0x38),
+                Value::WalRecord(NeonWalRecord::wal_append("@0x38")),
+            ),
+        ];
+
+        let tline = tenant
+            .create_test_timeline_with_layers(
+                TIMELINE_ID,
+                Lsn(0x10),
+                DEFAULT_PG_VERSION,
+                &ctx,
+                Vec::new(), // in-memory layers
+                vec![
+                    DeltaLayerTestDesc::new_with_inferred_key_range(Lsn(0x10)..Lsn(0x18), delta1),
+                    DeltaLayerTestDesc::new_with_inferred_key_range(Lsn(0x18)..Lsn(0x50), delta2),
+                ], // delta layers
+                vec![(Lsn(0x10), img_layer), (Lsn(0x18), rebased_img_layer)], // image layers
+                Lsn(0x50),
+            )
+            .await?;
+        {
+            tline
+                .applied_gc_cutoff_lsn
+                .lock_for_write()
+                .store_and_unlock(Lsn(0x30))
+                .wait()
+                .await;
+            let mut guard = tline.gc_info.write().unwrap();
+            *guard = GcInfo {
+                retain_lsns: vec![(Lsn(0x20), tline.timeline_id, MaybeOffloaded::No)],
+                cutoffs: GcCutoffs {
+                    time: Some(Lsn(0x30)),
+                    space: Lsn(0x30),
+                },
+                leases: Default::default(),
+                within_ancestor_pitr: false,
+            };
+        }
+
+        let verify_result = || async {
+            for (lsn, expected) in [
+                (Lsn(0x50), "rebased 1@0x18@0x20@0x28@0x38"),
+                (Lsn(0x30), "rebased 1@0x18@0x20@0x28"),
+                (Lsn(0x20), "rebased 1@0x18@0x20"),
+            ] {
+                assert_eq!(
+                    tline.get(get_key(1), lsn, &ctx).await.unwrap(),
+                    Bytes::from(expected),
+                    "key 1 at {lsn}"
+                );
+            }
+            for idx in [0, 2, 9] {
+                assert_eq!(
+                    tline.get(get_key(idx), Lsn(0x50), &ctx).await.unwrap(),
+                    Bytes::from(format!("value {idx}@0x10")),
+                );
+            }
+        };
+
+        verify_result().await;
+
+        let cancel = CancellationToken::new();
+        tline
+            .compact_with_gc(
+                &cancel,
+                CompactOptions::default_for_gc_compaction_unit_tests(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        verify_result().await;
+
+        // compact again
+        tline
+            .compact_with_gc(
+                &cancel,
+                CompactOptions::default_for_gc_compaction_unit_tests(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        verify_result().await;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
     async fn test_simple_bottom_most_compaction_on_branch() -> anyhow::Result<()> {
         use models::CompactLsnRange;
 
