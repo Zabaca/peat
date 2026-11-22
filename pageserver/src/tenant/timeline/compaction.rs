@@ -83,6 +83,60 @@ const ANCESTOR_COMPACTION_REWRITE_THRESHOLD: f64 = 0.3;
 /// by L0 compaction before it is abandoned for the current meta job.
 const MAX_GC_COMPACTION_SUB_JOB_ATTEMPTS: usize = 3;
 
+/// The history of a single key that gc-compaction keeps in memory must stay below this size.
+const GC_COMPACTION_MAX_KEY_HISTORY_BYTES: usize = 1024 * 1024 * 512;
+
+/// The history of a single key collected by the gc-compaction main loop, sorted by LSN.
+///
+/// `generate_key_retention` only needs the history from the latest base (an image or a WAL record that
+/// does not need a base image) at or below `truncate_below`, the lowest LSN it reconstructs the key at
+/// (the lowest retain LSN, or the GC horizon). Everything older is garbage that would be dropped anyway,
+/// so it is not kept in memory. Otherwise a frequently updated page (e.g. a visibility map page) with
+/// months of history exceeds the memory limit and the whole compaction job fails.
+struct KeyHistoryAccumulator {
+    values: Vec<(Key, Lsn, Value)>,
+    estimated_size: usize,
+    truncate_below: Lsn,
+    limit: usize,
+}
+
+impl KeyHistoryAccumulator {
+    fn new(truncate_below: Lsn, limit: usize) -> Self {
+        Self {
+            values: Vec::new(),
+            estimated_size: 0,
+            truncate_below,
+            limit,
+        }
+    }
+
+    fn values(&self) -> &[(Key, Lsn, Value)] {
+        &self.values
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        self.estimated_size = 0;
+    }
+
+    fn push(&mut self, key: Key, lsn: Lsn, val: Value) -> Result<(), CompactionError> {
+        if val.will_init() && lsn <= self.truncate_below {
+            self.clear();
+        }
+        self.estimated_size += val.estimated_size();
+        self.values.push((key, lsn, val));
+        if self.estimated_size >= self.limit {
+            return Err(CompactionError::Other(anyhow!(
+                "too many values for a single key: {} for key {}, {} items",
+                self.estimated_size,
+                key,
+                self.values.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default, Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize)]
 pub struct GcCompactionJobId(pub usize);
 
@@ -3712,8 +3766,14 @@ impl Timeline {
         let mut timer = Instant::now();
 
         // Step 2: Produce images+deltas.
-        let mut accumulated_values = Vec::new();
-        let mut accumulated_values_estimated_size = 0;
+        let truncate_history_below = job_desc
+            .retain_lsns_below_horizon
+            .first()
+            .copied()
+            .unwrap_or(job_desc.gc_cutoff)
+            .min(job_desc.gc_cutoff);
+        let mut accumulated_values =
+            KeyHistoryAccumulator::new(truncate_history_below, GC_COMPACTION_MAX_KEY_HISTORY_BYTES);
         let mut last_key: Option<Key> = None;
 
         // Only create image layers when there is no ancestor branches. TODO: create covering image layer
@@ -3881,25 +3941,14 @@ impl Timeline {
                 if last_key.is_none() {
                     last_key = Some(key);
                 }
-                accumulated_values_estimated_size += val.estimated_size();
-                accumulated_values.push((key, lsn, val));
-
-                // Accumulated values should never exceed 512MB.
-                if accumulated_values_estimated_size >= 1024 * 1024 * 512 {
-                    return Err(CompactionError::Other(anyhow!(
-                        "too many values for a single key: {} for key {}, {} items",
-                        accumulated_values_estimated_size,
-                        key,
-                        accumulated_values.len()
-                    )));
-                }
+                accumulated_values.push(key, lsn, val)?;
             } else {
                 let last_key: &mut Key = last_key.as_mut().unwrap();
                 stat.on_unique_key_visited(); // TODO: adjust statistics for partial compaction
                 let retention = self
                     .generate_key_retention(
                         *last_key,
-                        &accumulated_values,
+                        accumulated_values.values(),
                         job_desc.gc_cutoff,
                         &job_desc.retain_lsns_below_horizon,
                         COMPACTION_DELTA_THRESHOLD,
@@ -3925,8 +3974,7 @@ impl Timeline {
                     .map_err(CompactionError::Other)?;
                 accumulated_values.clear();
                 *last_key = key;
-                accumulated_values_estimated_size = val.estimated_size();
-                accumulated_values.push((key, lsn, val));
+                accumulated_values.push(key, lsn, val)?;
             }
         }
 
@@ -3941,7 +3989,7 @@ impl Timeline {
         let retention = self
             .generate_key_retention(
                 last_key,
-                &accumulated_values,
+                accumulated_values.values(),
                 job_desc.gc_cutoff,
                 &job_desc.retain_lsns_below_horizon,
                 COMPACTION_DELTA_THRESHOLD,
@@ -4684,3 +4732,172 @@ impl CompactionLayer<Key> for ResidentImageLayer {
     }
 }
 impl CompactionImageLayer<TimelineAdaptor> for ResidentImageLayer {}
+
+#[cfg(all(test, feature = "testing"))]
+mod key_history_tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    fn key() -> Key {
+        Key::from_hex("000000067F00000005003AA3DB0200000000").unwrap()
+    }
+
+    fn image(lsn: u64) -> (Lsn, Value) {
+        (Lsn(lsn), Value::Image(Bytes::from(vec![0u8; 100])))
+    }
+
+    fn delta(lsn: u64) -> (Lsn, Value) {
+        (
+            Lsn(lsn),
+            Value::WalRecord(NeonWalRecord::wal_append("x".repeat(100))),
+        )
+    }
+
+    fn lsns(acc: &KeyHistoryAccumulator) -> Vec<u64> {
+        acc.values().iter().map(|(_, lsn, _)| lsn.0).collect()
+    }
+
+    fn push_all(
+        acc: &mut KeyHistoryAccumulator,
+        values: Vec<(Lsn, Value)>,
+    ) -> Result<(), CompactionError> {
+        for (lsn, val) in values {
+            acc.push(key(), lsn, val)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn image_below_horizon_drops_older_history() {
+        let mut acc = KeyHistoryAccumulator::new(Lsn(0x40), usize::MAX);
+        push_all(
+            &mut acc,
+            vec![
+                image(0x10),
+                delta(0x18),
+                delta(0x20),
+                image(0x30),
+                delta(0x38),
+                delta(0x48),
+            ],
+        )
+        .unwrap();
+        assert_eq!(lsns(&acc), vec![0x30, 0x38, 0x48]);
+    }
+
+    #[test]
+    fn will_init_record_is_a_base() {
+        let mut acc = KeyHistoryAccumulator::new(Lsn(0x40), usize::MAX);
+        let will_init = (Lsn(0x30), Value::WalRecord(NeonWalRecord::wal_init("init")));
+        assert!(will_init.1.will_init());
+        push_all(
+            &mut acc,
+            vec![image(0x10), delta(0x20), will_init, delta(0x38)],
+        )
+        .unwrap();
+        assert_eq!(lsns(&acc), vec![0x30, 0x38]);
+    }
+
+    #[test]
+    fn history_above_truncation_point_is_kept() {
+        // 0x20 is the lowest retain LSN: the image at 0x30 must not drop the history needed at 0x20,
+        // and nothing above the horizon is ever dropped.
+        let mut acc = KeyHistoryAccumulator::new(Lsn(0x20), usize::MAX);
+        push_all(
+            &mut acc,
+            vec![
+                image(0x10),
+                delta(0x18),
+                image(0x30),
+                delta(0x38),
+                image(0x50),
+                delta(0x58),
+            ],
+        )
+        .unwrap();
+        assert_eq!(lsns(&acc), vec![0x10, 0x18, 0x30, 0x38, 0x50, 0x58]);
+    }
+
+    #[test]
+    fn periodic_images_keep_long_history_below_the_limit() {
+        // ~100k values of ~100 bytes would exceed a 1 MB limit, but an image every 100 values keeps
+        // only the tail in memory.
+        let mut acc = KeyHistoryAccumulator::new(Lsn(u64::MAX), 1024 * 1024);
+        for i in 0..100_000u64 {
+            let (lsn, val) = if i % 100 == 0 {
+                image(0x10 + i)
+            } else {
+                delta(0x10 + i)
+            };
+            acc.push(key(), lsn, val).unwrap();
+        }
+        assert!(acc.values().len() <= 100);
+    }
+
+    #[test]
+    fn history_without_a_base_still_hits_the_limit() {
+        let mut acc = KeyHistoryAccumulator::new(Lsn(u64::MAX), 1024 * 1024);
+        acc.push(key(), Lsn(0x10), image(0x10).1).unwrap();
+        let err = (1..100_000u64)
+            .find_map(|i| acc.push(key(), Lsn(0x10 + i), delta(0x10 + i).1).err())
+            .expect("limit must be hit");
+        assert!(
+            err.to_string().contains("too many values for a single key"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(size: usize) -> Value {
+        Value::Image(Bytes::from(vec![0u8; size]))
+    }
+
+    /// History below the latest base image at or below the lowest LSN anything reads is dropped as it is
+    /// collected, so a key rewritten many times below it stays small and the job does not fail on the limit.
+    #[test]
+    fn key_history_below_the_base_image_is_not_kept() {
+        let mut acc = KeyHistoryAccumulator::new(Lsn(0x1000), 10_000);
+        // 50 images of 1000 bytes each at ascending LSNs, all at or below the truncation point: 50 000
+        // bytes in all, five times the limit. Each is a base, so only the newest is kept.
+        for i in 1..=50u64 {
+            acc.push(Key::MIN, Lsn(i * 0x10), image(1000)).unwrap();
+            assert_eq!(acc.values().len(), 1);
+        }
+        assert_eq!(acc.values()[0].1, Lsn(50 * 0x10));
+    }
+
+    /// History above the truncation point is all needed, and the limit still applies to it.
+    #[test]
+    fn key_history_above_the_truncation_point_is_kept_and_still_limited() {
+        let mut acc = KeyHistoryAccumulator::new(Lsn(0x100), 10_000);
+        acc.push(Key::MIN, Lsn(0x10), image(1000)).unwrap(); // the base at or below the point
+        for i in 0..8u64 {
+            acc.push(Key::MIN, Lsn(0x200 + i), image(1000)).unwrap();
+        }
+        assert_eq!(acc.values().len(), 9); // 9 000 bytes: the base and eight newer values
+        // an image above the point is a base for later reads but is not below it, so nothing is dropped
+        let err = acc.push(Key::MIN, Lsn(0x300), image(1000)).unwrap_err();
+        assert!(err.to_string().contains("too many values for a single key"));
+    }
+
+    /// `clear` resets the size as well as the values.
+    #[test]
+    fn clear_resets_the_size() {
+        let mut acc = KeyHistoryAccumulator::new(Lsn(0x1000), 10_000);
+        for i in 1..=9u64 {
+            acc.push(Key::MIN, Lsn(i), image(1000)).unwrap();
+        }
+        acc.clear();
+        assert!(acc.values().is_empty());
+        // a full limit's worth fits again after a clear
+        for i in 1..=9u64 {
+            acc.push(Key::MIN, Lsn(0x2000 + i), image(1000)).unwrap();
+        }
+        assert_eq!(acc.values().len(), 9);
+    }
+}

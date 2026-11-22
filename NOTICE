@@ -3,3 +3,9 @@ Copyright 2022 - 2024 Neon Inc.
 
 The PostgreSQL submodules in vendor/ are licensed under the PostgreSQL license.
 See vendor/postgres-vX/COPYRIGHT for details.
+
+Two changes to the pageserver's gc-compaction (pageserver/src/tenant/timeline/compaction.rs) are taken from
+patches 0001 and 0003 of https://github.com/matisiekpl/neond (patches/neon/), licensed under the Apache
+License 2.0, the same licence as this repository: the retry of a sub-compaction job that L0 compaction
+preempted, and the dropping of a key's history below its base image. The unit tests that go with them are Peat's,
+except the one test in patch 0003.
