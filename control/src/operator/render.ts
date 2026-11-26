@@ -13,7 +13,11 @@
 //     Services that stay inside the cluster, whatever its program does.
 // Nothing rendered copies a label of the Platform object (a tool that applies the Platform by label and prunes what carries its label
 // would otherwise take the pieces with it). Each object carries the operator's own two labels and nothing of the Platform's.
+import { durationMs } from '../api/schema'
 import { GROUP, controlUser, frontDoor, placement, toEnv, type Names } from '../names'
+
+/** The pieces read a database's idle time in whole minutes (IDLE_MINUTES): the kinds' duration, at least one. */
+const idleMinutesOf = (d: string) => Math.max(1, Math.round(durationMs(d) / 60_000))
 import { SAFEKEEPER_RESOURCES } from '../storage-spec'
 import type { Resolved } from './platform'
 import { TOKENS, type Holder } from './keys'
@@ -295,7 +299,7 @@ export function controlEnv(r: Resolved, images = r.images): { name: string; valu
     { name: 'STORAGE_IMAGE', value: images.storage },
     { name: 'DEFAULT_PG_VERSION', value: String(s.computes.defaultPgVersion) },
     { name: 'PAGESERVER_SECONDARIES', value: s.pageservers.count > 1 ? '1' : '0' },
-    { name: 'IDLE_MINUTES', value: String(s.computes.idleMinutes) },
+    { name: 'IDLE_MINUTES', value: String(idleMinutesOf(s.computes.idleAfter)) },
     { name: 'COMPUTE_MEMORY_REQUEST', value: s.computes.memory.request },
     { name: 'COMPUTE_MEMORY_LIMIT', value: s.computes.memory.limit },
     { name: 'PGDATA_LIMIT', value: s.computes.scratch },
@@ -432,7 +436,7 @@ export function gateways(r: Resolved, images = r.images): Manifest[] {
           securityContext: RESTRICTED_POD,
           containers: [{
             name: 'gateway', image: images.control, args: ['gateway'],
-            env: [...toEnv(n), { name: 'HOME', value: '/tmp' }, { name: 'IDLE_MINUTES', value: String(r.spec.computes.idleMinutes) }, { name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } }],
+            env: [...toEnv(n), { name: 'HOME', value: '/tmp' }, { name: 'IDLE_MINUTES', value: String(idleMinutesOf(r.spec.computes.idleAfter)) }, { name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } }],
             ports: [{ name: 'pg', containerPort: PORTS.gatewayPg }, { name: 'metrics', containerPort: PORTS.gatewayMetrics }],
             resources: { requests: { cpu: '20m', memory: r.spec.gateways.memory.request }, limits: { memory: r.spec.gateways.memory.limit } },
             securityContext: RESTRICTED_CONTAINER, readinessProbe: probe, livenessProbe: { ...probe, failureThreshold: 10 },

@@ -1,5 +1,6 @@
 // The names every piece of the platform shares: its namespaces, the label that marks its machines, the taint the control layer puts on a
-// machine it has declared dead, the API group of its object kinds and the annotations its programs read. One meaning, one place.
+// machine it has declared dead, and the API group of its object kinds (also the prefix of its labels and annotations, each defined where it
+// is read). One meaning, one place: the Platform kind's defaults are these (a test holds the two together).
 //
 // Each has a neutral default. An install changes them through its Platform object (the operator passes them to the pieces it runs as
 // environment values, read here by `fromEnv`), so a cluster that already uses these namespaces or labels for something else can choose others.
@@ -57,7 +58,7 @@ export function parseTaint(text: string): Taint | null {
 }
 
 export const formatLabel = (l: Label): string => `${l.key}=${l.value}`
-export const formatTaint = (t: Taint | null): string => (t ? `${t.key}=${t.value}:${t.effect}` : '')
+export const formatTaint = (t: Taint | null): string => (t ? `${t.key}=${t.value ?? ''}:${t.effect}` : '')
 
 /** The names as a piece's environment gives them (the operator sets these; each one unset is the default). */
 export function fromEnv(env: Record<string, string | undefined> = process.env): Names {

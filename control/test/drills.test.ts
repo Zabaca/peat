@@ -237,52 +237,52 @@ describe('volumes', () => {
   })
   test('accepted: a path under a platform volume on a machine that has it', () => {
     const t = (m: string, p: string) => volumeTarget(m, p, SHAPE, DEFAULT_VOLUMES)
-    expect(t('machine-1', '/var/mnt/pageserver')).toEqual({ root: '/var/mnt/pageserver', sub: '' })
-    expect(t('machine-2', '/var/mnt/pageserver/neon/tenants/abc*')).toEqual({ root: '/var/mnt/pageserver', sub: 'neon/tenants/abc*' })
-    expect(t('machine-3', '/var/mnt/safekeeper/sk-3')).toEqual({ root: '/var/mnt/safekeeper', sub: 'sk-3' })
-    expect(t('machine-3', '/var/mnt/storcon-db/restored')).toEqual({ root: '/var/mnt/storcon-db', sub: 'restored' })
+    expect(t('machine-1', '/var/lib/peat/pageserver')).toEqual({ root: '/var/lib/peat/pageserver', sub: '' })
+    expect(t('machine-2', '/var/lib/peat/pageserver/neon/tenants/abc*')).toEqual({ root: '/var/lib/peat/pageserver', sub: 'neon/tenants/abc*' })
+    expect(t('machine-3', '/var/lib/peat/safekeeper/sk-3')).toEqual({ root: '/var/lib/peat/safekeeper', sub: 'sk-3' })
+    expect(t('machine-3', '/var/lib/peat/storcon-db/restored')).toEqual({ root: '/var/lib/peat/storcon-db', sub: 'restored' })
     // an outside machine has only the safekeepers' volume, and may have its member's directory wiped (the recovery drill)
-    expect(t('outside-1', '/var/mnt/safekeeper/sk-10')).toEqual({ root: '/var/mnt/safekeeper', sub: 'sk-10' })
+    expect(t('outside-1', '/var/lib/peat/safekeeper/sk-10')).toEqual({ root: '/var/lib/peat/safekeeper', sub: 'sk-10' })
   })
   test('the wipe Job on an outside machine is pinned to it by name and carries its safekeeper\'s own tolerations, and mounts only the safekeepers\' volume', async () => {
     const x = world(); const g = guard(x)
-    await g.wipeVolume('outside-1', '/var/mnt/safekeeper/sk-10')
+    await g.wipeVolume('outside-1', '/var/lib/peat/safekeeper/sk-10')
     const job = JSON.parse(x.stdins[x.argvs.findIndex((a) => a.includes('apply'))]!)
     expect(job.spec.template.spec.nodeSelector).toEqual({ 'kubernetes.io/hostname': 'outside-1' })
     expect(job.spec.template.spec.tolerations).toEqual([{ key: 'example.com/outside', operator: 'Equal', value: 'true', effect: 'NoSchedule' }])
-    expect(job.spec.template.spec.volumes).toEqual([{ name: 'vol', hostPath: { path: '/var/mnt/safekeeper', type: 'Directory' } }])
+    expect(job.spec.template.spec.volumes).toEqual([{ name: 'vol', hostPath: { path: '/var/lib/peat/safekeeper', type: 'Directory' } }])
     expect(job.spec.template.spec.containers[0].command[2]).toBe('rm -rf /vol/sk-10 ; echo wiped /vol/sk-10')
     expect(job.spec.template.spec.containers[0].securityContext).toEqual({ runAsUser: 0 })
   })
   const refused: [string, string][] = [
-    ['machine-3', '/var/mnt/pageserver'], ['machine-1', '/var/mnt/storcon-db'], ['machine-2', '/var/mnt/storcon-db/x'],
-    ['machine-1', '/'], ['machine-1', '/var'], ['machine-1', '/var/mnt'], ['machine-1', '/var/lib/containerd'], ['machine-1', '/etc/kubernetes'], ['machine-1', '/var/mnt/u-pageserver'], ['machine-1', '/var/mnt/pageserverx'], ['machine-1', '/var/mnt/pageserver/'],
-    ['machine-1', '/var/mnt/pageserver/..'], ['machine-1', '/var/mnt/pageserver/../safekeeper'], ['machine-1', '/var/mnt/pageserver/a/../../b'], ['machine-1', '/var/mnt/pageserver//x'], ['machine-1', '/var/mnt/pageserver/a b'], ['machine-1', '/var/mnt/pageserver/$(id)'], ['machine-1', '/var/mnt/pageserver/;rm'],
-    ['machine-1', '/var/mnt/pageserver/`x`'], ['machine-1', '/var/mnt/pageserver/a\nb'], ['machine-1', '/var/mnt/pageserver/.'], ['machine-1', '/var/mnt/pageserver/./x'], ['machine-1', 'var/mnt/pageserver'], ['machine-1', '../var/mnt/pageserver'], ['machine-1', '/var/mnt/pageserver/-rf'],
-    ['control-plane', '/var/mnt/pageserver'], ['db-machine', '/var/mnt/safekeeper'], ['outside-1', '/var/mnt/pageserver'], ['outside-1', '/var/mnt/storcon-db/x'], ['outside-1', '/var/mnt'], ['outside-1', '/var/lib/containerd'], ['outside-1', '/var/mnt/safekeeper/../x'], ['machine-10', '/var/mnt/safekeeper'], ['machine-1-db', '/var/mnt/pageserver'],
+    ['machine-3', '/var/lib/peat/pageserver'], ['machine-1', '/var/lib/peat/storcon-db'], ['machine-2', '/var/lib/peat/storcon-db/x'],
+    ['machine-1', '/'], ['machine-1', '/var'], ['machine-1', '/var/lib/peat'], ['machine-1', '/var/lib/containerd'], ['machine-1', '/etc/kubernetes'], ['machine-1', '/var/lib/peat/u-pageserver'], ['machine-1', '/var/lib/peat/pageserverx'], ['machine-1', '/var/lib/peat/pageserver/'],
+    ['machine-1', '/var/lib/peat/pageserver/..'], ['machine-1', '/var/lib/peat/pageserver/../safekeeper'], ['machine-1', '/var/lib/peat/pageserver/a/../../b'], ['machine-1', '/var/lib/peat/pageserver//x'], ['machine-1', '/var/lib/peat/pageserver/a b'], ['machine-1', '/var/lib/peat/pageserver/$(id)'], ['machine-1', '/var/lib/peat/pageserver/;rm'],
+    ['machine-1', '/var/lib/peat/pageserver/`x`'], ['machine-1', '/var/lib/peat/pageserver/a\nb'], ['machine-1', '/var/lib/peat/pageserver/.'], ['machine-1', '/var/lib/peat/pageserver/./x'], ['machine-1', 'var/mnt/pageserver'], ['machine-1', '../var/lib/peat/pageserver'], ['machine-1', '/var/lib/peat/pageserver/-rf'],
+    ['control-plane', '/var/lib/peat/pageserver'], ['db-machine', '/var/lib/peat/safekeeper'], ['outside-1', '/var/lib/peat/pageserver'], ['outside-1', '/var/lib/peat/storcon-db/x'], ['outside-1', '/var/lib/peat'], ['outside-1', '/var/lib/containerd'], ['outside-1', '/var/lib/peat/safekeeper/../x'], ['machine-10', '/var/lib/peat/safekeeper'], ['machine-1-db', '/var/lib/peat/pageserver'],
   ]
   for (const [m, p] of refused) test(`${m} ${JSON.stringify(p)} is refused`, () => expect(() => volumeTarget(m, p, SHAPE, DEFAULT_VOLUMES)).toThrow(Refusal))
   test('a refused wipe issues no command; an accepted one is a root Job pinned to that machine with only that volume\'s root mounted', async () => {
     const x = world(); const g = guard(x)
-    await expect(g.wipeVolume('machine-3', '/var/mnt/pageserver')).rejects.toBeInstanceOf(Refusal)
-    await expect(g.wipeVolume('db-machine', '/var/mnt/safekeeper/sk-1')).rejects.toBeInstanceOf(Refusal)
+    await expect(g.wipeVolume('machine-3', '/var/lib/peat/pageserver')).rejects.toBeInstanceOf(Refusal)
+    await expect(g.wipeVolume('db-machine', '/var/lib/peat/safekeeper/sk-1')).rejects.toBeInstanceOf(Refusal)
     expect(x.argvs.filter((a) => !a.includes('get'))).toEqual([])
-    await g.wipeVolume('machine-1', '/var/mnt/pageserver/neon/tenants/abc*')
+    await g.wipeVolume('machine-1', '/var/lib/peat/pageserver/neon/tenants/abc*')
     const apply = x.argvs.findIndex((a) => a.includes('apply'))
     expect(apply).toBeGreaterThanOrEqual(0)
     const job = JSON.parse(x.stdins[apply]!)
     expect(job.metadata.namespace).toBe('peat')
     expect(job.spec.template.spec.nodeSelector).toEqual({ [LABEL.key]: LABEL.value, 'kubernetes.io/hostname': 'machine-1' })
-    expect(job.spec.template.spec.volumes).toEqual([{ name: 'vol', hostPath: { path: '/var/mnt/pageserver', type: 'Directory' } }])
+    expect(job.spec.template.spec.volumes).toEqual([{ name: 'vol', hostPath: { path: '/var/lib/peat/pageserver', type: 'Directory' } }])
     expect(job.spec.template.spec.containers[0].command[2]).toBe('rm -rf /vol/neon/tenants/abc* ; echo wiped /vol/neon/tenants/abc*')
     expect(job.spec.template.spec.containers[0].image).toBe('registry.example/peat/storage:test')
-    expect(JSON.stringify(job)).not.toContain('/var/mnt/safekeeper')
+    expect(JSON.stringify(job)).not.toContain('/var/lib/peat/safekeeper')
   })
   test('a platform whose machines are tainted: the wipe Job tolerates the machines\' taint', async () => {
     const x = world()
     const s = settings()
     const g = new Guard(x, { clock: new FakeClock(), log: () => {}, stateDir: null, settings: { ...s, names: { ...s.names, machineTaint: { key: 'example.com/dedicated', value: 'db', effect: 'NoSchedule' } } } })
-    await g.wipeVolume('machine-2', '/var/mnt/pageserver')
+    await g.wipeVolume('machine-2', '/var/lib/peat/pageserver')
     const job = JSON.parse(x.stdins[x.argvs.findIndex((a) => a.includes('apply'))]!)
     expect(job.spec.template.spec.tolerations).toEqual([{ key: 'example.com/dedicated', operator: 'Equal', value: 'db', effect: 'NoSchedule' }])
   })
@@ -691,8 +691,10 @@ describe('the clients and the analysis', () => {
     expect(t).toContain("PGSSLMODE: 'verify-full'")
     expect(t).toContain("PGSSLROOTCERT: '/ca/ca.crt'")
     expect(t).toContain('`${db}.${n.dbNamespace}.svc`')
-    expect(t).toContain("'tls.crt'")
+    // the authority's public certificate from the ConfigMap the platform publishes in the database namespace; no Secret, no key
+    expect(t).toContain("['-n', this.n.dbNamespace, 'get', 'configmap', this.g.settings.caConfigMap]")
     expect(t).not.toContain("'tls.key'")
+    expect(t).not.toContain("'get', 'secret', this.g.settings")
   })
   test('analyzeWriter: acknowledged rows missing, the longest gap and what it began and ended after the fault', () => {
     const log = ['ok 1000 1100 1|t', 'ok 2000 2100 2|t', 'ok 3000 3100 3|t', 'err 4000 14000 rc=124 timeout', 'ok 15000 15100 4|t', 'ok 16000 16100 5|t', 'ok 17000 17100 5|t'].join('\n')

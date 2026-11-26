@@ -45,6 +45,10 @@ export function specOf(p: Platform): { spec: PlatformSpec } | { errors: string[]
   const errors = check(platformSpec, p.spec)
   if (errors.length) return { errors }
   const spec = withDefaults(platformSpec, p.spec) as PlatformSpec
+  // the pageservers' count is the operator's to default: two, or one with spread none, which allows no more (two pageservers on one machine
+  // would share its directory, and the second's start refuses the first's identity)
+  if (spec.pageservers.count === undefined) spec.pageservers.count = spec.spread === 'none' ? 1 : 2
+  if (spec.spread === 'none' && spec.pageservers.count > 1) return { errors: [`pageservers.count: spread none runs one pageserver, not ${spec.pageservers.count} (two would share one machine and its directory)`] }
   const store = spec.objectStore
   const missing: string[] = []
   for (const piece of ['pageservers', 'safekeepers', 'records'] as const) if (!store[piece] && !(store.bucket && store.credentialsSecret)) missing.push(piece)

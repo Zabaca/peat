@@ -58,7 +58,8 @@ export interface DrillSettings {
   /** The machines' host directories each storage piece keeps its data in (a wipe is accepted only below one of them). */
   volumes: { pageserver: string; safekeeper: string; controllerDatabase: string }
   /** The Secret, in the computes' namespace, holding the platform CA's certificate (`tls.crt`; its key is never read). */
-  caSecret: string
+  /** The ConfigMap, in the database namespace, holding the authority's public certificate (ca.crt): what a client verifies the databases with. */
+  caConfigMap: string
   /** The full-sleep time the control layer and the gateways run with (the sleep drills shorten it and the check after a drill wants it back). */
   idleMinutes: string
   controllerDatabase: ControllerDatabase | null
@@ -73,7 +74,8 @@ export interface DrillSettings {
   kubeconfig: string | null
 }
 
-export const DEFAULT_VOLUMES = { pageserver: '/var/mnt/pageserver', safekeeper: '/var/mnt/safekeeper', controllerDatabase: '/var/mnt/storcon-db' } as const
+/** The Platform kinds' own defaults (spec.pageservers.storage, spec.safekeepers.storage), and the controller database's beside them. */
+export const DEFAULT_VOLUMES = { pageserver: '/var/lib/peat/pageserver', safekeeper: '/var/lib/peat/safekeeper', controllerDatabase: '/var/lib/peat/storcon-db' } as const
 
 /** `namespace/name`, plain names both. */
 function nsName(text: string, what: string): { namespace: string; name: string } {
@@ -110,7 +112,7 @@ export function drillSettings(env: Record<string, string | undefined> = process.
     prometheus: prom ? { namespace: prom.namespace, service: prom.name.includes(':') ? prom.name : `${prom.name}:80` } : null,
     rulesFile: env['PEAT_DRILL_RULES'] || null,
     volumes,
-    caSecret: env['PEAT_CA_SECRET'] || 'peat-ca',
+    caConfigMap: env['PEAT_CA_CONFIGMAP'] || 'peat-ca',
     idleMinutes: env['IDLE_MINUTES'] || '30',
     controllerDatabase: cdb ? { cluster: 'storcon-db', image: '', storageClass: '', objectStore: '', archive: cdb.cluster ?? 'storcon-db', database: 'storage_controller', machine: '', ...cdb } as ControllerDatabase : null,
     recreatable: new RegExp(env['PEAT_DRILL_RECREATABLE'] ? `^drill|${env['PEAT_DRILL_RECREATABLE']}` : '^drill'),

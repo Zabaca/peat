@@ -125,7 +125,7 @@ spec:
   controller: { records: postgres, postgres: { urlSecret: records-db } }
   gateways: { count: 1 }
   control: { replicas: 1 }
-  computes: { idleMinutes: 1 }
+  computes: { idleAfter: 1m }
 EOF
 
 echo "== every piece Ready"
