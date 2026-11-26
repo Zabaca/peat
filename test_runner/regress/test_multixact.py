@@ -21,8 +21,12 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 # See src/include/access/multixact.h and slru.h
-MULTIXACT_OFFSETS_PER_PAGE = 8192 // 4
 SLRU_PAGES_PER_SEGMENT = 32
+
+
+def multixact_offset_size(pg_version: PgVersion) -> int:
+    # A MultiXactOffset is 4 bytes up to Postgres 18 and 8 bytes since 19
+    return 8 if pg_version == PgVersion.V19 else 4
 
 
 #
@@ -129,6 +133,8 @@ def test_multixact_next_offset(
     env = neon_env_builder.init_start(
         initial_tenant_conf={"lazy_slru_download": lazy_slru_download}
     )
+    offset_size = multixact_offset_size(env.pg_version)
+    offsets_per_page = 8192 // offset_size
     endpoint = env.endpoints.create_start("main")
 
     endpoint.safe_psql("CREATE TABLE t(i int primary key)")
@@ -150,7 +156,7 @@ def test_multixact_next_offset(
     mxid = create_multixact()
     if page_boundary:
         # Create multixids until the next one is the first on a new page
-        while (mxid + 1) % MULTIXACT_OFFSETS_PER_PAGE != 0:
+        while (mxid + 1) % offsets_per_page != 0:
             mxid = create_multixact()
     else:
         for _ in range(10):
@@ -178,11 +184,12 @@ def test_multixact_next_offset(
     assert query_scalar(cur, f"SELECT count(*) FROM pg_get_multixact_members('{mxid}')") == 2
 
     # The next multixid's entry must be set, to where the last multixid's members end
-    segno = next_mxid // (MULTIXACT_OFFSETS_PER_PAGE * SLRU_PAGES_PER_SEGMENT)
-    entry = next_mxid % (MULTIXACT_OFFSETS_PER_PAGE * SLRU_PAGES_PER_SEGMENT)
+    segno = next_mxid // (offsets_per_page * SLRU_PAGES_PER_SEGMENT)
+    entry = next_mxid % (offsets_per_page * SLRU_PAGES_PER_SEGMENT)
     raw = query_scalar(
         cur,
-        f"SELECT pg_read_binary_file('pg_multixact/offsets/{segno:04X}', {entry * 4}, 4)",
+        f"SELECT pg_read_binary_file('pg_multixact/offsets/{segno:04X}', "
+        f"{entry * offset_size}, {offset_size})",
     )
     assert int.from_bytes(bytes(raw), "little") == next_offset
 
