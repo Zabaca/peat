@@ -1,0 +1,20 @@
+# A Platform: the whole install in one object. Apply it after the install file; the operator brings up every piece.
+# Label three machines first: kubectl label node <node> peat.zabaca.com/machine=true
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Platform
+metadata:
+  name: peat
+spec:
+  release: release-2026-12-01
+  objectStore:
+    endpoint: https://s3.example.com
+    region: us-east-1
+    bucket: peat-data
+    credentialsSecret: peat-store
+  gateways:
+    domain: db.example.com
+  upgrades:
+    quietHours:
+      - start: "02:00"
+        end: "03:00"
+        timeZone: America/New_York

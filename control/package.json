@@ -1,0 +1,17 @@
+{
+  "name": "peat-control",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Peat's control layer, gateway, operator and database command: one TypeScript program run by Bun",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/node": "25.6.0",
+    "typescript": "5.9.3"
+  }
+}

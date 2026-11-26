@@ -1,0 +1,24 @@
+# A one-machine trial: every piece on one machine (three safekeepers still, so a write still needs two of three), on host directories
+# the operator makes. The status says the platform survives no machine's loss.
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Platform
+metadata:
+  name: peat
+spec:
+  release: release-2026-12-01
+  spread: none
+  objectStore:
+    endpoint: http://minio.minio.svc:9000
+    bucket: peat
+    credentialsSecret: peat-store
+  pageservers:
+    count: 1
+    storage:
+      hostPath: { path: /var/lib/peat/pageserver, create: true }
+  safekeepers:
+    storage:
+      hostPath: { path: /var/lib/peat/safekeeper, create: true }
+  gateways:
+    count: 1
+  control:
+    replicas: 1
