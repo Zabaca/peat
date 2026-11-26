@@ -11,12 +11,13 @@
 //   - The WAL trim reads each timeline at most hourly and lists the store only when its floor has moved (a 30 s cycle over 150 timelines
 //     would be about 13 million listings a month).
 // Its records are ConfigMaps and Secrets in the platform namespace. Run by Bun from the control image, under the account `peat-control`.
-import { createHmac, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, pbkdf2Sync, randomBytes, sign as edSign, verify as edVerify } from 'node:crypto'
+import { X509Certificate, createHmac, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, pbkdf2Sync, randomBytes, sign as edSign, verify as edVerify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { SAFEKEEPER_RESOURCES, SEED_GROUP_ANNOTATION, closeDecision, decommissionDecision, reopenDecision, totalLossEvidence, formatSeedGroup, parseSeedGroup, membersOffBox, moveDecision, otherReplacementOpen, placementFor, replaceDecision, replacementMachines, replacementPool, safekeeperStatefulSet, seedCompletion, seedDecision, seedGroup, seedIds, neverWritten, isPullTimelineFailure, keeperNodeProblem, keeperReplacementVerdict, certInfo, certNeedsReload, tcpUp, memoryGauges, placementVerdict, startVerdict, within, type MemberAt, type ReplacementMark, type SkRecord, type TimelineRead } from './storage-spec'
 import { computeImageFor, pgVersionOf, requestedPgVersion } from './storage-spec' // a database's Postgres version and the compute image that serves it
 import { ancestorFor, olderTimelineFor, ownMemberProbe, recoverDecision, recoverStep, recoveryPoint, recoveryScope, timelineOwnMembers, unfinishedRepoint, type MemberProbe, type RecoveryMark } from './storage-spec' // the recovery of a database under its own name (recoverDatabase)
 import { GROUP, controlUrl, fromEnv, frontDoor, parseLabel, placement } from './names'
+import { newLeaf } from './operator/keys'
 
 const NAMES = fromEnv()
 const NS = NAMES.namespace // the control layer, the storage, the records, the leases
@@ -63,6 +64,24 @@ const PORT_BASE = 15010
 const COMPUTE_MEMORY_REQUEST = process.env['COMPUTE_MEMORY_REQUEST'] ?? '512Mi'
 const COMPUTE_MEMORY_LIMIT = process.env['COMPUTE_MEMORY_LIMIT'] ?? '1Gi'
 const PGDATA_LIMIT = process.env['PGDATA_LIMIT'] ?? '2Gi'
+const DEFAULT_PG = Number(process.env['DEFAULT_PG_VERSION'] || '19')
+// How many warm copies of a new database's pages the controller keeps on other pageservers: one (a pageserver's loss fails over in
+// seconds), or none when the platform has one pageserver (the controller cannot place a copy, and refuses the tenant)
+const SECONDARIES = Number(process.env['PAGESERVER_SECONDARIES'] ?? '1')
+// SPREAD `none` is a one-machine trial: every safekeeper is a zone of its own (the controller picks a timeline's members from distinct zones)
+// and a replacement may go to a machine that holds another member. `machines` (the default) keeps a machine's loss from taking two members.
+const SPREAD = process.env['SPREAD'] === 'none' ? 'none' : 'machines'
+// The node label whose value is a safekeeper's zone: its machine's name by default
+const SK_ZONE_LABEL = process.env['SAFEKEEPER_ZONE_LABEL'] || 'kubernetes.io/hostname'
+const SK_RESOURCES = { requests: { cpu: '100m', memory: process.env['SAFEKEEPER_MEMORY_REQUEST'] || SAFEKEEPER_RESOURCES.requests.memory }, limits: { memory: process.env['SAFEKEEPER_MEMORY_LIMIT'] || SAFEKEEPER_RESOURCES.limits.memory } }
+// The folder of the store's bucket the safekeepers write under (and the WAL trim lists)
+const S3_PREFIX = (process.env['S3_PREFIX'] || 'safekeeper').replace(/\/+$/, '')
+// A database's certificate: a cert-manager issuer (`Issuer/<name>` or `ClusterIssuer/<name>`) signs it, or, with none, this layer signs it
+// with the platform's own authority (its certificate and key mounted at CA_DIR). DB_DOMAIN, when set, is the domain a client outside the
+// cluster reaches the databases under: `<db>.<DB_DOMAIN>` is in each certificate too.
+const CERT_ISSUER = process.env['CERT_ISSUER'] ?? ''
+const CA_DIR = process.env['CA_DIR'] ?? '/ca'
+const DB_DOMAIN = process.env['DB_DOMAIN'] ?? ''
 
 // ---- Kubernetes, as the pod sees it
 const API = `https://${process.env['KUBERNETES_SERVICE_HOST'] ?? 'kubernetes.default.svc'}:${process.env['KUBERNETES_SERVICE_PORT'] ?? '443'}`
@@ -350,19 +369,50 @@ const computePodTemplate = (d: Db) => {
 }
 
 // ---- a database's name and certificate
-// A client dials `<db>.peat-db.svc`: an ExternalName Service in `peat-db` that leads to the gateways' one front door (`pg-front`), which learns the database from the TLS server name. kube-proxy programs nothing for an
-// ExternalName Service (it is a DNS answer), so a thousand databases do not add two thousand Services to every machine's rules. The compute's certificate is a cert-manager Certificate for that name and its `.svc.cluster.local`
-// form, signed by the platform's own CA (the Issuer `peat-ca` in peat-compute, made by the instance peat-tls); the Secret `tls-<db>` it fills is what the compute mounts, and both go with the database.
+// A client dials `<db>.<database namespace>.svc` (or `<db>.<DB_DOMAIN>` from outside): an ExternalName Service that leads to the gateways'
+// one front door (`pg-front`), which learns the database from the TLS server name. kube-proxy programs nothing for an ExternalName Service
+// (it is a DNS answer), so a thousand databases do not add two thousand Services to every machine's rules. The compute's certificate names
+// the database's names and is signed by the platform's authority: by a cert-manager issuer when one is named (a Certificate, which fills the
+// Secret `tls-<db>`), or by this layer itself (it writes the Secret, and renews it 30 days before it expires). The compute mounts the Secret;
+// both go with the database.
 const tlsSecret = (name: string) => `tls-${name}`
-const certificate = (name: string) => ({
-  apiVersion: 'cert-manager.io/v1', kind: 'Certificate',
-  metadata: { name: tlsSecret(name), namespace: CNS, labels: { 'peat-db-cert': 'true' } },
-  spec: {
-    secretName: tlsSecret(name), issuerRef: { name: 'peat-ca', kind: 'Issuer' },
-    dnsNames: [`${name}.${DB_NS}.svc`, `${name}.${DB_NS}.svc.cluster.local`],
-    duration: '8760h', renewBefore: '720h', privateKey: { algorithm: 'ECDSA', size: 256 }, usages: ['digital signature', 'key encipherment', 'server auth'],
-  },
-})
+const dnsNamesOf = (name: string) => [`${name}.${DB_NS}.svc`, `${name}.${DB_NS}.svc.cluster.local`, ...(DB_DOMAIN ? [`${name}.${DB_DOMAIN}`] : [])]
+const certificate = (name: string) => {
+  const [kind, issuer] = CERT_ISSUER.includes('/') ? CERT_ISSUER.split('/', 2) : ['Issuer', CERT_ISSUER]
+  return {
+    apiVersion: 'cert-manager.io/v1', kind: 'Certificate',
+    metadata: { name: tlsSecret(name), namespace: CNS, labels: { 'peat-db-cert': 'true' } },
+    spec: {
+      secretName: tlsSecret(name), issuerRef: { name: issuer, kind },
+      dnsNames: dnsNamesOf(name),
+      duration: '8760h', renewBefore: '720h', privateKey: { algorithm: 'ECDSA', size: 256 }, usages: ['digital signature', 'key encipherment', 'server auth'],
+    },
+  }
+}
+const RENEW_BEFORE_MS = 30 * 86_400_000
+let caPair: { certPem: string; keyPem: string } | undefined
+const ca = () => (caPair ??= { certPem: readFileSync(`${CA_DIR}/tls.crt`, 'utf8'), keyPem: readFileSync(`${CA_DIR}/tls.key`, 'utf8') })
+/** The database's certificate exists and is not about to expire: made once by the issuer, or signed here and renewed here. */
+async function ensureCertificate(name: string): Promise<void> {
+  if (CERT_ISSUER) {
+    // created once and left to cert-manager to renew: a replace of a custom resource needs its resourceVersion (found 2026-11-19, the first wake: 422), so an existing one is not touched
+    ok(await kube('POST', `/apis/cert-manager.io/v1/namespaces/${CNS}/certificates`, certificate(name)), `create certificate ${tlsSecret(name)}`, [409])
+    return
+  }
+  const got = await kube('GET', `/api/v1/namespaces/${CNS}/secrets/${tlsSecret(name)}`)
+  if (got.status === 200) {
+    const notAfter = (() => { try { return Date.parse(new X509Certificate(Buffer.from(String(got.json?.data?.['tls.crt'] ?? ''), 'base64').toString()).validTo) } catch { return 0 } })()
+    if (notAfter - Date.now() > RENEW_BEFORE_MS) return
+  }
+  const leaf = newLeaf(ca(), dnsNamesOf(name))
+  await apply(`/api/v1/namespaces/${CNS}/secrets`, tlsSecret(name), { apiVersion: 'v1', kind: 'Secret', type: 'kubernetes.io/tls', metadata: { name: tlsSecret(name), namespace: CNS, labels: { 'peat-db-cert': 'true' } }, stringData: { 'tls.crt': leaf.certPem, 'tls.key': leaf.keyPem, 'ca.crt': ca().certPem } })
+  if (got.status === 200) console.log(`cert: ${name}'s certificate renewed`)
+}
+/** Every database's own certificate renewed in time (this layer signs them when no issuer does): the acting layer, once an hour. */
+async function renewOwnCerts() {
+  if (!isLeader || CERT_ISSUER) return
+  for (const d of await listDbs()) if (d.mode === 'primary') await ensureCertificate(d.name).catch((e) => console.log(`cert ${d.name}: ${e}`))
+}
 const nameService = (name: string) => ({
   apiVersion: 'v1', kind: 'Service',
   metadata: { name, namespace: DB_NS, labels: { 'peat-route': 'true' } },
@@ -375,7 +425,7 @@ async function startCompute(d: Db): Promise<string> {
   const dep = await kube('GET', depPath(d.name))
   if (existing && dep.status === 200 && dep.json.spec.replicas === 1) return existing.metadata.name
   // created once and left to cert-manager to renew: `apply` replaces on a conflict, and a replace of a custom resource needs its resourceVersion (found 2026-11-19, the first wake: 422), so an existing one is not touched
-  ok(await kube('POST', `/apis/cert-manager.io/v1/namespaces/${CNS}/certificates`, certificate(d.name)), `create certificate ${tlsSecret(d.name)}`, [409])
+  await ensureCertificate(d.name)
   await writeSpec(d)
   if (dep.status === 200) ok(await kube('PATCH', depPath(d.name), { spec: { replicas: 1 } }, 'application/merge-patch+json'), `scale compute-${d.name} up`)
   else {
@@ -708,7 +758,7 @@ async function trimTimeline(tenant: string, timeline: string, dry: boolean): Pro
   if (!dry && trimmedAt.get(key) === floor) { rep.skipped = 'the floor has not moved since the last trim: nothing listed'; return rep }
   rep.floor = `${(floor >> 32n).toString(16).toUpperCase()}/${(floor & 0xffffffffn).toString(16).toUpperCase()}`
   rep.floorSegment = floorSeg.toString()
-  const prefix = `safekeeper/${key}/`
+  const prefix = `${S3_PREFIX}/${key}/`
   let token: string | undefined
   const doomed: string[] = []
   do {
@@ -765,10 +815,10 @@ let skJobHistory: SkJob[] = []
 const skStatefulSet = (id: number, node: string) =>
   safekeeperStatefulSet({
     id, node, namespace: NS, image: STORAGE_IMAGE, controlUrl: CONTROL_URL,
-    remote: { endpoint: process.env['S3_ENDPOINT'] ?? '', bucket: process.env['S3_BUCKET'] ?? '', region: process.env['S3_REGION'] ?? 'auto', prefix: 'safekeeper' },
+    remote: { endpoint: process.env['S3_ENDPOINT'] ?? '', bucket: process.env['S3_BUCKET'] ?? '', region: process.env['S3_REGION'] ?? 'auto', prefix: S3_PREFIX },
     secrets: SK_SECRETS,
     placement: placementFor(node, { keeperMachines: KEEPER_MACHINES, platform: PLACEMENT, keeper: KEEPER_PLACEMENT }), volumeRoot: SK_VOLUME, volumeType: SK_VOLUME_TYPE, walBackupParallelJobs: Number(process.env['SK_WAL_BACKUP_JOBS'] ?? '2'),
-    resources: SAFEKEEPER_RESOURCES,
+    resources: SK_RESOURCES,
     labels: { 'peat-sk': 'true' },
   })
 /** The machine a safekeeper's pod is on (or pinned to while it waits), or null when it has no pod. */
@@ -781,10 +831,18 @@ async function skMachine(id: number): Promise<string | null> {
  * A member's registration. Its availability zone is its MACHINE: the storage controller picks a new timeline's members from distinct zones (`safekeepers_for_new_timeline`, read 2026-11-20), so with a zone per machine a set never
  * holds two members of one machine, and a lost member and its replacement (made on one machine) are never both in a set. (It was `sk-<id>`, a zone per member, which allowed both.)
  */
-const skRegistration = (id: number, machine: string | null) => ({ id, created_at: '2023-10-25T09:11:25Z', updated_at: '2024-08-28T11:32:43Z', region_id: 'peat', host: `safekeeper-w${id}-0${SK_SUFFIX}`, port: 5454, http_port: 7676, https_port: null, version: 5957, availability_zone_id: machine ?? `sk-${id}` })
+const skRegistration = (id: number, machine: string | null, zone: string | null = machine) => ({ id, created_at: '2023-10-25T09:11:25Z', updated_at: '2024-08-28T11:32:43Z', region_id: 'peat', host: `safekeeper-w${id}-0${SK_SUFFIX}`, port: 5454, http_port: 7676, https_port: null, version: 5957, availability_zone_id: SPREAD === 'none' ? `sk-${id}` : (zone ?? `sk-${id}`) })
+/** A member's zone: its machine's name, or the value of SAFEKEEPER_ZONE_LABEL on its machine; a zone of its own with spread none. */
+async function zoneOf(id: number, machine: string | null): Promise<string | null> {
+  if (SPREAD === 'none') return `sk-${id}`
+  if (!machine || SK_ZONE_LABEL === 'kubernetes.io/hostname') return machine
+  const n = await kube('GET', `/api/v1/nodes/${machine}`)
+  return n.status === 200 ? String(n.json?.metadata?.labels?.[SK_ZONE_LABEL] ?? machine) : machine
+}
 /** Registers a running safekeeper with the storage controller and makes it Active, as neon_local does (control_plane/src/storage_controller.rs, register_safekeepers). Safe to repeat. Used for a replacement and, by `POST /sk-register`, for the platform's first three (nothing else registers them). */
 async function registerSafekeeper(id: number): Promise<void> {
-  ok(await storcon('POST', `/control/v1/safekeeper/${id}`, skRegistration(id, await skMachine(id))), 'register')
+  const machine = await skMachine(id)
+  ok(await storcon('POST', `/control/v1/safekeeper/${id}`, skRegistration(id, machine, await zoneOf(id, machine))), 'register')
   ok(await storcon('POST', `/control/v1/safekeeper/${id}/scheduling_policy`, { scheduling_policy: 'Active' }), 'activate')
 }
 /** Puts every listed member that is not decommissioned in the zone of its machine (an upsert only: its scheduling policy is left alone). Members registered before zones were machines are moved here once. */
@@ -794,9 +852,10 @@ async function ensureSkZones(list: any[]): Promise<Map<number, string | null>> {
     if (/^decom/i.test(String(sk.scheduling_policy))) continue
     const machine = await skMachine(sk.id)
     machines.set(sk.id, machine)
-    if (!machine || sk.availability_zone_id === machine) continue
-    const r = await storcon('POST', `/control/v1/safekeeper/${sk.id}`, skRegistration(sk.id, machine))
-    console.log(`sk-zone: safekeeper ${sk.id} (was ${sk.availability_zone_id}) put in the zone ${machine}: ${r.status}`)
+    const zone = await zoneOf(sk.id, machine)
+    if (!machine || !zone || sk.availability_zone_id === zone) continue
+    const r = await storcon('POST', `/control/v1/safekeeper/${sk.id}`, skRegistration(sk.id, machine, zone))
+    console.log(`sk-zone: safekeeper ${sk.id} (was ${sk.availability_zone_id}) put in the zone ${zone}: ${r.status}`)
   }
   return machines
 }
@@ -949,6 +1008,8 @@ async function replacementMachinesNow(lost: number, all: any[]): Promise<string[
   const lostNode = podRecords.find((p) => p.nodeId === String(lost))?.node ?? ''
   const onKeeper = KEEPER_MACHINES.includes(lostNode)
   const keeperReady = onKeeper ? await keepersReady() : []
+  // a one-machine trial: any machine that is alive, the lost member's first (the platform survives no machine's loss anyway)
+  if (SPREAD === 'none') return [...nodeStates.values()].filter((m) => !m.dead).map((m) => m.name).sort((a, b) => (a === lostNode ? -1 : 0) - (b === lostNode ? -1 : 0))
   return replacementMachines(
     lost, all as SkRecord[], podRecords,
     replacementPool([...nodeStates.keys()].map((n) => ({ name: n, dead: Boolean(nodeStates.get(n)?.dead) })), lostNode, KEEPER_MACHINES, keeperReady, onKeeper ? await keeperTried(lost) : false),
@@ -1233,10 +1294,10 @@ async function gatewayPeers(): Promise<{ name: string; ip: string }[]> {
 async function createDb(name: string, asked?: unknown): Promise<Db> {
   if (!/^[a-z][a-z0-9-]{0,30}$/.test(name)) throw new Error(`bad name ${name}`)
   if (await getDb(name)) throw new Error(`${name} exists`)
-  const pg = requestedPgVersion(asked)
+  const pg = requestedPgVersion(asked, DEFAULT_PG)
   computeImageFor(pg, COMPUTE_IMAGES) // refused before anything is made when no compute could serve this version
   const tenant = hex32(), timeline = hex32()
-  ok(await storcon('POST', '/v1/tenant', { new_tenant_id: tenant, placement_policy: { Attached: 1 } }), 'create tenant')
+  ok(await storcon('POST', '/v1/tenant', { new_tenant_id: tenant, placement_policy: { Attached: SECONDARIES } }), 'create tenant')
   ok(await storcon('POST', `/v1/tenant/${tenant}/timeline`, { new_timeline_id: timeline, pg_version: pg }), 'create timeline')
   const d: Db = { name, tenant, timeline, parent: '', root: true, mode: 'primary', port: 0, created: new Date().toISOString(), pg }
   const password = randomBytes(12).toString('hex')
@@ -1882,6 +1943,7 @@ void loop('storage nodes', 5000, pollStorageNodes)
 void loop('probe machines', PROBE_EVERY_MS, probeNodes)
 void loop('reconcile computes', PROBE_EVERY_MS + 1000, reconcileComputes)
 void loop('reload renewed certificates', 300_000, reloadRenewedCerts)
+void loop('renew the certificates this layer signs', 3_600_000, renewOwnCerts)
 // JavaScriptCore collects lazily and does not know the container's memory limit: run in the pod, the garbage of the loops and of every call piled up until the kernel killed the process at 256 MiB (read 2026-11-21: with the
 // program's own loops and calls, a local run of the same Bun held 1.6 MiB of heap with a full collection every 30 s and grew its live promises and closures without one). A full collection of a heap this small takes
 // milliseconds. `GC_EVERY_S` 0 turns it off.

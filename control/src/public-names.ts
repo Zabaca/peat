@@ -84,6 +84,9 @@ export function publicNameHits(path: string, text: string): Hit[] {
     for (const m of line.matchAll(/(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.]*\d)/g)) {
       const ip = m[0]
       if (m.slice(1, 5).some((x) => Number(x) > 255)) continue
+      // an object identifier (`oid('2.5.4.3')`, `extension('2.5.29.19', ...)`) and a numbered section of an RFC ("RFC 5280, 4.1.2.5") are written as dotted numbers too
+      const before = line.slice(0, m.index)
+      if (/\b(?:oid|extension)\(['"]$/.test(before) || /\bRFC \d+,? (?:section )?$/i.test(before)) continue
       if (!DOC_RANGES.some((r) => r.test(ip))) add('address', ip)
     }
     for (const m of line.matchAll(/([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)/g)) {

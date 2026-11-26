@@ -22,6 +22,7 @@ describe('the rules', () => {
     expect(kinds('pod at 10.244.1.5')).toEqual(['address'])
     expect(kinds('the host 172.16.0.4')).toEqual(['address'])
     expect(kinds('version 1.2.3 and 1.2.3.4.5')).toEqual([])
+    expect(kinds("seq(oid('2.5.4.3'), name) // RFC 5280, 4.1.2.5")).toEqual([])
   })
 
   test('a host: reserved examples, the listed third parties and the API group pass; anything else is a finding', () => {

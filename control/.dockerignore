@@ -1,0 +1,5 @@
+# The control image takes the program and nothing else (.github/peat/control.Dockerfile).
+*
+!package.json
+!tsconfig.json
+!src/

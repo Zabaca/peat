@@ -126,7 +126,7 @@ describe('the names and settings the program reads', () => {
   test('its program imports nothing but Node\'s own and the folder\'s shared modules', () => {
     for (const f of ['control.ts', 'storage-spec.ts']) {
       const specifiers = [...src(f).matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]!)
-      for (const s of specifiers) expect(s.startsWith('node:') || ['./storage-spec', './names'].includes(s), `${f}: ${s}`).toBe(true)
+      for (const s of specifiers) expect(s.startsWith('node:') || ['./storage-spec', './names', './operator/keys'].includes(s), `${f}: ${s}`).toBe(true)
     }
   })
 })
@@ -181,7 +181,7 @@ describe('what the control layer makes, and what its account must be granted', (
   })
 
   test('a database\'s certificate is created once and an existing one is left alone (a replace of a custom resource needs its resourceVersion: the first wake failed with a 422)', () => {
-    expect(control).toContain("`create certificate ${tlsSecret(d.name)}`, [409])")
+    expect(control).toContain("`create certificate ${tlsSecret(name)}`, [409])")
     expect(control).not.toMatch(/apply\(`\/apis\/cert-manager\.io/)
   })
 })
@@ -249,7 +249,8 @@ describe('who may call which route', () => {
 describe('the program\'s settings for the pieces it makes', () => {
   test('a safekeeper asks 128 MiB and may use 512; a compute\'s scratch is capped; a safekeeper carries no API credential or service links', () => {
     expect(SAFEKEEPER_RESOURCES).toMatchObject({ requests: { memory: '128Mi' }, limits: { memory: '512Mi' } })
-    expect(control).toContain('resources: SAFEKEEPER_RESOURCES')
+    expect(control).toContain('resources: SK_RESOURCES')
+    expect(control).toContain("process.env['SAFEKEEPER_MEMORY_REQUEST'] || SAFEKEEPER_RESOURCES.requests.memory")
     expect(control).toContain('emptyDir: { sizeLimit: PGDATA_LIMIT }')
     expect(safekeeperStatefulSet(baseOptions).spec.template.spec).toMatchObject({ automountServiceAccountToken: false, enableServiceLinks: false })
     expect(control).not.toContain('COMPUTE_SERVICES')
@@ -444,7 +445,7 @@ describe('the safekeepers: closing, seeding, moving, deciding', () => {
   })
 
   test('a member is registered in the zone of its machine, and no new database is made while a replacement is open', () => {
-    expect(control).toContain('availability_zone_id: machine ?? `sk-${id}`')
+    expect(control).toContain("availability_zone_id: SPREAD === 'none' ? `sk-${id}` : (zone ?? `sk-${id}`)")
     expect(control).not.toContain('availability_zone_id: `sk-${id}` }')
     expect(control).toContain('await ensureSkZones(')
     for (const route of ["path === '/db') {", "(path === '/branch' || path === '/restore')"]) {
@@ -1066,12 +1067,12 @@ describe('a database\'s Postgres version: 19 by default since 2026-11-26, 18 for
   })
   test('the program reads the 19 image from its environment (optional: unset, a request for 19 is refused and 18 is served as before), records the version, and gives a timeline, a branch, a replica and a recovery their database\'s', () => {
     expect(control).toContain("19: process.env['COMPUTE_IMAGE_PG19'] || undefined")
-    expect(control).not.toContain('PG_VERSION')
+    expect(control).toContain("const DEFAULT_PG = Number(process.env['DEFAULT_PG_VERSION'] || '19')")
     expect(control).toContain('image: computeImageFor(d.pg, COMPUTE_IMAGES)')
     expect(control).toContain('pg: pgVersionOf(d.pg)') // a record read by getDb
     expect(control).toContain('pg: pgVersionOf(i.data.pg)') // and by listDbs
     expect(control).toContain('pg: String(d.pg)') // and written by saveDb
-    expect(control).toContain('const pg = requestedPgVersion(asked)')
+    expect(control).toContain('const pg = requestedPgVersion(asked, DEFAULT_PG)')
     expect(control).toContain('{ new_timeline_id: timeline, pg_version: pg }')
     expect(control).toContain("pg_version: parent.pg }), 'create branch timeline'") // a branch and a restore are of the parent's version
     expect(control).toContain('created: new Date().toISOString(), pg: parent.pg }')
@@ -1080,7 +1081,7 @@ describe('a database\'s Postgres version: 19 by default since 2026-11-26, 18 for
   })
   test('the version is checked, and a compute image looked up, before the tenant is made: a request no compute could serve leaves nothing behind', () => {
     const fn = control.slice(control.indexOf('async function createDb('), control.indexOf('async function attachedPageserverApi'))
-    expect(fn.indexOf('requestedPgVersion(asked)')).toBeLessThan(fn.indexOf("storcon('POST', '/v1/tenant'"))
+    expect(fn.indexOf('requestedPgVersion(asked, DEFAULT_PG)')).toBeLessThan(fn.indexOf("storcon('POST', '/v1/tenant'"))
     expect(fn.indexOf('computeImageFor(pg, COMPUTE_IMAGES)')).toBeLessThan(fn.indexOf("storcon('POST', '/v1/tenant'"))
   })
   test('a Deployment carries its version as a label, so a later move of every compute to a new image can leave the other version\'s alone', () => {
