@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { crds } from '../src/api/crds'
 import { check, withDefaults, type Schema } from '../src/api/schema'
 import { API_VERSION, KINDS, databaseSpec, platformSpec } from '../src/api/v1alpha1'
+import { DEFAULT_NAMES, formatTaint } from '../src/names'
 
 // The two kinds as a user writes them: the examples a user copies pass, the defaults are what the descriptions say, and a mistake is named.
 
@@ -41,13 +42,14 @@ describe('Platform', () => {
     expect(p.machines.label).toEqual({ key: 'peat.zabaca.com/machine', value: 'true' })
     expect(p.spread).toBe('machines')
     expect(p.images.registry).toBe('ghcr.io/zabaca/peat')
-    expect(p.pageservers).toMatchObject({ count: 2, memory: { request: '768Mi', limit: '1536Mi' }, storage: { hostPath: { path: '/var/lib/peat/pageserver', create: false } } })
+    expect(p.pageservers.count).toBeUndefined() // the operator's: 2, or 1 with spread none
+    expect(p.pageservers).toMatchObject({ memory: { request: '768Mi', limit: '1536Mi' }, storage: { hostPath: { path: '/var/lib/peat/pageserver', create: false } } })
     expect(p.safekeepers).toMatchObject({ count: 3, zoneLabel: 'kubernetes.io/hostname', memory: { request: '128Mi', limit: '512Mi' } })
     expect(p.controller).toMatchObject({ records: 'kubernetes', memory: { request: '64Mi', limit: '256Mi' } })
     expect(p.gateways).toMatchObject({ count: 2, service: { type: 'ClusterIP' } })
-    expect(p.computes).toMatchObject({ defaultPgVersion: 19, idleMinutes: 30, scratch: '2Gi', memory: { request: '512Mi', limit: '1Gi' } })
+    expect(p.computes).toMatchObject({ defaultPgVersion: 19, idleAfter: '30m', scratch: '2Gi', memory: { request: '512Mi', limit: '1Gi' } })
     expect(p.databases.deleteHold).toBe('7d')
-    expect(p.upgrades).toMatchObject({ quietHours: [], restartHours: [], checkSeconds: 600 })
+    expect(p.upgrades).toMatchObject({ quietHours: [], restartHours: [], checkTimeout: '10m' })
     expect(p.control).toMatchObject({ replicas: 2 })
     expect(p.suspend).toBe(false)
     // nothing given is left as none: keys made, the platform's own authority
@@ -67,6 +69,17 @@ describe('Platform', () => {
   })
 })
 
+describe('the shared names and the kinds\' defaults', () => {
+  test('the Platform\'s default namespaces and machine label are src/names.ts\'s', () => {
+    const p = withDefaults(platformSpec, { release: 'r', objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's' } }) as any
+    expect(p.namespaces).toEqual({ platform: DEFAULT_NAMES.namespace, computes: DEFAULT_NAMES.computeNamespace, gateways: DEFAULT_NAMES.gatewayNamespace, databases: DEFAULT_NAMES.dbNamespace })
+    expect(p.machines.label).toEqual(DEFAULT_NAMES.machineLabel)
+  })
+  test('a taint with no value is written with an empty one', () => {
+    expect(formatTaint({ key: 'k', effect: 'NoSchedule' } as any)).toBe('k=:NoSchedule')
+  })
+})
+
 describe('Database', () => {
   test('a database, a branch, a restore to a moment and a replica', () => {
     expect(check(databaseSpec, {})).toEqual([])
@@ -74,7 +87,7 @@ describe('Database', () => {
     expect(check(databaseSpec, { parent: 'orders' })).toEqual([])
     expect(check(databaseSpec, { parent: 'orders', at: '2026-12-01T09:30:00Z' })).toEqual([])
     expect(check(databaseSpec, { replicaOf: 'orders' })).toEqual([])
-    expect(withDefaults(databaseSpec, {})).toEqual({ closed: false, keepOldDays: 30 })
+    expect(withDefaults(databaseSpec, {})).toEqual({ closed: false, keepOldFor: '30d' })
   })
   test('a version the platform does not run and a parent that is no database name are refused', () => {
     expect(check(databaseSpec, { pgVersion: 17 })).toEqual(['pgVersion: is one of 18, 19'])
@@ -99,6 +112,17 @@ describe('the CustomResourceDefinitions', () => {
       return out
     }
     for (const c of all) expect(walk(c.spec.versions[0].schema.openAPIV3Schema, c.metadata.name)).toEqual([])
+  })
+  test('the rules across fields the descriptions promise are the API server\'s to judge, in the CustomResourceDefinitions', () => {
+    const text = JSON.stringify(all)
+    for (const message of [
+      'the namespaces cannot change', 'may not be default or one of the cluster', 'the store needs the one bucket', 'records postgres needs controller.postgres', 'spread none runs one pageserver',
+      'at is the moment of a parent', 'not both', 'parent cannot change', 'at cannot change', 'replicaOf cannot change', 'pgVersion is never lowered',
+    ]) expect([message, text.includes(message)]).toEqual([message, true])
+  })
+  test('every duration is written one way: a number and s, m, h or d', () => {
+    expect(check(platformSpec, { ...{ release: 'r', objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's' } }, computes: { idleAfter: '30 minutes' } })).toHaveLength(1)
+    expect(check(databaseSpec, { idleAfter: '5m', keepOldFor: '30d' })).toEqual([])
   })
   test('every field says what it is for (kubectl explain prints it)', () => {
     const missing: string[] = []

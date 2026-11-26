@@ -523,7 +523,7 @@ jobs:
   # only, never moved); the job also refuses a commit that is not on main.
   publish-images:
     name: publish the images (arm64 and amd64)
-    needs: [ images, regress, regress-pg19, test-push-images ]
+    needs: [ images, regress, regress-pg19, test-push-images, control ]
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release-')) &&

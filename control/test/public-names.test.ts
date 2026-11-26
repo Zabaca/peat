@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { publicNameHits } from '../src/public-names'
 
 // The public-names check (src/public-names.ts): its rules on made-up lines, then the whole folder, which must hold no finding.
 // The scan leaves out the check's own two files: this one holds offending lines on purpose, and the check's source names what it allows.
 
-const kinds = (line: string, path = 'src/a.ts') => publicNameHits(path, line).map((h) => h.kind)
+const kinds = (line: string, path = 'notes.txt') => publicNameHits(path, line).map((h) => h.kind)
 
 describe('the rules', () => {
   test('a dash: em and en dashes are findings; a hyphen is not', () => {
@@ -51,10 +51,29 @@ describe('the rules', () => {
     expect(kinds('anything at all about Zabaca', 'NOTICE')).toEqual([])
   })
 
-  test('a record: references to planning documents another repository holds', () => {
-    expect(kinds('see docs/problems/some-problem/problem.md')).toEqual(['record'])
-    expect(kinds("as Home's tests did")).toEqual(['record'])
-    expect(kinds('see docs/sourcetree.md and the home directory')).toEqual([])
+  test('a record: a path of a document this repository does not hold', () => {
+    const exists = (p: string) => p === 'docs/sourcetree.md'
+    expect(publicNameHits('README.md', 'see docs/some-folder/some-file.md', exists).map((h) => h.kind)).toEqual(['record'])
+    expect(publicNameHits('README.md', 'see docs/sourcetree.md and the home directory', exists)).toEqual([])
+  })
+
+  test('a host put together in code, after a dot, a star or an expression, and under any real top-level domain', () => {
+    expect(kinds('const h = `${db}.acme-corp.com`', 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const w = '*.acme-corp.com'", 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const s = '.acme-corp.com'", 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const a = 'acme.co'", 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const a = 'acme.app'", 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const m = 'ops@acme.co'", 'src/a.ts')).toEqual(['email'])
+    expect(kinds('// the backups live at acme-backups.s3.us-west-2.amazonaws.com', 'src/a.ts')).toEqual(['host'])
+    expect(kinds('// path style: s3.us-west-2.amazonaws.com/acme-backups/x', 'src/a.ts')).toEqual(['host'])
+    expect(kinds('// the API is at s3.us-west-2.amazonaws.com', 'src/a.ts')).toEqual([])
+  })
+
+  test('code is not prose: property chains, files and quoted code in comments are no hosts', () => {
+    expect(kinds('const n = o.metadata.name; console.log(res.json, cfg.spec.co)', 'src/a.ts')).toEqual([])
+    expect(kinds("// see README.md, control.ts and `o.spec.co` for why; a file x.sh", 'src/a.ts')).toEqual([])
+    expect(kinds("const re = /'acme.co'/; const p = '.spec.template.containers'", 'src/a.ts')).toEqual([])
+    expect(kinds('acme.co in a document', 'README.md')).toEqual(['host'])
   })
 })
 
@@ -66,7 +85,8 @@ describe('the folder', () => {
     const files = listed.stdout.split('\0').filter((f) => f && !['test/public-names.test.ts', 'src/public-names.ts', 'bun.lock'].includes(f))
     // a scan that read nothing would pass by finding nothing
     expect(files.length).toBeGreaterThan(5)
-    const found = files.flatMap((f) => publicNameHits(f, readFileSync(join(root, f), 'utf8')).map((h) => `${h.path}:${h.line}  ${h.kind}  ${h.detail}`))
+    const repo = join(root, '..')
+    const found = files.flatMap((f) => publicNameHits(f, readFileSync(join(root, f), 'utf8'), (p) => existsSync(join(repo, p))).map((h) => `${h.path}:${h.line}  ${h.kind}  ${h.detail}`))
     expect(found).toEqual([])
   })
 })
