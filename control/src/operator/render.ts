@@ -36,10 +36,10 @@ export const SECRETS = {
   controllerTokens: 'peat-storcon-tokens',
   pageserverTokens: 'peat-pageserver-tokens',
   safekeeperTokens: 'peat-safekeeper-tokens',
-  ca: 'peat-ca',
   caKey: 'peat-ca-key',
 } as const
-export const CA_ISSUER = 'peat-ca'
+/** The ConfigMap of the authority's public certificate (ca.crt) a client verifies the databases with (sslmode=verify-full): never its key. */
+export const CA_CONFIG_MAP = 'peat-ca'
 export const HBA_CONFIG_MAP = 'peat-pg-hba'
 export const PORTS = { brokerGrpc: 50051, controller: 1234, pageserverPg: 6400, pageserverHttp: 9898, safekeeperPg: 5454, safekeeperHttp: 7676, control: 8080, gatewayPg: 5432, gatewayMetrics: 9090 } as const
 /** The label of a namespace whose pods may read every piece's metrics (a Prometheus's). */
@@ -62,6 +62,9 @@ const inNamespace = (name: string) => ({ namespaceSelector: { matchLabels: { 'ku
 const piece = (namespace: string, app: string) => ({ ...inNamespace(namespace), podSelector: { matchLabels: { app } } })
 const DNS = { to: [{ ...inNamespace('kube-system'), podSelector: { matchLabels: { 'k8s-app': 'kube-dns' } } }], ports: [{ protocol: 'UDP', port: 53 }, { protocol: 'TCP', port: 53 }] }
 const SCRAPER = { namespaceSelector: { matchLabels: { [SCRAPE_LABEL]: 'true' } } }
+/** The operator's pods, in their own namespace: it reads the storage controller's, the pageservers', the safekeepers' and the control layer's APIs. */
+export const OPERATOR_NAMESPACE = 'peat-system'
+const OPERATOR_PODS = { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': OPERATOR_NAMESPACE } }, podSelector: { matchLabels: { app: 'peat-operator' } } }
 /** The API server, at whatever address the cluster gives it (a policy sees the endpoint's address and port, not the Service's). */
 const API_SERVER = { to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(443, 6443) }
 const storePort = (endpoint: string): number => { const u = new URL(endpoint); return Number(u.port || (u.protocol === 'https:' ? 443 : 80)) }
@@ -117,10 +120,10 @@ export function keySecrets(r: Resolved, kept: Record<string, string>): Manifest[
     secret(SECRETS.controllerTokens, n.namespace, tokens('controller')),
     secret(SECRETS.pageserverTokens, n.namespace, tokens('pageserver')),
     secret(SECRETS.safekeeperTokens, n.namespace, tokens('safekeeper')),
-    // the authority, in the computes' namespace: where a cert-manager CA Issuer would read it (tls.crt, tls.key), and the control layer signs with it
-    secret(SECRETS.ca, n.computeNamespace, { 'tls.crt': kept['ca.crt'] ?? '', 'tls.key': kept['ca.key'] ?? '', 'ca.crt': kept['ca.crt'] ?? '' }, 'kubernetes.io/tls'),
-    // and in the platform namespace, where the control layer reads it to sign each database's certificate (when no issuer is named)
+    // the authority's key is in the platform namespace alone, where the control layer signs each database's certificate with it (when no issuer is named)
     ...(r.spec.certificates.issuer ? [] : [secret(SECRETS.caKey, n.namespace, { 'tls.crt': kept['ca.crt'] ?? '', 'tls.key': kept['ca.key'] ?? '' }, 'kubernetes.io/tls')]),
+    // and its public certificate, for clients, in the database namespace (where each database's name is)
+    { apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(r, CA_CONFIG_MAP, n.dbNamespace), data: { 'ca.crt': kept['ca.crt'] ?? '' } },
   ]
 }
 
@@ -263,7 +266,7 @@ export function storagePolicies(r: Resolved): Manifest[] {
   const records = r.spec.controller.records === 'kubernetes' ? [API_SERVER, STORE(r)] : [{ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(5432) }]
   return [
     policy(r, ns, 'storage-broker', [{ from: [inPeat('pageserver'), inPeat('safekeeper'), SCRAPER], ports: tcp(P.brokerGrpc) }], [DNS]),
-    policy(r, ns, 'storage-controller', [{ from: [inPeat('pageserver'), inPeat('peat-control'), inPeat('peat-operator'), SCRAPER], ports: tcp(P.controller) }], [DNS, ...records, { to: [inPeat('pageserver')], ports: tcp(P.pageserverHttp) }, { to: [inPeat('safekeeper')], ports: tcp(P.safekeeperHttp) }, { to: [inPeat('peat-control')], ports: tcp(P.control) }]),
+    policy(r, ns, 'storage-controller', [{ from: [inPeat('pageserver'), inPeat('peat-control'), OPERATOR_PODS, SCRAPER], ports: tcp(P.controller) }], [DNS, ...records, { to: [inPeat('pageserver')], ports: tcp(P.pageserverHttp) }, { to: [inPeat('safekeeper')], ports: tcp(P.safekeeperHttp) }, { to: [inPeat('peat-control')], ports: tcp(P.control) }]),
     policy(r, ns, 'pageserver', [{ from: [inPeat('storage-controller'), inPeat('peat-control'), SCRAPER], ports: tcp(P.pageserverHttp) }, { from: [computes], ports: tcp(P.pageserverPg) }], [DNS, { to: [inPeat('storage-broker')], ports: tcp(P.brokerGrpc) }, { to: [inPeat('safekeeper')], ports: tcp(P.safekeeperPg) }, { to: [inPeat('storage-controller')], ports: tcp(P.controller) }, STORE(r)]),
     policy(r, ns, 'safekeeper', [{ from: [computes, inPeat('pageserver')], ports: tcp(P.safekeeperPg) }, { from: [inPeat('storage-controller'), inPeat('peat-control'), SCRAPER], ports: tcp(P.safekeeperHttp) }, { from: [inPeat('safekeeper')], ports: tcp(P.safekeeperPg, P.safekeeperHttp) }], [DNS, { to: [inPeat('storage-broker')], ports: tcp(P.brokerGrpc) }, { to: [inPeat('peat-control')], ports: tcp(P.control) }, { to: [inPeat('safekeeper')], ports: tcp(P.safekeeperPg, P.safekeeperHttp) }, STORE(r)]),
   ]
@@ -297,6 +300,8 @@ export function controlEnv(r: Resolved, images = r.images): { name: string; valu
     { name: 'COMPUTE_IMAGE', value: images.compute[18] },
     { name: 'COMPUTE_IMAGE_PG19', value: images.compute[19] },
     { name: 'STORAGE_IMAGE', value: images.storage },
+    // the release the safekeepers it makes are stamped with
+    { name: 'RELEASE', value: images.release },
     { name: 'DEFAULT_PG_VERSION', value: String(s.computes.defaultPgVersion) },
     { name: 'PAGESERVER_SECONDARIES', value: s.pageservers.count > 1 ? '1' : '0' },
     { name: 'IDLE_MINUTES', value: String(idleMinutesOf(s.computes.idleAfter)) },
@@ -401,7 +406,7 @@ export function controlPolicies(r: Resolved): Manifest[] {
   const computes = piece(n.computeNamespace, 'peat-compute')
   const gateways = piece(n.gatewayNamespace, 'peat-gateway')
   return [
-    policy(r, ns, 'peat-control', [{ from: [inPeat('storage-controller'), inPeat('safekeeper'), gateways, computes, inPeat('peat-operator'), SCRAPER], ports: tcp(PORTS.control) }], [
+    policy(r, ns, 'peat-control', [{ from: [inPeat('storage-controller'), inPeat('safekeeper'), gateways, computes, OPERATOR_PODS, SCRAPER], ports: tcp(PORTS.control) }], [
       DNS, API_SERVER,
       { to: [inPeat('storage-controller')], ports: tcp(PORTS.controller) },
       { to: [inPeat('pageserver')], ports: tcp(PORTS.pageserverHttp) },
@@ -579,8 +584,15 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
 }
 
 /** Every object of the platform, in the order it is applied: the base first, the guards before the account they hold. */
+/** The annotation each workload carries: the release it was rendered at (what the status reports, whatever its image's name says). */
+export const RELEASE_ANNOTATION = `${GROUP}/release`
+/** The upgrade's piece a workload belongs to. */
+export const pieceOf = (m: Manifest): string => (m.metadata.name === 'storage-controller' || m.metadata.name === 'storage-broker' ? 'controller' : m.metadata.name === 'peat-gateway' ? 'gateways' : m.metadata.name === 'peat-control' ? 'control' : m.metadata.name)
+const stamped = (ms: Manifest[], release: (m: Manifest) => string): Manifest[] =>
+  ms.map((m) => (m.kind === 'Deployment' || m.kind === 'StatefulSet' ? { ...m, metadata: { ...m.metadata, annotations: { ...(m.metadata.annotations ?? {}), [RELEASE_ANNOTATION]: release(m) } } } : m))
+
 export function render(r: Resolved, kept: Record<string, string>, storageImages?: string[]): Manifest[] {
-  return [...base(r), ...keySecrets(r, kept), ...guards(r, storageImages), ...storage(r), ...keeperPrep(r), ...control(r), ...gateways(r)]
+  return stamped([...base(r), ...keySecrets(r, kept), ...guards(r, storageImages), ...storage(r), ...keeperPrep(r), ...control(r), ...gateways(r)], () => r.images.release)
 }
 
 export { SAFEKEEPER_RESOURCES }

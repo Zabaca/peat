@@ -65,7 +65,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     control: str('The control image (the operator, the control layer and the gateways).'),
     compute: obj('The compute image of each Postgres version.', { '18': str('Postgres 18.'), '19': str('Postgres 19.') }),
   }, { default: { registry: 'ghcr.io/zabaca/peat' } }),
-  namespaces: obj('The namespaces the platform uses. They cannot change once the platform is made (its pieces and its data live in them), and none may be a namespace of the cluster\'s own.', {
+  namespaces: obj('The namespaces the platform uses (the status records them). They cannot change once the platform is made (its pieces and its data live in them), and none may be a namespace of the cluster\'s own.', {
     platform: str('The storage, the control layer and its records.', { default: 'peat' }),
     computes: str("The databases' computes.", { default: 'peat-compute' }),
     gateways: str('The gateways and the front door.', { default: 'peat-gateway' }),
@@ -168,6 +168,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
   release: str('The release every piece runs, once they all run one.'),
   message: str('What a person reads first.'),
   survives: str("What the platform survives: one machine's loss, or none (spread none)."),
+  namespaces: obj('The namespaces the platform runs in, recorded: a Platform that names others is refused.', { platform: str('The platform namespace.'), computes: str('The computes\' namespace.'), gateways: str('The gateways\' namespace.'), databases: str('The database namespace.') }),
   pieces: list('Every piece and the release it runs.', obj('A piece.', {
     kind: str('Its kind.'), namespace: str('Its namespace.'), name: str('Its name.'),
     release: str('The release it runs.'), ready: bool('Whether it is ready.'), adopted: bool('Whether the operator took it over.'), message: str('Why not, when not.'),

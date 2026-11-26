@@ -433,7 +433,8 @@ jobs:
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           for sha in $(git rev-list --first-parent -n 30 "$(git merge-base HEAD origin/main)"); do
-            if docker manifest inspect "ghcr.io/zabaca/peat/storage:$sha" > /dev/null 2>&1; then echo "sha=$sha" >> "$GITHUB_OUTPUT"; echo "images of $sha"; exit 0; fi
+            # every image the test runs: the storage and both computes
+            if docker manifest inspect "ghcr.io/zabaca/peat/storage:$sha" > /dev/null 2>&1 && docker manifest inspect "ghcr.io/zabaca/peat/compute-pg18:$sha" > /dev/null 2>&1 && docker manifest inspect "ghcr.io/zabaca/peat/compute-pg19:$sha" > /dev/null 2>&1; then echo "sha=$sha" >> "$GITHUB_OUTPUT"; echo "images of $sha"; exit 0; fi
           done
           echo "::error::no commit of the last 30 on main has published images"; exit 1
       - name: The control image of this change
