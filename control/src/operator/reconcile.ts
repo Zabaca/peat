@@ -1,12 +1,14 @@
 // One pass of the operator over the cluster: the Platform read and checked, the machines chosen (once, then kept), the keys made when the
 // install gives none (once, then kept), every piece applied as rendered, what the operator made and no longer renders removed, and the
-// Platform's status written. Run every few seconds by main.ts; every pass is whole, so a pass that stops half way is finished by the next.
+// Platform's status written. Run every few seconds by main.ts; a pass that stops half way is finished by the next (what it made is in the
+// record of what the operator made, owned.ts, from the moment it is made).
 //
-// What it never does: change an object it did not make (one already there, of the same name, is reported and left alone; the Platform's
-// `adopt` list is how it takes one over; a namespace the Platform names is the one exception, as a person makes it first to hold the
-// store's Secret), delete an object it did not make, delete a namespace, or copy the Platform's labels onto anything.
+// What it never does: change an object it did not make (one already there, of the same name, is reported and left alone; a namespace the
+// Platform names is the one exception, as a person makes it first to hold the store's Secret), delete an object it did not make, delete a
+// namespace, or copy the Platform's labels onto anything.
 import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
-import { ok, pathOf, pluralOf, serverApply, type Kube } from '../kube'
+import { ok, pathOf, serverApply, type Kube } from '../kube'
+import { NONCE_ANNOTATION, Owned } from './owned'
 import { keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
 import { choosePlacements, resolve, specOf, type Placements, type Resolved } from './platform'
 import { KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, render, type Manifest } from './render'
@@ -36,23 +38,6 @@ export const RENDERED_KINDS: { apiVersion: string; kind: string; namespaced: boo
 const platformsPath = `/apis/${API_VERSION}/platforms`
 const key = (o: { kind: string; metadata: { namespace?: string; name: string } }) => `${o.kind}/${o.metadata.namespace ?? ''}/${o.metadata.name}`
 const sel = (labels: Record<string, string>) => encodeURIComponent(Object.entries(labels).map(([k, v]) => `${k}=${v}`).join(','))
-/**
- * The operator's record of what it made: every object's kind, namespace and name with the UID the API server gave it, in a ConfigMap of
- * the platform namespace. An object is the operator's only when the record holds its UID: a label proves nothing (anyone can copy one, and a
- * copy of the authority's certificate with its labels kept must not be deleted), and an object of a piece's name that the operator did not
- * make is never applied over.
- */
-export const OWNED_CONFIG_MAP = 'peat-owned'
-type Owned = Record<string, string>
-async function readOwned(k: Kube, ns: string): Promise<Owned> {
-  const r = await k.request('GET', `/api/v1/namespaces/${ns}/configmaps/${OWNED_CONFIG_MAP}`)
-  if (r.status !== 200) return {}
-  try { return JSON.parse(r.json.data?.['owned.json'] ?? '{}') } catch { return {} }
-}
-async function writeOwned(k: Kube, ns: string, owned: Owned): Promise<void> {
-  const cm = { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: OWNED_CONFIG_MAP, namespace: ns, labels: { [MANAGED_BY]: OPERATOR } }, data: { 'owned.json': JSON.stringify(owned, Object.keys(owned).sort()) } }
-  ok(await serverApply(k, cm, FIELD_MANAGER), 'keep the record of what the operator made')
-}
 const kindOf = (key: string) => RENDERED_KINDS.find((x) => x.kind === key.split('/')[0])
 
 export interface PassResult { platform?: string; phase: string; message: string; applied: number; pruned: number; refused: string[] }
@@ -94,8 +79,8 @@ async function readKeys(k: Kube, r: Resolved): Promise<Record<string, string>> {
     if (given[AUTH_PUBLIC]) kept[AUTH_PUBLIC] = given[AUTH_PUBLIC]
   }
   if (r.spec.keys.caSecret) {
-    const given = await secretData(n.computeNamespace, r.spec.keys.caSecret, `read ${r.spec.keys.caSecret}`)
-    if (!given?.['tls.crt'] || !given?.['tls.key']) throw new Error(`keys.caSecret: ${n.computeNamespace}/${r.spec.keys.caSecret} holds no tls.crt and tls.key`)
+    const given = await secretData(n.namespace, r.spec.keys.caSecret, `read ${r.spec.keys.caSecret}`)
+    if (!given?.['tls.crt'] || !given?.['tls.key']) throw new Error(`keys.caSecret: ${n.namespace}/${r.spec.keys.caSecret} holds no tls.crt and tls.key`)
     kept[CA_CERT] = given['tls.crt']
     kept[CA_KEY] = given['tls.key']
   }
@@ -121,7 +106,6 @@ async function pieces(k: Kube, r: Resolved, rendered: Manifest[]): Promise<{ kin
   }
   for (const m of rendered.filter((x) => x.kind === 'Deployment' || x.kind === 'StatefulSet')) {
     const live = await k.request('GET', pathOf(m))
-    const image = String(m.spec.template.spec.containers[0].image)
     if (live.status !== 200) { out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(m), ready: false, message: 'not made yet' }); continue }
     out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(live.json), ...judge(live.json) })
   }
@@ -148,7 +132,8 @@ export async function reconcile(k: Kube): Promise<PassResult> {
   const spec = checked.spec
   // the namespaces are where the platform's pieces and data are: once recorded they never change (the kind's rule says so too, on a cluster that judges it)
   const recordedNs = (p.status as any)?.namespaces
-  if (recordedNs && JSON.stringify(recordedNs) !== JSON.stringify(spec.namespaces)) return done('Failed', `the namespaces cannot change: the platform runs in ${JSON.stringify(recordedNs)}; set them back`)
+  const sameNamespaces = (a: Record<string, string>, b: Record<string, string>) => (['platform', 'computes', 'gateways', 'databases'] as const).every((f) => a[f] === b[f])
+  if (recordedNs && !sameNamespaces(recordedNs, spec.namespaces)) return done('Failed', `the namespaces cannot change: the platform runs in ${JSON.stringify(recordedNs)}; set them back`)
   // records kubernetes needs the storage controller's record kinds, which come with the storage image that keeps them
   if (spec.controller.records === 'kubernetes') {
     const served = await k.request('GET', `/apis/${RECORDS_GROUP}/v1alpha1`)
@@ -161,27 +146,30 @@ export async function reconcile(k: Kube): Promise<PassResult> {
   if ('errors' in chosen) return done('Failed', chosen.errors.join('; '))
   const r = resolve(p, spec, chosen.placements)
 
-  // the namespaces first: the keys, the placements and the record of what the operator made are kept in the platform namespace
+  // the record of what the operator made, in its own namespace; a record that cannot be read stops the pass here
+  const owned = await Owned.load(k, k.namespace)
   const applied: string[] = []
   const refused: string[] = []
-  const owned: Owned = {}
-  let ownedRead = false
   const applyOne = async (m: Manifest) => {
     const live = await k.request('GET', pathOf(m))
-    // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret)
-    if (live.status === 200 && owned[key(m)] !== live.json.metadata?.uid && m.kind !== 'Namespace') {
-      refused.push(`${key(m)} exists and was not made by the operator: left alone`)
-      return
+    if (live.status === 200) {
+      // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret)
+      if (m.kind !== 'Namespace' && !(await owned.ours(key(m), live.json))) {
+        refused.push(`${key(m)} exists and was not made by the operator: left alone`)
+        return
+      }
+      ok(await serverApply(k, m, FIELD_MANAGER), `apply ${key(m)}`)
+    } else {
+      ok(live, `read ${key(m)}`, [404])
+      // the intent first, then the object stamped with its nonce, then its UID: a pass that dies between them is recognised by the next
+      const nonce = await owned.intend(key(m))
+      const a = ok(await serverApply(k, { ...m, metadata: { ...m.metadata, annotations: { ...(m.metadata.annotations ?? {}), [NONCE_ANNOTATION]: nonce } } } as Manifest, FIELD_MANAGER), `make ${key(m)}`)
+      await owned.made(key(m), String(a.json?.metadata?.uid ?? ''))
     }
-    const a = ok(await serverApply(k, m, FIELD_MANAGER), `apply ${key(m)}`)
-    if (a.json?.metadata?.uid) owned[key(m)] = String(a.json.metadata.uid)
     applied.push(key(m))
   }
   const rendered0 = render(r, {})
   for (const m of rendered0.filter((x) => x.kind === 'Namespace')) await applyOne(m)
-  // the record as kept, with what this pass has just made (a UID just given wins)
-  for (const [k2, uid] of Object.entries(await readOwned(k, r.names.namespace))) if (!(k2 in owned)) owned[k2] = uid
-  ownedRead = true
 
   let keys = await readKeys(k, r)
   const missing = makeMissing(keys)
@@ -199,22 +187,28 @@ export async function reconcile(k: Kube): Promise<PassResult> {
   const rendered = render(r, keys)
   for (const m of rendered.filter((x) => x.kind !== 'Namespace')) await applyOne(m)
 
-  // what the operator made and no longer renders, by its record: removed only inside the platform's namespaces or cluster-scoped, and only the
-  // very object it made (the delete carries the recorded UID as a precondition). A namespace is never removed: what is in it may not be its own.
+  // what the operator made and no longer renders, by its record: removed only inside the platform's namespaces, or cluster-scoped and still
+  // carrying the operator's labels, and only the very object it made (the delete carries the recorded UID as a precondition). A namespace
+  // is never removed: what is in it may not be its own.
   const wanted = new Set(rendered.map(key))
   const platformNamespaces = new Set([r.names.namespace, r.names.computeNamespace, r.names.gatewayNamespace, r.names.dbNamespace])
   let pruned = 0
-  for (const [k2, uid] of Object.entries(owned)) {
+  for (const k2 of owned.keys()) {
     if (wanted.has(k2)) continue
     const [kind, ns, name] = k2.split('/') as [string, string, string]
     const known = kindOf(k2)
     if (!known || kind === 'Namespace' || (known.namespaced && !platformNamespaces.has(ns))) continue
     const m = { apiVersion: known.apiVersion, kind, metadata: { name, ...(known.namespaced ? { namespace: ns } : {}) } }
+    const live = await k.request('GET', pathOf(m))
+    if (live.status === 404) { await owned.forget(k2); continue }
+    ok(live, `read ${k2}`)
+    if (!(await owned.ours(k2, live.json))) continue
+    if (!known.namespaced && !(live.json.metadata?.labels?.[MANAGED_BY] === OPERATOR && live.json.metadata?.labels?.[PLATFORM_LABEL] === r.name)) continue
+    const uid = String(live.json.metadata.uid)
     ok(await k.request('DELETE', pathOf(m), { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid } }), `remove ${k2}`, [404, 409])
-    delete owned[k2]
+    await owned.forget(k2)
     pruned++
   }
-  if (ownedRead) await writeOwned(k, r.names.namespace, owned)
 
   const ps = await pieces(k, r, rendered)
   const notReady = ps.filter((x) => !x.ready)

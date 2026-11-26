@@ -105,7 +105,8 @@ export function choosePlacements(spec: PlatformSpec, machines: string[], kept: P
   const controller = kept.controller ?? spec.controller.machine ?? (spec.spread === 'none' ? sorted[0]! : (sorted.find((m) => !psNodes.includes(m)) ?? ''))
   // the safekeepers' first members on machines of distinct zones (the controller picks each timeline's members from distinct zones, so a set
   // needs as many zones as members): one machine of each zone first, in name order
-  const byZone = [...new Map(sorted.map((m) => [zoneOf(m), m])).values()]
+  const byZone: string[] = []
+  for (const m of sorted) if (!byZone.some((x) => zoneOf(x) === zoneOf(m))) byZone.push(m)
   const skOrder = spec.spread === 'none' ? sorted : [...byZone, ...sorted.filter((m) => !byZone.includes(m))]
   const safekeepers = pick('safekeepers', spec.safekeepers.count, spec.safekeepers.machines, kept.safekeepers, sorted.filter((m) => !skOrder.slice(0, spec.safekeepers.count).includes(m)))
   if (spec.spread === 'machines') {

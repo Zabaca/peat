@@ -198,6 +198,22 @@ describe('the review\'s rules', () => {
   })
 })
 
+describe('a given authority, and an issuer', () => {
+  test('keys.caSecret is read from the platform namespace, and peat-ca carries its certificate', async () => {
+    const { newCa } = await import('../src/operator/keys')
+    const ca = newCa()
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'my-ca', namespace: 'peat' }, data: { 'tls.crt': Buffer.from(ca.certPem).toString('base64'), 'tls.key': Buffer.from(ca.keyPem).toString('base64') } })
+    k.put(platform({ keys: { caSecret: 'my-ca' } }))
+    await reconcile(k)
+    expect(k.get('v1', 'configmaps', 'peat-db', 'peat-ca').data['ca.crt']).toBe(ca.certPem)
+  })
+  test('with an issuer and no authority named, no peat-ca is published (the platform\'s own would sign nothing)', async () => {
+    k.put(platform({ certificates: { issuer: { name: 'corp-ca', kind: 'ClusterIssuer' } } }))
+    await reconcile(k)
+    expect(k.get('v1', 'configmaps', 'peat-db', 'peat-ca')).toBeUndefined()
+  })
+})
+
 describe('what is the operator\'s: its record of the objects it made, never a label', () => {
   test('an object with the operator\'s labels that it did not make is neither applied over nor deleted, here or in another namespace', async () => {
     const labels = { [MANAGED_BY]: 'peat-operator', 'peat.zabaca.com/platform': 'peat' }
@@ -212,13 +228,69 @@ describe('what is the operator\'s: its record of the objects it made, never a la
     expect(k.get('v1', 'configmaps', 'peat', 'stale')).toBeDefined()
     expect(r.pruned).toBe(0)
   })
-  test('the record names each object made, by its UID', async () => {
+  const record = () => k.get('v1', 'configmaps', 'peat-system', 'peat-owned').data as Record<string, string>
+  test('the record, in the operator\'s own namespace, names each object made by its UID', async () => {
     k.put(platform())
     await reconcile(k)
-    const owned = JSON.parse(k.get('v1', 'configmaps', 'peat', 'peat-owned').data['owned.json'])
     const ctl = k.get('apps/v1', 'deployments', 'peat', 'storage-controller')
-    expect(owned['Deployment/peat/storage-controller']).toBe(ctl.metadata.uid)
-    expect(Object.keys(owned).length).toBeGreaterThan(30)
+    expect(record()['Deployment.peat.storage-controller']).toBe(`uid:${ctl.metadata.uid}`)
+    expect(Object.keys(record()).length).toBeGreaterThan(30)
+    expect(k.get('v1', 'configmaps', 'peat', 'peat-owned')).toBeUndefined()
+  })
+  test('a pass that fails half way loses nothing it made: the next owns all of it', async () => {
+    k.put(platform())
+    k.forcedOnce.set('PATCH /apis/apps/v1/namespaces/peat-gateway/deployments/peat-gateway', { status: 500, json: { message: 'injected' } })
+    await expect(reconcile(k)).rejects.toThrow('injected')
+    const r = await reconcile(k)
+    expect(r.refused).toEqual([])
+    expect(k.get('apps/v1', 'deployments', 'peat-gateway', 'peat-gateway')).toBeDefined()
+  })
+  test('a pass that dies between the create and the record: the object is found by its nonce and recorded', async () => {
+    k.put(platform())
+    await reconcile(k)
+    const cm = k.get('v1', 'configmaps', 'peat-system', 'peat-owned')
+    const live = k.get('apps/v1', 'deployments', 'peat', 'storage-broker')
+    cm.data['Deployment.peat.storage-broker'] = 'nonce:abc123'
+    live.metadata.annotations = { ...live.metadata.annotations, 'peat.zabaca.com/owner-nonce': 'abc123' }
+    const r = await reconcile(k)
+    expect(r.refused).toEqual([])
+    expect(record()['Deployment.peat.storage-broker']).toBe(`uid:${live.metadata.uid}`)
+  })
+  test('a record that cannot be read stops the pass and is never overwritten', async () => {
+    k.put(platform())
+    await reconcile(k)
+    const before = { ...record() }
+    k.forced.set('GET /api/v1/namespaces/peat-system/configmaps/peat-owned', { status: 500, json: { message: 'down' } })
+    await expect(reconcile(k)).rejects.toThrow('read the record')
+    k.forced.clear()
+    k.get('v1', 'configmaps', 'peat-system', 'peat-owned').data['Job.peat.x'] = 'not a value'
+    await expect(reconcile(k)).rejects.toThrow('cannot read')
+    delete k.get('v1', 'configmaps', 'peat-system', 'peat-owned').data['Job.peat.x']
+    expect(record()).toEqual(before)
+  })
+  test('cleanup deletes only the very object recorded (a UID precondition), and a cluster-scoped one only with the operator\'s labels', async () => {
+    k.put(platform({ safekeepers: { outside: { machines: ['outside-1'] } } }))
+    await reconcile(k)
+    // the Job made again by someone else under the same name: the record's UID is not its UID
+    const job = k.get('batch/v1', 'jobs', 'peat', 'keeper-prep')
+    job.metadata.uid = 'someone-elses'
+    // and a cluster-scoped object the record names, no longer rendered, without the operator's labels
+    const cr = k.put({ apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: { name: 'leftover' }, rules: [] })
+    k.get('v1', 'configmaps', 'peat-system', 'peat-owned').data['ClusterRole..leftover'] = `uid:${cr.metadata.uid}`
+    k.put(platform())
+    const r = await reconcile(k)
+    expect(k.get('batch/v1', 'jobs', 'peat', 'keeper-prep')).toBeDefined()
+    expect(k.get('rbac.authorization.k8s.io/v1', 'clusterroles', null, 'leftover')).toBeDefined()
+    expect(r.pruned).toBe(0)
+    // with the operator's labels it is the operator's to remove
+    k.get('rbac.authorization.k8s.io/v1', 'clusterroles', null, 'leftover').metadata.labels = { [MANAGED_BY]: 'peat-operator', 'peat.zabaca.com/platform': 'peat' }
+    expect((await reconcile(k)).pruned).toBe(1)
+    expect(k.get('rbac.authorization.k8s.io/v1', 'clusterroles', null, 'leftover')).toBeUndefined()
+  })
+  test('the API server refuses a delete whose UID does not match (the fake honours the precondition)', async () => {
+    k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'x', namespace: 'peat' }, data: {} })
+    expect((await k.request('DELETE', '/api/v1/namespaces/peat/configmaps/x', { preconditions: { uid: 'other' } })).status).toBe(409)
+    expect(k.get('v1', 'configmaps', 'peat', 'x')).toBeDefined()
   })
 })
 
