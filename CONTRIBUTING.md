@@ -10,6 +10,14 @@ Peat is a fork of Neon's open-source code, kept on the latest PostgreSQL release
 - **Reruns** (below).
 - **Style.** As upstream: `cargo fmt` and `cargo clippy` for Rust (`./run_clippy.sh`, `./scripts/reformat`), the Python checks in [docs/sourcetree.md](docs/sourcetree.md#obligatory-checks) for the test suite. `pre-commit.py` is a sample pre-commit hook (`ln -s ../../pre-commit.py .git/hooks/pre-commit`).
 
+## The control folder
+
+`control/` holds the TypeScript program that runs a platform on Kubernetes (the control layer, the gateways, the drills, the object kinds;
+its [README](control/README.md) says what is where). A change there runs `bun test` and `bun run typecheck` in it, as CI's `control` job
+does. Nothing in it may name a real person, company, host, address, bucket or record: examples use `example.com`, the documentation address
+ranges and made-up machine names, and `control/test/public-names.test.ts` fails on what it can recognise. A setting that one install needs
+gets a neutral default, never that install's value.
+
 ## Reruns
 
 The regression suite reruns a failed test once, so a test that fails on a shared four-CPU runner for timing alone does not fail its shard. A rerun is not a pass: it is a failure that did not repeat. Every rerun is listed in the job's summary and as a warning on the run (`.github/peat/peat_reruns.py`, `.github/peat/report_reruns.py`), with the first attempt's error and logs kept in the shard's artifact (`reruns.jsonl`, `rerun-first-attempts.tar.gz`), whether the rerun passed or not. The failed attempt's test output directory is removed when its rerun is about to start (its logs are kept first), so a rerun has the room a first attempt had; a test that writes 12 GB could not otherwise be rerun on the 16 GB filesystem of the solo job.
