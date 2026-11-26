@@ -1,6 +1,8 @@
 # What the storage controller's service account needs with --records kubernetes, in the
-# records' namespace only (README.md beside this file). Replace RECORDS_NAMESPACE and
-# CONTROLLER_ACCOUNT with the install's own; the copy tool needs the same Role.
+# records' namespace only (README.md beside this file). Replace RECORDS_NAMESPACE (where the
+# record objects are), CONTROLLER_NAMESPACE and CONTROLLER_ACCOUNT (the controller's service
+# account) with the install's own; the copy tool's account needs the same Role. `watch` is for
+# the copy in the bucket, which the controller writes from a watch of every kind.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -23,4 +25,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: CONTROLLER_ACCOUNT
-    namespace: RECORDS_NAMESPACE
+    namespace: CONTROLLER_NAMESPACE

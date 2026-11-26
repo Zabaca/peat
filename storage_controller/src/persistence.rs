@@ -63,9 +63,9 @@ use crate::timeline_import::{TimelineImport, TimelineImportUpdateError};
 /// ## Where the records are kept
 ///
 /// This type is the one interface the rest of the controller uses; each operation is passed to
-/// the store the records are kept in: Postgres ([`postgres::PostgresStore`], Neon's code
-/// unchanged, and the default) or Kubernetes objects ([`kubernetes::KubernetesStore`], described
-/// in `storage_controller/kubernetes/README.md`).
+/// the store the records are kept in: Postgres (`PostgresStore` in `persistence/postgres.rs`,
+/// Neon's code unchanged, and the default) or Kubernetes objects (`KubernetesStore` in
+/// `persistence/kubernetes.rs`, described in `storage_controller/kubernetes/README.md`).
 pub struct Persistence {
     store: Store,
 }
@@ -73,7 +73,7 @@ pub struct Persistence {
 /// Where the records are kept.
 enum Store {
     Postgres(postgres::PostgresStore),
-    Kubernetes(kubernetes::KubernetesStore),
+    Kubernetes(Box<kubernetes::KubernetesStore>),
 }
 
 /// Legacy format, for use in JSON compat objects in test environment
@@ -236,7 +236,9 @@ impl Persistence {
             None => None,
         };
         Ok(Self {
-            store: Store::Kubernetes(kubernetes::KubernetesStore::new(client, namespace, copy)),
+            store: Store::Kubernetes(Box::new(kubernetes::KubernetesStore::new(
+                client, namespace, copy,
+            ))),
         })
     }
 
@@ -267,6 +269,27 @@ impl Persistence {
             Store::Postgres(store) => store.write_all(&records.to_rows()?, replace).await,
             Store::Kubernetes(store) => store.write_all(records, replace).await,
         }
+    }
+
+    /// Keep the records in Kubernetes objects in `namespace`, through `client`, with no copy
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn kubernetes_with_client(client: kube::Client, namespace: String) -> Self {
+        Self {
+            store: Store::Kubernetes(Box::new(kubernetes::KubernetesStore::new(
+                client, namespace, None,
+            ))),
+        }
+    }
+
+    /// Return an error when the Kubernetes store finds its records went back, instead of exiting
+    /// the process (tests).
+    #[cfg(test)]
+    pub(crate) fn do_not_exit(mut self) -> Self {
+        if let Store::Kubernetes(store) = &mut self.store {
+            store.do_not_exit();
+        }
+        self
     }
 
     /// A helper for use during startup, where we would like to tolerate concurrent restarts of the
@@ -427,7 +450,6 @@ impl Persistence {
     /// When a tenant invokes the /re-attach API, this function is responsible for doing an efficient
     /// batched increment of the generations of all tenants whose generation_pageserver is equal to
     /// the node that called /re-attach.
-    #[tracing::instrument(skip_all, fields(node_id))]
     pub(crate) async fn re_attach(
         &self,
         input_node_id: NodeId,
@@ -480,6 +502,21 @@ impl Persistence {
         match &self.store {
             Store::Postgres(store) => store.shard_generations(tenant_shard_ids).await,
             Store::Kubernetes(store) => store.shard_generations(tenant_shard_ids).await,
+        }
+    }
+
+    /// A pageserver's generation validation: the generations of shards whose latest generation
+    /// was issued to `node_id`. On Postgres, the same query as [`Self::shard_generations`]; the
+    /// Kubernetes store answers from one list of that pageserver's tenants, and leaves out a
+    /// shard whose latest generation went to another pageserver (answered invalid).
+    pub(crate) async fn shard_generations_on(
+        &self,
+        node_id: NodeId,
+        tenant_shard_ids: impl Iterator<Item = &TenantShardId>,
+    ) -> Result<Vec<(TenantShardId, Option<Generation>)>, DatabaseError> {
+        match &self.store {
+            Store::Postgres(store) => store.shard_generations(tenant_shard_ids).await,
+            Store::Kubernetes(store) => store.shard_generations_on(node_id, tenant_shard_ids).await,
         }
     }
 

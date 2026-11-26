@@ -24,6 +24,10 @@ use crate::persistence::{
 pub(crate) const GROUP: &str = "storagecontroller.peat.zabaca.com";
 pub(crate) const VERSION: &str = "v1alpha1";
 
+/// The annotation holding an object's revision: the controller's own count of its writes, one
+/// more on each (not the API server's `resourceVersion`, which goes back with an etcd restore).
+pub(crate) const REVISION_ANNOTATION: &str = "storagecontroller.peat.zabaca.com/revision";
+
 /// The label on a Timeline naming its tenant.
 pub(crate) const TENANT_LABEL: &str = "storagecontroller.peat.zabaca.com/tenant";
 /// The prefix of the label on a Tenant naming a pageserver one of its shards' generations was
@@ -61,7 +65,8 @@ pub(crate) struct Object<S> {
 }
 
 impl<S: Spec> Object<S> {
-    pub(crate) fn new(name: &str, spec: S) -> Self {
+    /// A new object at `revision`.
+    pub(crate) fn new(name: &str, spec: S, revision: u64) -> Self {
         let labels = spec.labels();
         Object {
             api_version: format!("{GROUP}/{VERSION}"),
@@ -69,15 +74,41 @@ impl<S: Spec> Object<S> {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
                 labels: (!labels.is_empty()).then_some(labels),
+                annotations: Some(BTreeMap::from([(
+                    REVISION_ANNOTATION.to_string(),
+                    revision.to_string(),
+                )])),
                 ..Default::default()
             },
             spec,
         }
     }
 
-    /// The same object holding `spec`, with the labels the controller keeps recomputed and any
-    /// other label left as it was.
-    pub(crate) fn with_spec(&self, spec: S) -> Self {
+    pub(crate) fn name(&self) -> &str {
+        self.metadata.name.as_deref().unwrap_or_default()
+    }
+
+    /// The object's revision. One missing, or not an integer, fails closed.
+    pub(crate) fn revision(&self) -> DatabaseResult<u64> {
+        let found = self
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(REVISION_ANNOTATION));
+        found.and_then(|r| r.parse::<u64>().ok()).ok_or_else(|| {
+            DatabaseError::Logical(format!(
+                "{} {} has no revision the controller can read ({REVISION_ANNOTATION}: {found:?}): \
+                 refusing it",
+                S::KIND,
+                self.name()
+            ))
+        })
+    }
+
+    /// The same object holding `spec` at the next revision, with the labels the controller keeps
+    /// recomputed and any other label left as it was.
+    pub(crate) fn with_spec(&self, spec: S) -> DatabaseResult<Self> {
+        let revision = self.revision()? + 1;
         let mut labels: BTreeMap<String, String> = self
             .metadata
             .labels
@@ -89,12 +120,16 @@ impl<S: Spec> Object<S> {
         labels.extend(spec.labels());
         let mut metadata = self.metadata.clone();
         metadata.labels = (!labels.is_empty()).then_some(labels);
-        Object {
+        metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(REVISION_ANNOTATION.to_string(), revision.to_string());
+        Ok(Object {
             api_version: format!("{GROUP}/{VERSION}"),
             kind: S::KIND.to_string(),
             metadata,
             spec,
-        }
+        })
     }
 }
 
@@ -122,13 +157,14 @@ impl<S: Spec> Resource for Object<S> {
     }
 }
 
-/// Times are kept as Postgres keeps them: UTC, rounded to the microsecond.
+/// Times are kept as the Postgres store keeps them: UTC, to the whole microsecond below (diesel
+/// sends Postgres whole microseconds, dropping what is finer).
 mod micros {
     use chrono::{DateTime, SecondsFormat, SubsecRound, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub(crate) fn round(t: DateTime<Utc>) -> DateTime<Utc> {
-        t.round_subsecs(6)
+        t.trunc_subsecs(6)
     }
 
     pub(crate) fn serialize<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
@@ -687,7 +723,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn times_round_to_microseconds_as_postgres_keeps_them() {
+    fn times_drop_what_is_finer_than_a_microsecond_as_postgres_keeps_them() {
         let t = chrono::DateTime::parse_from_rfc3339("2026-11-26T12:00:00.1234567Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -696,7 +732,7 @@ mod tests {
             started_at: t,
         };
         let json = serde_json::to_value(&spec).unwrap();
-        assert_eq!(json["startedAt"], "2026-11-26T12:00:00.123457Z");
+        assert_eq!(json["startedAt"], "2026-11-26T12:00:00.123456Z");
         let back: LeaderSpec = serde_json::from_value(json).unwrap();
         assert_eq!(back.started_at, round_to_micros(t));
     }
@@ -742,7 +778,7 @@ mod tests {
             tenant_id: "1f359dd625e519a1a4e8d7509690f6fc".to_string(),
             shards: vec![shard(0, Some(5)), shard(1, None)],
         };
-        let mut obj = Object::new(&spec.tenant_id.clone(), spec.clone());
+        let mut obj = Object::new(&spec.tenant_id.clone(), spec.clone(), 1);
         assert_eq!(
             obj.metadata
                 .labels
@@ -761,7 +797,8 @@ mod tests {
             shards: vec![shard(0, Some(6)), shard(1, Some(6))],
             ..spec
         };
-        let obj = obj.with_spec(moved);
+        let obj = obj.with_spec(moved).unwrap();
+        assert_eq!(obj.revision().unwrap(), 2);
         assert_eq!(
             obj.metadata.labels.unwrap().keys().collect::<Vec<_>>(),
             vec![
@@ -769,5 +806,30 @@ mod tests {
                 "someone.example.com/else"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    #[test]
+    fn an_object_without_a_readable_revision_is_refused() {
+        let spec = LeaderSpec {
+            address: "http://controller.example.com:1234".to_string(),
+            started_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        let mut obj = Object::new(LEADER_OBJECT_NAME, spec.clone(), 7);
+        assert_eq!(obj.revision().unwrap(), 7);
+        obj.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(REVISION_ANNOTATION.to_string(), "seven".to_string());
+        assert!(obj.revision().is_err());
+        assert!(obj.with_spec(spec.clone()).is_err());
+        obj.metadata.annotations = None;
+        let err = obj.revision().unwrap_err().to_string();
+        assert!(err.contains("Leader leader"), "{err}");
     }
 }
