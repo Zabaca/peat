@@ -13,6 +13,7 @@ from fixtures.neon_fixtures import (
     import_timeline_from_vanilla_postgres,
     wait_for_wal_insert_lsn,
 )
+from fixtures.pg_version import PgVersion
 from fixtures.remote_storage import RemoteStorageKind
 from fixtures.utils import query_scalar
 
@@ -193,7 +194,6 @@ def test_import_at_2bil(
 # Constants and macros copied from PostgreSQL multixact.c and headers. These are needed to
 # calculate the SLRU segments that a particular multixid or multixid-offsets falls into.
 BLCKSZ = 8192
-MULTIXACT_OFFSETS_PER_PAGE = int(BLCKSZ / 4)
 SLRU_PAGES_PER_SEGMENT = 32
 MXACT_MEMBER_BITS_PER_XACT = 8
 MXACT_MEMBER_FLAGS_PER_BYTE = 1
@@ -204,12 +204,22 @@ MULTIXACT_MEMBERGROUPS_PER_PAGE = int(BLCKSZ / MULTIXACT_MEMBERGROUP_SIZE)
 MULTIXACT_MEMBERS_PER_PAGE = MULTIXACT_MEMBERGROUPS_PER_PAGE * MULTIXACT_MEMBERS_PER_MEMBERGROUP
 
 
-def MultiXactIdToOffsetSegment(xid: int):
-    return int(xid / (SLRU_PAGES_PER_SEGMENT * MULTIXACT_OFFSETS_PER_PAGE))
+def multixact_offsets_per_page(pg_version: PgVersion) -> int:
+    # A multixact offset is 4 bytes up to Postgres 18, 8 bytes since 19
+    return int(BLCKSZ / (8 if pg_version >= PgVersion.V19 else 4))
+
+
+def MultiXactIdToOffsetSegment(xid: int, pg_version: PgVersion):
+    return int(xid / (SLRU_PAGES_PER_SEGMENT * multixact_offsets_per_page(pg_version)))
 
 
 def MXOffsetToMemberSegment(off: int):
     return int(off / (SLRU_PAGES_PER_SEGMENT * MULTIXACT_MEMBERS_PER_PAGE))
+
+
+def member_segment_file_name(segno: int, pg_version: PgVersion) -> str:
+    # Postgres 19 numbers the members segments with 64 bits and names them with 15 hex digits
+    return f"{segno:015X}" if pg_version >= PgVersion.V19 else f"{segno:04X}"
 
 
 def advance_multixid_to(
@@ -257,13 +267,13 @@ def advance_multixid_to(
     # missing. That's OK for our purposes. Autovacuum will print some warnings about the
     # missing segments, but will clean it up by truncating the SLRUs up to the new value,
     # closing the gap.
-    segname = f"{MultiXactIdToOffsetSegment(next_multi_xid):04X}"
+    segname = f"{MultiXactIdToOffsetSegment(next_multi_xid, pg_bin.pg_version):04X}"
     log.info(f"Creating dummy segment pg_multixact/offsets/{segname}")
     with open(vanilla_pg.pgdatadir / "pg_multixact" / "offsets" / segname, "w") as of:
         of.write("\0" * SLRU_PAGES_PER_SEGMENT * BLCKSZ)
         of.flush()
 
-    segname = f"{MXOffsetToMemberSegment(next_multi_offset):04X}"
+    segname = member_segment_file_name(MXOffsetToMemberSegment(next_multi_offset), pg_bin.pg_version)
     log.info(f"Creating dummy segment pg_multixact/members/{segname}")
     with open(vanilla_pg.pgdatadir / "pg_multixact" / "members" / segname, "w") as of:
         of.write("\0" * SLRU_PAGES_PER_SEGMENT * BLCKSZ)
@@ -455,10 +465,14 @@ $$;
     log.info(f"next_multixact_id after restart: {next_multixact_id_after_restart}")
     assert next_multixact_id_after_restart >= next_multixact_id_before_restart
 
-    # The multi-offset should wrap around as well
+    # The multi-offset should wrap around as well, up to Postgres 18. Since 19 it is 64 bits
+    # and never wraps around.
     cur.execute("select next_multi_offset from pg_control_checkpoint()")
     next_multi_offset_after_restart = int(
         query_scalar(cur, "select next_multi_offset from pg_control_checkpoint()")
     )
     log.info(f"next_multi_offset after restart: {next_multi_offset_after_restart}")
-    assert next_multi_offset_after_restart < 100000
+    if env.pg_version >= PgVersion.V19:
+        assert next_multi_offset_after_restart >= 0xFFFFFF00
+    else:
+        assert next_multi_offset_after_restart < 100000

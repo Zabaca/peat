@@ -2304,6 +2304,31 @@ impl DatadirModification<'_> {
             .get_db_size(spcnode, dbnode, Version::Modified(self), ctx)
             .await?;
 
+        // The database's relations in the rel_size_v2 keyspace, which the key range deleted below
+        // does not cover, are marked removed. A database that is dropped and made again with the
+        // same ids (as ALTER DATABASE ... SET TABLESPACE does when it moves one away and back)
+        // would otherwise find its relations still there when they are created again.
+        let v2_mode = self
+            .maybe_enable_rel_size_v2(false)
+            .map_err(WalIngestErrorKind::MaybeRelSizeV2Error)?;
+        if v2_mode.current_status != RelSizeMigration::Legacy {
+            let rels: Vec<RelTag> = self
+                .tline
+                .list_rels(spcnode, dbnode, Version::Modified(self), ctx)
+                .await?
+                .into_iter()
+                .collect();
+            if !rels.is_empty() {
+                let drop_relations = HashMap::from([((spcnode, dbnode), rels)]);
+                if let Err(e) = self.put_rel_drop_v2(drop_relations, ctx).await {
+                    if v2_mode.current_status == RelSizeMigration::Migrated {
+                        return Err(e);
+                    }
+                    tracing::warn!("error dropping rels of a dropped database: {}", e);
+                }
+            }
+        }
+
         // Remove entry from dbdir
         let buf = self.get(DBDIR_KEY, ctx).await?;
         let mut dir = DbDirectory::des(&buf)?;
@@ -2488,7 +2513,7 @@ impl DatadirModification<'_> {
                 if v2_mode.current_status == RelSizeMigration::Migrated {
                     return Err(e);
                 }
-                tracing::warn!("error writing rel_size_v2 keyspace: {}", e);
+                tracing::warn!("error writing rel_size_v2 keyspace for {}: {}", rel, e);
             }
         }
 
