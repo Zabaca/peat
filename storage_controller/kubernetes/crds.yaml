@@ -30,6 +30,8 @@ spec:
                   type: string
                 shards:
                   type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [shardNumber, shardCount]
                   items:
                     type: object
                     required:
@@ -97,6 +99,8 @@ spec:
                   type: string
                 shards:
                   type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [shardNumber, shardCount]
                   items:
                     type: object
                     required: [shardNumber, shardCount, healthy, lastScrubbedAt]
@@ -173,6 +177,8 @@ spec:
                       format: date-time
                 pendingOps:
                   type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [safekeeperId]
                   items:
                     type: object
                     required: [safekeeperId, generation, kind]

@@ -19,6 +19,17 @@ A pageserver's re-attach, one transaction on Postgres, becomes one write per ten
 
 The controller reads every object at start, as it reads every row today. Reads that must be current (a generation, a timeline's membership) go to the API server, never to a cache.
 
+Within one controller, writes to one tenant's object are taken one at a time (a lock per tenant), so a tenant with many shards reconciling at once does not spend its retries on conflicts with itself; the compare-and-swap stays the guard against a second controller. A pageserver's generation validation (a batch of shards, often many tenants') is answered from one list of the Tenant objects, not one read per tenant.
+
+### Writes that touch more than one object
+
+On Postgres these are one transaction; here they are several writes, in this order, each safe to repeat. A failure part way returns an error to the caller, whose retry finishes the work.
+
+- **Re-attach:** read the Pageserver (a deleted one is refused, as on Postgres); one compare-and-swap per tenant labelled with that pageserver, in any order; then the Pageserver's scheduling policy, last, only once every tenant is written. A retry increments the tenants already written again: a generation may skip a number, never repeat one.
+- **Creating a tenant's shards:** the Tenant (a shard already present is refused, as a unique violation is), then its MetadataHealth entries. A shard whose health entry is missing reads as having none, as before the scrubber's first run.
+- **Removing shards** (deleting a tenant, completing a split, aborting one): the Tenant, then its MetadataHealth entries, in a second write. Postgres removes health rows with their shard by a cascade; here, until the second write lands, a health entry can outlive its shard, so every reader of health entries and the copy tool drop entries whose shard is gone, and the controller removes such entries at start.
+- **Preferred zones and the scrubber's health updates,** which Postgres writes for many tenants in one transaction: one write per tenant, in tenant id order. Both are idempotent, and neither is a generation.
+
 ## Settings
 
 The controller's command line, beside Neon's:
@@ -32,19 +43,25 @@ The controller's command line, beside Neon's:
 
 The API server is reached as any Kubernetes client reaches it: in a pod, through the pod's service account; outside one, through the kubeconfig named by `KUBECONFIG` (or `~/.kube/config`).
 
-The copy's bucket is reached with the same credentials the pageserver uses for its own: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the environment (or the other sources of the AWS SDK's default chain) for an S3-compatible store. The records' copy should be a bucket, or a prefix under a key, that only the controller writes: the controller needs no access to the pageservers' or safekeepers' data.
+The copy's bucket is reached the way the pageserver reaches its own: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the environment (or the other sources of the AWS SDK's default chain) for an S3-compatible store. The records' copy should be a bucket, or a prefix under a key, that only the controller writes: the controller needs no access to the pageservers' or safekeepers' data. (The `remote_storage` syntax carries no credentials, so one process reaches one store's key; the copy tool's restore is split in two steps for that reason, below.)
 
 ### What the controller refuses at start, with `kubernetes`
 
 - **The kinds are missing:** the namespace answers 404 for any of the six kinds (the install file has not applied `crds.yaml`).
+- **The copy cannot be read.** The copy is how the controller knows its objects have not lost or undone anything, so it starts only once it has read it (or found that the bucket holds none yet), as a controller on Postgres starts only once it reaches its database. Once running, an unreachable bucket only delays the copy's writes.
 - **The records are empty but the copy is not:** the namespace holds no Tenant, Pageserver or Safekeeper object, while the bucket's copy holds some. A cluster whose objects were lost would otherwise start from nothing, tell every pageserver to drop its tenants, and later hand out generation numbers the object store has already seen. The way on is a restore (below). On a first install both are empty and the controller starts.
+- **The records went back:** for some shard the copy holds a higher generation than its object does, or for some tenant the copy has seen a higher generation (its highest-ever record, below) than any of the tenant's shards holds. That is what the objects look like after the cluster's store (etcd) is taken back to an older snapshot; starting would hand out generations that were already issued. The way on is a restore. (A tenant deleted and made again under the same id meets this check too, since its new shards start below what the copy saw; a restore is the way on there as well.)
 - **No copy is configured,** outside `--dev`.
 
-With records present, the controller starts even if the bucket cannot be reached, and keeps the copy's writes waiting until it can (so a store outage does not also stop the controller).
+A running controller that sees a generation go back (an object's shard, in the watch the copy is written from, with a lower generation than before) stops writing the copy and exits with an error, so its restart meets the check above.
 
 ## The copy in the bucket
 
-Within a second of each change to the records, the controller writes the changed objects to the copy's bucket, one JSON file per object, and removes the file of a deleted object. At start it compares the bucket with the objects and rewrites whatever differs. The copy is for one use: rebuilding the records after the cluster's objects are lost, with `storcon_records restore` (below). The layout under the prefix is the controller's and may change between releases; read it through the tool.
+Within a second of each change to the records, the controller writes the copy: one document holding every record. It follows the API server rather than its own writes (it watches every kind and writes what the API server holds), so a leader and a candidate during a handover write the same copy, and one that has stepped down never writes back an older one. Beside the records, the document keeps, for every tenant, the highest generation it has ever seen for any of its shards; that entry outlives the tenant's record and is carried over from the copy a controller finds at start.
+
+A copy is never replaced by one that goes back: the controller does not write a document in which some shard's generation is lower than in the copy it last read or wrote, or which holds no records over one that holds some (from inside the cluster, every record gone at once is what a loss looks like, and the copy is then the way back). Either case leaves the copy as it is and shows in the metric below; a generation going back also stops the controller (above).
+
+The copy is for one use: rebuilding the records after the cluster's objects are lost or undone, with `storcon_records restore` (below). Its layout under the prefix is the controller's and may change between releases; read it through the tool.
 
 The metric `storage_controller_records_copy_behind_seconds` is the age of the oldest change not yet in the copy (0 when it is current), for an alert.
 
@@ -52,13 +69,13 @@ The controller's database metrics (`storage_controller_database_query_latency`, 
 
 ## The object kinds
 
-Group `storagecontroller.peat.zabaca.com`, version `v1alpha1`, all namespaced, all in the category `peat-records` (`kubectl get peat-records` lists them). Every field sits under `spec`; there is no `status`. Field names are camelCase; integers are JSON numbers; times are RFC 3339 strings in UTC with microseconds, as Postgres keeps them.
+Group `storagecontroller.peat.zabaca.com`, version `v1alpha1`, all namespaced, all in the category `peat-records` (`kubectl get peat-records` lists them). The group is its own, apart from the operator's kinds (which sit under `peat.zabaca.com`), so permissions can be given for one without the other: the controller's account touches only these, and a person or tool allowed to manage databases is not thereby allowed to edit generations. Every field sits under `spec`; there is no `status`. Field names are camelCase; integers are JSON numbers; times are RFC 3339 strings in UTC with microseconds, as Postgres keeps them.
 
-Three fields keep the exact text Neon's Postgres backend stores, so a copy between the two stores is exact and needs no translation: a tenant shard's `placementPolicy`, `config` and `schedulingPolicy` (each the JSON text serde writes, for example `"\"Active\""` for a shard's scheduling policy and `"{\"Attached\":1}"` for a placement), and an import's `shardStatuses` (JSON text).
+Three fields keep the exact text Neon's Postgres backend stores, so a copy between the two stores is exact and needs no translation: a tenant shard's `placementPolicy`, `config` and `schedulingPolicy` (each the JSON text serde writes, for example `"\"Active\""` for a shard's scheduling policy and `"{\"Attached\":1}"` for a placement), and an import's `shardStatuses` (JSON text; Postgres keeps it as `jsonb`, which reorders keys, so every comparison reads it as JSON, not as text).
 
 These objects are the controller's own. Nothing else writes them, except the copy tool while the controller is stopped. Do not edit them by hand: an edit to a generation can let two pageservers own the same data.
 
-The kinds' schemas are strict (an unknown field is dropped by the API server), so the controller compares every object the API server returns from a write with the object it sent, and stops with an error if a field was dropped: a controller newer than the installed kinds fails at its first write instead of losing data.
+The kinds' schemas are strict. Every write asks the API server for strict field validation (`fieldValidation=Strict`), so a field the installed kinds do not know is refused rather than dropped, and the controller also compares every object the API server returns from a write with the object it sent: a controller newer than the installed kinds fails at its first write instead of losing data. Lists keyed by a field (a tenant's shards by `shardNumber` and `shardCount`, a timeline's pending operations by `safekeeperId`) are declared as maps, so the API server refuses two entries with one key.
 
 ### Tenant
 
@@ -160,17 +177,19 @@ Neon's two `hadron_*` tables are not read or written by the controller's code, a
 
 ## Permissions
 
-The controller's service account needs, in the records' namespace only, `get`, `list`, `watch`, `create`, `update` and `delete` on `tenants`, `metadatahealths`, `timelines`, `pageservers`, `safekeepers` and `leaders` of the group: the Role in [`rbac.yaml`](rbac.yaml). Nothing cluster-wide, and nothing on any other kind. The copy tool needs the same, run by an account that holds it. Installing `crds.yaml` needs a cluster administrator, as any CustomResourceDefinition does.
+The controller's service account needs, in the records' namespace only, `get`, `list`, `watch` (the copy is written from a watch), `create`, `update` and `delete` on `tenants`, `metadatahealths`, `timelines`, `pageservers`, `safekeepers` and `leaders` of the group: the Role in [`rbac.yaml`](rbac.yaml). Nothing cluster-wide, and nothing on any other kind. The copy tool needs the same, run by an account that holds it. Installing `crds.yaml` needs a cluster administrator, as any CustomResourceDefinition does.
 
 ## The copy tool
 
 `storcon_records`, a program beside `storage_controller` in the storage image. It reads and writes the records with the controller stopped: to move a controller from Postgres to Kubernetes objects and back, to compare the two, to take a baseline before a change, and to rebuild the objects from the bucket's copy.
 
+**Where it runs:** inside the cluster's network, where the controller's and the pageservers' addresses resolve (a Job or a `kubectl exec` in the platform's namespace, with an account holding the Role below). Its check that nothing still runs (below) fails closed, so from a workstation, where those names do not resolve, every command that writes is refused.
+
 It names a store as one of:
 
 - `postgres`: the database at `--database-url` or `DATABASE_URL`, as the controller reaches it. The tool runs the controller's migrations on an empty database before writing to it.
 - `kubernetes`: the objects in `--records-namespace`, reached as the controller reaches them.
-- `bucket`: the copy at `--records-copy-storage`, with the controller's credentials. Read only, by `dump`, `compare` and `restore`.
+- `bucket`: the copy at `--records-copy-storage`, with the controller's credentials. Read only, by `dump`, `compare` and `restore`. Health entries whose shard is gone are dropped from every store's records as they are read (Postgres has none), so they never reach a comparison or a write.
 
 Commands:
 
@@ -178,14 +197,27 @@ Commands:
 storcon_records dump --from <store> [--output <file>]
 storcon_records compare <store> <store> [--json]
 storcon_records copy --from <postgres|kubernetes> --to <postgres|kubernetes> [--replace]
-storcon_records restore --to <postgres|kubernetes> --records-copy-storage <TOML> --pageserver-storage <TOML> [--replace]
+storcon_records scan-generations --pageserver-storage <TOML> --output <file>
+storcon_records restore --to <postgres|kubernetes> --records-copy-storage <TOML> --generations <file>
+                        [--replace] [--generation-margin <N>] [--accept-missing <list>]
+                        [--accept-silent-safekeepers]
 ```
+
+Every command that writes also takes `--controller-address <url>` and `--assume-stopped` (below).
 
 - **`dump`** writes every record as one JSON document (to the file, or to standard output), sorted, the same shape from any store, for a baseline or a person to read.
 - **`compare`** reads both stores and reports every difference, field by field (with `--json`, as one JSON document), and the count of each kind on each side.
 - **`copy`** writes every record of one store into the other, then compares them. The destination must be empty unless `--replace` is given, which first removes what it holds. Generations are copied as they are.
-- **`restore`** rebuilds the records from the bucket's copy, for a platform whose objects were lost. Every shard's generation is set above the highest of what the copy holds for it and what the pageservers' store (`--pageserver-storage`, the pageservers' own `remote_storage` setting, with their credentials) shows in its index files, and each timeline's membership is read back from its safekeepers (with `SAFEKEEPER_JWT_TOKEN` when they need one), keeping the highest generation; so no generation held by a pageserver can be issued again. Then it compares the result with the copy, generations aside.
+- **`scan-generations`** reads the pageservers' store (`--pageserver-storage`, the pageservers' own `remote_storage` setting, run with the pageservers' credentials in its environment) and writes, per tenant shard found under `tenants/`, the highest generation any object under the shard's prefix carries as its suffix. It is a separate step so that each run holds one store's key: the pageservers' bucket and the records' copy have keys of their own.
+- **`restore`** rebuilds the records from the bucket's copy (run with the copy's credentials), for a platform whose objects were lost or undone. Every shard of a tenant gets one generation, `--generation-margin` (1000 by default) above the highest of the copy's generations for the tenant's shards, the highest the copy has ever seen for the tenant, and the highest `scan-generations` found for any of its shards. The margin covers generations handed out after the copy was last written and never used to write. A shard the copy holds without a generation, of which the store holds nothing, stays without one. So no generation a pageserver held can be issued again.
+  - It refuses when the store shows what the copy does not hold (a copy behind during a bucket outage): a tenant with data in the store and no record in the copy, or a tenant split further in the store (a shard count higher than any the copy holds for it). It lists them; `--accept-missing` with that list goes on without them (they keep their data in the store, with no record).
+  - Each timeline's safekeeper membership is read back from its safekeepers (with `SAFEKEEPER_JWT_TOKEN` when they need one), keeping the highest configuration any holds. It refuses unless every member of the timeline's current and next sets answers, since a silent one may hold the highest configuration, and a configuration issued again under the same generation would split the timeline's safekeepers; `--accept-silent-safekeepers` keeps the copy's membership for those timelines, and the controller's next change of them may then be refused by the safekeepers until set by hand.
+  - Then it reads what it wrote back and compares it with the copy, the shards' generations and the timelines' membership aside.
 
-Every command that writes refuses to start (exit 3) while the controller or any pageserver answers: it tries a connection to the leader's address and to each pageserver's HTTP port named in the records it reads (for `restore`, in the copy), and names whatever answered. A pageserver still attached could hold a generation the copy does not show yet; a running controller could write while the tool does.
+**The check that nothing still runs.** Every command that writes refuses (exit 3) while the controller runs, and `restore` and `copy --to postgres` also while any pageserver runs:
 
-Exit codes: 0 done (for `compare`, the stores are equal); 1 an error; 2 a wrong command line; 3 refused, with the reason (something still runs, or the destination is not empty without `--replace`); 4 the stores differ (from `compare`, or from the check at the end of `copy` and `restore`).
+- The controller is found at the Leader record's address (`--address-for-peers`), or at `--controller-address` when given; with neither, the command is refused, since there is nothing to check.
+- Pageservers are found at the HTTP ports their records name (for `restore`, the copy's). `restore` needs them stopped because a pageserver still attached could hold a generation the copy does not show; `copy --to postgres` is the way back of a move to Kubernetes, which the move's plan runs with every pageserver stopped. `copy --to kubernetes`, the move itself, runs with the pageservers up: with the controller stopped no generation can be issued, so the records cannot change under the copy.
+- An address that accepts a connection runs; one that refuses it (the host answers, the port is closed, as a Service with no pod behind it does) is stopped; one that does not resolve, or does not answer within 5 seconds, is unknown, and unknown refuses. A name that vanished with its pod (a StatefulSet pod's own name) is unknown too: check that the pod is gone, then give `--assume-stopped`, which skips the whole check and says so in the output.
+
+Exit codes: 0 done (for `compare`, the stores are equal); 1 an error; 2 a wrong command line; 3 refused, with the reason (something runs or may run, the destination is not empty without `--replace`, the store holds what the copy does not, or a safekeeper did not answer); 4 the stores differ (from `compare`, or from the check at the end of `copy` and `restore`).
