@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { publicNameHits } from '../src/public-names'
 
 // The public-names check (src/public-names.ts): its rules on made-up lines, then the whole folder, which must hold no finding.
 // The scan leaves out the check's own two files: this one holds offending lines on purpose, and the check's source names what it allows.
 
-const kinds = (line: string, path = 'src/a.ts') => publicNameHits(path, line).map((h) => h.kind)
+const kinds = (line: string, path = 'notes.txt') => publicNameHits(path, line).map((h) => h.kind)
 
 describe('the rules', () => {
   test('a dash: em and en dashes are findings; a hyphen is not', () => {
@@ -40,7 +40,7 @@ describe('the rules', () => {
   test('an email: only at a reserved example domain', () => {
     expect(kinds('owner: ops@example.com')).toEqual([])
     expect(kinds('git@github.com:Zabaca/peat.git')).toEqual([])
-    expect(kinds('owner: someone@acme-corp.com')).toEqual(['email'])
+    expect(kinds('owner: someone@acme-corp.com')).toEqual(['email', 'host'])
     expect(kinds('image ghcr.io/zabaca/peat/storage@sha256:abc')).toEqual([])
   })
 
@@ -52,10 +52,101 @@ describe('the rules', () => {
     expect(kinds('anything at all about Zabaca', 'NOTICE')).toEqual([])
   })
 
-  test('a record: references to planning documents another repository holds', () => {
-    expect(kinds('see docs/problems/some-problem/problem.md')).toEqual(['record'])
-    expect(kinds("as Home's tests did")).toEqual(['record'])
-    expect(kinds('see docs/sourcetree.md and the home directory')).toEqual([])
+  test('a record: a path of a document this repository does not hold', () => {
+    const exists = (p: string) => p === 'docs/sourcetree.md'
+    expect(publicNameHits('README.md', 'see docs/some-folder/some-file.md', exists).map((h) => h.kind)).toEqual(['record'])
+    expect(publicNameHits('README.md', 'see docs/sourcetree.md and the home directory', exists)).toEqual([])
+  })
+
+  test('a host put together in code, after a dot, a star or an expression, and under any real top-level domain', () => {
+    expect(kinds('const h = `${db}.acme-corp.com`', 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const w = '*.acme-corp.com'", 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const s = '.acme-corp.com'", 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const a = 'acme.co'", 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const a = 'acme.app'", 'src/a.ts')).toEqual(['host'])
+    expect(kinds("const m = 'ops@acme.co'", 'src/a.ts')).toEqual(['email', 'host'])
+    expect(kinds('// the backups live at acme-backups.s3.us-west-2.amazonaws.com', 'src/a.ts')).toEqual(['host'])
+    expect(kinds('// path style: s3.us-west-2.amazonaws.com/acme-backups/x', 'src/a.ts')).toEqual(['host'])
+    expect(kinds('// the API is at s3.us-west-2.amazonaws.com', 'src/a.ts')).toEqual([])
+  })
+
+  test('code is not prose: property chains, files and quoted code in comments are no hosts', () => {
+    expect(kinds('const n = o.metadata.name; console.log(res.json, cfg.spec.co)', 'src/a.ts')).toEqual([])
+    expect(kinds("// see README.md, control.ts and `o.spec.co` for why; a file x.sh", 'src/a.ts')).toEqual([])
+    expect(kinds("const re = /'acme.co'/; const p = '.spec.template.containers'", 'src/a.ts')).toEqual([])
+    expect(kinds('acme.co in a document', 'README.md')).toEqual(['host'])
+  })
+})
+
+describe('the second review\'s holes, and attempts to break the check', () => {
+  const code = (line: string) => kinds(line, 'src/a.ts')
+  test('a host quoted in backticks inside a comment', () => {
+    expect(code('// see `db.acme-corp.com`')).toEqual(['host'])
+    expect(code('/* the store: `store.acme-corp.com` */')).toEqual(['host'])
+  })
+  test('a host right after @ with no local part', () => {
+    expect(code('const a = `${user}@acme-corp.com`')).toEqual(['host'])
+    expect(kinds('<user>@acme-corp.com')).toEqual(['host'])
+    expect(code('const o = { domain: "@acme-corp.com" }')).toEqual(['host'])
+  })
+  test('second-level domains of two letters under a country', () => {
+    for (const h of ['acme-corp.co.uk', 'acme.co.jp', 'acme.co.nz', 'acme.co.za', 'acme.co.in', 'acme.ac.uk', 'acme.or.jp', 'hp.de', 'qm.io']) expect([h, kinds(`at ${h}`)]).toEqual([h, ['host']])
+  })
+  test('the newer generic domains, from IANA\'s list', () => {
+    for (const t of ['health', 'clinic', 'law', 'dental', 'media', 'design', 'consulting', 'church', 'nyc', 'vip', 'fun']) expect([t, kinds(`at acme.${t}`)]).toEqual([t, ['host']])
+  })
+  test('git\'s own address names its owner after a colon; an s3:// address names its bucket', () => {
+    expect(kinds('git@github.com:acme-corp/private.git')).toEqual(['host'])
+    expect(kinds('git@github.com:Zabaca/peat.git')).toEqual([])
+    expect(kinds('the copy at s3://acme-backups/path')).toEqual(['host'])
+    expect(kinds('for example s3://example-bucket/path')).toEqual([])
+  })
+  test('IPv6: only the documentation prefix, loopback and the unspecified address', () => {
+    expect(kinds('listen on [::1] and :: and 2001:db8::5')).toEqual([])
+    expect(kinds('the node at 2a01:4f8:c17:1234::1')).toEqual(['address'])
+    expect(kinds('at 05:00:30 and 12:30')).toEqual([])
+  })
+  test('a slash after x++ is a division, and the string after it is still read', () => {
+    expect(code("let x = i++ / 2; const h = 'db.acme-corp.com'")).toEqual(['host'])
+  })
+  test('attempts to break it: a host split by a template, in a URL, uppercase, with a port, in YAML, in a shell line', () => {
+    expect(code('const u = `https://${sub}.acme-corp.com:8443/x`')).toEqual(['host'])
+    expect(code("const u = 'HTTPS://DB.ACME-CORP.COM'")).toEqual(['host'])
+    expect(kinds('endpoint: https://store.acme-corp.io:9000', 'x.yaml')).toEqual(['host'])
+    expect(kinds('curl -fsS https://api.acme-corp.dev/v1', 'x.sh')).toEqual(['host'])
+    expect(code("const m = { 'ops+alerts@acme-corp.com': 1 }")).toEqual(['email', 'host'])
+    expect(code('// mail goes to "Ops" <ops@acme.health>')).toEqual(['email', 'host'])
+  })
+  test('what it lets through on purpose, with why: property chains, files, the listed third parties and the examples', () => {
+    expect(code('// o.metadata.name, Date.now(), status.host, images.storage')).toEqual([])
+    expect(code("const f = 'README.md', g = 'run.sh', h = 'control.ts'")).toEqual([])
+    expect(code("const a = 'db.example.com', b = 'x.test', c = 'kubernetes.io/hostname'")).toEqual([])
+  })
+})
+
+describe('the third review\'s follow-ups', () => {
+  test('the exemptions are code\'s alone: in a document a name like a property chain is a host', () => {
+    expect(kinds('mail acme.name and see acme.host or x.acme-corp.com', 'README.md')).toEqual(['host', 'host', 'host'])
+    expect(kinds('endpoint: https://x.acme-corp.com', 'examples/a.yaml')).toEqual(['host'])
+    expect(kinds("const n = 'o.metadata.name'", 'src/a.ts')).toEqual([])
+    expect(kinds("const d = 'json.data'", 'src/a.ts')).toEqual(['host']) // data is no longer exempt
+  })
+  test('under amazonaws.com only the S3 API\'s hosts; an account\'s registry, load balancer or database is a finding', () => {
+    expect(kinds('the API at s3.us-west-2.amazonaws.com')).toEqual([])
+    for (const h of ['123456789012.dkr.ecr.us-east-1.amazonaws.com', 'my-lb-123.us-east-1.elb.amazonaws.com', 'abc.gr7.us-east-1.eks.amazonaws.com', 'db.abc.us-east-1.rds.amazonaws.com']) expect([h, kinds(`at ${h}`)]).toEqual([h, ['host']])
+  })
+  test('docker.io names its owner as ghcr.io does', () => {
+    expect(kinds('image docker.io/library/postgres:17')).toEqual([])
+    expect(kinds('image docker.io/acmecorp/private-image:1')).toEqual(['host'])
+  })
+  test('a store\'s own addresses: an S3 ARN, gs:// and r2://', () => {
+    expect(kinds('the bucket arn:aws:s3:::acme-backups')).toEqual(['host'])
+    expect(kinds('copy to gs://acme-backups/x and r2://acme-records')).toEqual(['host', 'host'])
+    expect(kinds('for example gs://example-bucket')).toEqual([])
+  })
+  test('private suffixes: .local (but the cluster\'s own), .internal, .lan, .corp', () => {
+    expect(kinds('the router at gw.home.lan, nas.local, db.acme.internal, ad.acme.corp')).toEqual(['host', 'host', 'host', 'host'])
+    expect(kinds('the service at storage-controller.peat.svc.cluster.local')).toEqual([])
   })
 })
 
@@ -67,7 +158,8 @@ describe('the folder', () => {
     const files = listed.stdout.split('\0').filter((f) => f && !['test/public-names.test.ts', 'src/public-names.ts', 'bun.lock'].includes(f))
     // a scan that read nothing would pass by finding nothing
     expect(files.length).toBeGreaterThan(5)
-    const found = files.flatMap((f) => publicNameHits(f, readFileSync(join(root, f), 'utf8')).map((h) => `${h.path}:${h.line}  ${h.kind}  ${h.detail}`))
+    const repo = join(root, '..')
+    const found = files.flatMap((f) => publicNameHits(f, readFileSync(join(root, f), 'utf8'), (p) => existsSync(join(repo, p))).map((h) => `${h.path}:${h.line}  ${h.kind}  ${h.detail}`))
     expect(found).toEqual([])
   })
 })

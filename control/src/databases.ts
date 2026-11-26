@@ -1,6 +1,7 @@
 // What the control layer does about one Database object, decided from the object and the others: pure, so a test can judge it; control.ts
 // does what it says. A Database is the database's one record: the command and the API write the object, and the control layer makes the
 // storage behind it, keeps its record in the object's status, and takes it apart when the object is deleted.
+import { durationMs } from './api/schema'
 import { GROUP } from './names'
 
 /** The finalizer that keeps a deleted Database until its compute is gone and its data's hold is recorded. */
@@ -84,9 +85,7 @@ export function databaseAction(o: DbObject, all: DbObject[], ctx: { replacementO
 /** When a deleted database's data goes: `hold` is the Platform's deleteHold (`7d`, `36h`, `never`); null is never. */
 export function deleteAfter(hold: string, now: Date = new Date()): Date | null {
   if (hold === 'never') return null
-  const m = /^(\d+)([dh])$/.exec(hold)
-  if (!m) throw new Error(`a hold is a number of days or hours (7d, 36h) or never, not ${JSON.stringify(hold)}`)
-  return new Date(now.getTime() + Number(m[1]) * (m[2] === 'd' ? 86_400_000 : 3_600_000))
+  return new Date(now.getTime() + durationMs(hold)) // a duration, as every one of the kinds (7d, 36h)
 }
 
 /** A held deletion's data may be removed now: its time has come, and no database still uses its tenant (a root's data goes with its last timeline). */

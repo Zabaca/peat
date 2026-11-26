@@ -2,19 +2,22 @@
 //
 //   bun src/drills/run.ts list                                     # the drills, their groups and durations
 //   bun src/drills/run.ts plan <drill> [--want with-gateway]       # every guarded step the drill would take, against a fake world: changes nothing, reads nothing from the cluster
-//   bun src/drills/run.ts run <drill> --yes [--run N] [--want ...] [--gb N] [--kubeconfig <file>]
-//   bun src/drills/run.ts recover [--kubeconfig <file>]           # after a run that was killed or could not undo: replays the pending file, sweeps the drills' objects, starts stopped platform machines
+//   bun src/drills/run.ts run <drill> --kubeconfig <file> --yes [--run N] [--want ...] [--gb N]
+//   bun src/drills/run.ts recover --kubeconfig <file>             # after a run that was killed or could not undo: replays the pending file, sweeps the drills' objects, starts stopped platform machines
 //
 // What the drills are told about the install (environment values; see guard.ts, `drillSettings`): the platform's names (NAMESPACE, MACHINE_LABEL and the rest of src/names.ts), the machine command
 // (PEAT_DRILL_MACHINE_COMMAND, e.g. `["my-power", "{action}", "{machine}"]`), the quiet hours (PEAT_QUIET_HOURS, the JSON of the Platform's spec.upgrades.quietHours), Alertmanager and Prometheus
 // (PEAT_DRILL_ALERTMANAGER `monitoring/alertmanager`, PEAT_DRILL_PROMETHEUS `monitoring/prometheus:80`), the volumes (PEAT_DRILL_VOLUMES), the controller's database (PEAT_DRILL_CONTROLLER_DB), the databases
 // that may be lost (PEAT_DRILL_RECREATABLE), the namespaces to watch (PEAT_DRILL_WATCHED) and the work the uplink drill must not slow (PEAT_DRILL_UPLINK_BEHIND, PEAT_DRILL_UPLINK_ALERT).
 //
+// A drill names the cluster it breaks: `run` and `recover` refuse without `--kubeconfig <file>` (the shell's KUBECONFIG and current context
+// are never used, so a drill cannot land on whatever cluster the shell last pointed at), and every run prints that file's API server first.
+//
 // Each change's way back is written to the pending file BEFORE the change; `run` refuses while it holds anything and `recover` clears it. `run` refuses to start unless the platform is in a known good state,
 // is clear of the quiet hours when the drill cuts a machine or the store or loads the uplink (no argument overrides that), takes the snapshot of what must not move, holds the Alertmanager silence, runs the
 // drill, undoes everything the guard changed, waits for the platform to be good again, takes the snapshot again and compares the pods of the namespaces it watches. The record of the run is written to the
 // state directory.
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DRILLS, byName, type DrillSpec, type Opts } from './drills'
 import { FakeClock, FakeCtx, PlanExec, fakeSettings } from './fake'
@@ -25,7 +28,18 @@ const argv = process.argv.slice(2)
 const flag = (n: string) => { const i = argv.indexOf(`--${n}`); return i >= 0 ? argv[i + 1] : undefined }
 const has = (n: string) => argv.includes(`--${n}`)
 const opts = (): Opts => ({ want: flag('want') as Opts['want'], gb: flag('gb') ? Number(flag('gb')) : undefined })
-const settings = () => { const s = drillSettings(); const k = flag('kubeconfig'); return k ? { ...s, kubeconfig: k } : s }
+/** The cluster a drill acts on: the file `--kubeconfig` names, never the shell's; and that file's API server, printed before anything is done. */
+function target(): { kubeconfig: string; server: string } {
+  const file = flag('kubeconfig')
+  if (!file) throw new Refusal('a drill names the cluster it acts on: add --kubeconfig <file> (the shell\'s KUBECONFIG and current context are never used)')
+  if (!existsSync(file)) throw new Refusal(`no kubeconfig at ${file}`)
+  const cfg = Bun.YAML.parse(readFileSync(file, 'utf8')) as any
+  const ctx = (cfg?.contexts ?? []).find((c: any) => c.name === cfg?.['current-context'])?.context
+  const server = (cfg?.clusters ?? []).find((c: any) => c.name === ctx?.cluster)?.cluster?.server
+  if (!server) throw new Refusal(`${file} has no current context with a cluster: it cannot say which API server a drill would reach`)
+  return { kubeconfig: file, server: String(server) }
+}
+const settings = () => { const t = target(); return { ...drillSettings(), kubeconfig: t.kubeconfig, server: t.server } }
 
 /** The alerts of an alert drill: seen in Prometheus and in Alertmanager (active, not silenced) with the time of first sight; a tested alert is silenced when Alertmanager first shows it active unless the drill lets it through to the install's receivers. */
 function watchAlerts(c: Ctx, spec: DrillSpec): { stop: () => Promise<void>; seen: Map<string, { prometheus?: string; alertmanager?: string; silencedAt?: string }>; sent: { before?: { asked: number; failed: number }; sentAt?: string; after?: { asked: number; failed: number } } } {
@@ -57,6 +71,7 @@ function watchAlerts(c: Ctx, spec: DrillSpec): { stop: () => Promise<void>; seen
 
 async function runRecover(): Promise<void> {
   const s = settings()
+  console.log(`recover: against the API server ${s.server} (${s.kubeconfig})`)
   const g = new Guard(new RealExec(s.kubeconfig), { settings: s })
   g.installTrap()
   const r = await g.recover()
@@ -73,6 +88,7 @@ async function runLive(spec: DrillSpec): Promise<void> {
   if (spec.machineCut && !s.machineCommand) throw new Refusal(`${spec.name} cuts a machine and no machine command is set (PEAT_DRILL_MACHINE_COMMAND, with {action} and {machine})`)
   if (spec.alerts && (!s.alertmanager || !s.prometheus)) throw new Refusal(`${spec.name} tests alerts and needs Prometheus and Alertmanager named (PEAT_DRILL_PROMETHEUS, PEAT_DRILL_ALERTMANAGER)`)
   const runNo = Number(flag('run') ?? '1')
+  console.log(`== against the API server ${s.server} (${s.kubeconfig})`)
   const g = new Guard(new RealExec(s.kubeconfig), { settings: s })
   g.installTrap()
   if (spec.clear) g.assertClearOfQuietHours(spec.minutes)
@@ -144,8 +160,8 @@ if (import.meta.main) {
     } else if (cmd === 'plan' || cmd === 'run') {
       const spec = name ? byName(name) : undefined
       if (!spec) throw new Error(`no drill ${JSON.stringify(name)}; bun run.ts list`)
-      if (cmd === 'plan') await plan(spec)
-      else if (!has('yes')) { console.log(`${spec.name}: ${spec.title}\n~${spec.minutes} minutes. Add --yes to run it. \`plan\` shows every guarded step first.`); process.exitCode = 2 }
+      if (cmd === 'plan') { const k = flag('kubeconfig'); console.log(k ? `plan of ${spec.name}: a run with this kubeconfig would act on the API server ${target().server} (${k}); the plan itself reads nothing from it` : `plan of ${spec.name}: against a fake world; a run needs --kubeconfig <file>, and names its API server first`); await plan(spec) }
+      else if (!has('yes')) { const t = target(); console.log(`${spec.name}: ${spec.title}\n~${spec.minutes} minutes, against the API server ${t.server} (${t.kubeconfig}). Add --yes to run it. \`plan\` shows every guarded step first.`); process.exitCode = 2 }
       else await runLive(spec)
     } else throw new Error('usage: run.ts list | plan <drill> | run <drill> --yes | recover')
   } catch (e) {

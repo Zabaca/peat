@@ -127,7 +127,7 @@ spec:
   controller: { records: postgres, postgres: { urlSecret: records-db } }
   gateways: { count: 1 }
   control: { replicas: 1 }
-  computes: { idleMinutes: 1 }
+  computes: { idleAfter: 1m }
   databases: { deleteHold: 1h }
 EOF
 
@@ -169,13 +169,36 @@ spec:
     spec: { containers: [ { name: x, image: docker.io/library/busybox:1.37 } ] }
 EOF
 
+echo "== the kinds' rules, judged by the cluster's own API server"
+kind_refused() { # kind_refused <words the refusal must hold>, the object on standard input
+  local want=$1 out
+  if out=$(k apply --dry-run=server -f - 2>&1); then fail "the API server admitted an object its kind refuses ($want)"; fi
+  grep -q "$want" <<< "$out" || fail "refused for another reason than \"$want\": $out"
+  echo "  refused: $want"
+}
+kind_refused 'at is the moment of a parent' <<EOF
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Database
+metadata: { name: rule-at, namespace: peat-db }
+spec: { at: "2026-12-01T00:00:00Z" }
+EOF
+kind_refused 'the namespaces cannot change' <<EOF
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Platform
+metadata: { name: peat }
+spec:
+  release: ci
+  namespaces: { platform: elsewhere }
+  objectStore: { endpoint: "http://minio.store.svc:9000", bucket: peat, credentialsSecret: peat-store }
+EOF
+
 echo "== a database, through the control layer"
 k -n peat port-forward svc/peat-control 18080:8080 >/dev/null 2>&1 & pids+=($!)
 k -n peat-gateway port-forward svc/pg-front 15432:5432 >/dev/null 2>&1 & pids+=($!)
 sleep 3
 made=$(curl -fsS -X POST localhost:18080/db -H 'content-type: application/json' -d '{"name":"first"}') || fail "the control layer did not make a database"
 echo "  $made" | cut -c1-300
-k -n peat-compute get secret peat-ca -o jsonpath='{.data.ca\.crt}' | base64 -d > "$work/ca.crt"
+k -n peat-db get configmap peat-ca -o jsonpath='{.data.ca\.crt}' > "$work/ca.crt"
 password=$(k -n peat get secret db-first-login -o jsonpath='{.data.password}' | base64 -d)
 conn="host=first.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/ca.crt connect_timeout=30"
 sql() { PGPASSWORD="$password" psql "$conn" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }

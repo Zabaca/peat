@@ -20,6 +20,17 @@ export interface Schema {
   format?: string
   'x-kubernetes-preserve-unknown-fields'?: boolean
   'x-kubernetes-int-or-string'?: boolean
+  /** Rules the API server judges (CEL): across fields, and, with `oldSelf`, from one version of an object to the next. The checker below does not run them; the install test has the API server judge them. */
+  'x-kubernetes-validations'?: { rule: string; message: string }[]
+}
+
+/** Every duration of the kinds is written one way: a whole number and a unit, s, m, h or d (`30m`, `10m`, `7d`). */
+export const DURATION = '^[0-9]+(s|m|h|d)$'
+/** A duration in milliseconds; refused when it is not one. */
+export function durationMs(text: string): number {
+  const m = /^([0-9]+)(s|m|h|d)$/.exec(text)
+  if (!m) throw new Error(`a duration is a whole number and s, m, h or d (30m, 7d), not ${JSON.stringify(text)}`)
+  return Number(m[1]) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as 's' | 'm' | 'h' | 'd']
 }
 
 /** Every way `value` breaks `schema`, as `path: why`; empty when it fits. Unknown fields are findings unless the schema keeps them. */
@@ -93,3 +104,5 @@ export const bool = (description: string, more: Partial<Schema> = {}): Schema =>
 export const list = (description: string, items: Schema, more: Partial<Schema> = {}): Schema => ({ type: 'array', description, items, ...more })
 export const obj = (description: string, properties: Record<string, Schema>, more: Partial<Schema> = {}): Schema => ({ type: 'object', description, properties, ...more })
 export const map = (description: string, values: Schema = { type: 'string' }): Schema => ({ type: 'object', description, additionalProperties: values })
+export const duration = (description: string, more: Partial<Schema> = {}): Schema => ({ type: 'string', description, pattern: DURATION, ...more })
+export const rules = (...r: [string, string][]): Partial<Schema> => ({ 'x-kubernetes-validations': r.map(([rule, message]) => ({ rule, message })) })
