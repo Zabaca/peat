@@ -5,6 +5,7 @@
 // The clients are pods named `drill-*` in the computes' namespace, on the platform's machines, with a policy of their own (`drill-client`:
 // DNS and the gateways' 5432 only). They connect to `<database>.<databases' namespace>.svc` with `sslmode=verify-full` against the platform
 // CA's certificate (a ConfigMap `drill-ca` holding the PUBLIC half, read from the CA's Secret), as any client of the platform would.
+import { durationMs } from '../api/schema'
 import { DRILL_BASE_DATABASE, Guard, egressReachesStore, namespacesOf } from './guard'
 import { placement, type Names } from '../names'
 
@@ -308,7 +309,7 @@ export class LiveCtx implements Ctx {
       }
     }
     const env = async (n: string, name: string, key: string) => (await this.g.kjson<any>(['-n', n, 'get', 'deployment', name]).catch(() => null))?.spec?.template?.spec?.containers?.[0]?.env?.find((e: any) => e.name === key)
-    const want = this.g.settings.idleMinutes
+    const want = String(Math.max(1, Math.round(durationMs(this.g.settings.idleAfter) / 60_000)))
     const idle = [await env(ns, 'peat-control', 'IDLE_MINUTES'), await env(this.n.gatewayNamespace, 'peat-gateway', 'IDLE_MINUTES')]
     if (idle.some((e) => e !== undefined && e?.value !== want)) { lines.push(`IDLE_MINUTES is not ${want} on the control layer and the gateways (a sleep drill's leftover: recover)`); ok = false }
     if (cdb) {
