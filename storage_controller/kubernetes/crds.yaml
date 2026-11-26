@@ -1,0 +1,364 @@
+# The storage controller's record kinds (README.md beside this file says what each holds).
+# Apply before the controller starts with --records kubernetes; needs a cluster administrator.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: tenants.storagecontroller.peat.zabaca.com
+spec:
+  group: storagecontroller.peat.zabaca.com
+  scope: Namespaced
+  names:
+    kind: Tenant
+    listKind: TenantList
+    plural: tenants
+    singular: tenant
+    categories: [peat-records]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [tenantId, shards]
+              properties:
+                tenantId:
+                  type: string
+                shards:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - shardNumber
+                      - shardCount
+                      - shardStripeSize
+                      - placementPolicy
+                      - splitting
+                      - config
+                      - schedulingPolicy
+                    properties:
+                      shardNumber:
+                        type: integer
+                        minimum: 0
+                      shardCount:
+                        type: integer
+                        minimum: 0
+                      shardStripeSize:
+                        type: integer
+                        minimum: 0
+                      generation:
+                        type: integer
+                        minimum: 0
+                      generationPageserver:
+                        type: integer
+                      placementPolicy:
+                        type: string
+                      splitting:
+                        type: string
+                        enum: [Idle, Splitting]
+                      config:
+                        type: string
+                      schedulingPolicy:
+                        type: string
+                      preferredAzId:
+                        type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: metadatahealths.storagecontroller.peat.zabaca.com
+spec:
+  group: storagecontroller.peat.zabaca.com
+  scope: Namespaced
+  names:
+    kind: MetadataHealth
+    listKind: MetadataHealthList
+    plural: metadatahealths
+    singular: metadatahealth
+    categories: [peat-records]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [tenantId, shards]
+              properties:
+                tenantId:
+                  type: string
+                shards:
+                  type: array
+                  items:
+                    type: object
+                    required: [shardNumber, shardCount, healthy, lastScrubbedAt]
+                    properties:
+                      shardNumber:
+                        type: integer
+                        minimum: 0
+                      shardCount:
+                        type: integer
+                        minimum: 0
+                      healthy:
+                        type: boolean
+                      lastScrubbedAt:
+                        type: string
+                        format: date-time
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: timelines.storagecontroller.peat.zabaca.com
+spec:
+  group: storagecontroller.peat.zabaca.com
+  scope: Namespaced
+  names:
+    kind: Timeline
+    listKind: TimelineList
+    plural: timelines
+    singular: timeline
+    categories: [peat-records]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [tenantId, timelineId]
+              properties:
+                tenantId:
+                  type: string
+                timelineId:
+                  type: string
+                membership:
+                  type: object
+                  required:
+                    - startLsn
+                    - generation
+                    - skSet
+                    - cplaneNotifiedGeneration
+                    - skSetNotifiedGeneration
+                  properties:
+                    startLsn:
+                      type: string
+                    generation:
+                      type: integer
+                    skSet:
+                      type: array
+                      items:
+                        type: integer
+                    newSkSet:
+                      type: array
+                      items:
+                        type: integer
+                    cplaneNotifiedGeneration:
+                      type: integer
+                    skSetNotifiedGeneration:
+                      type: integer
+                    deletedAt:
+                      type: string
+                      format: date-time
+                pendingOps:
+                  type: array
+                  items:
+                    type: object
+                    required: [safekeeperId, generation, kind]
+                    properties:
+                      safekeeperId:
+                        type: integer
+                      generation:
+                        type: integer
+                      kind:
+                        type: string
+                        enum: [pull, exclude, delete]
+                import:
+                  type: object
+                  required: [shardStatuses]
+                  properties:
+                    shardStatuses:
+                      type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: pageservers.storagecontroller.peat.zabaca.com
+spec:
+  group: storagecontroller.peat.zabaca.com
+  scope: Namespaced
+  names:
+    kind: Pageserver
+    listKind: PageserverList
+    plural: pageservers
+    singular: pageserver
+    categories: [peat-records]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Address
+          type: string
+          jsonPath: .spec.listenHttpAddr
+        - name: Zone
+          type: string
+          jsonPath: .spec.availabilityZoneId
+        - name: Scheduling
+          type: string
+          jsonPath: .spec.schedulingPolicy
+        - name: Lifecycle
+          type: string
+          jsonPath: .spec.lifecycle
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required:
+                - nodeId
+                - schedulingPolicy
+                - lifecycle
+                - listenHttpAddr
+                - listenHttpPort
+                - listenPgAddr
+                - listenPgPort
+                - availabilityZoneId
+              properties:
+                nodeId:
+                  type: integer
+                schedulingPolicy:
+                  type: string
+                lifecycle:
+                  type: string
+                listenHttpAddr:
+                  type: string
+                listenHttpPort:
+                  type: integer
+                listenHttpsPort:
+                  type: integer
+                listenPgAddr:
+                  type: string
+                listenPgPort:
+                  type: integer
+                listenGrpcAddr:
+                  type: string
+                listenGrpcPort:
+                  type: integer
+                availabilityZoneId:
+                  type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: safekeepers.storagecontroller.peat.zabaca.com
+spec:
+  group: storagecontroller.peat.zabaca.com
+  scope: Namespaced
+  names:
+    kind: Safekeeper
+    listKind: SafekeeperList
+    plural: safekeepers
+    singular: safekeeper
+    categories: [peat-records]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Host
+          type: string
+          jsonPath: .spec.host
+        - name: Zone
+          type: string
+          jsonPath: .spec.availabilityZoneId
+        - name: Scheduling
+          type: string
+          jsonPath: .spec.schedulingPolicy
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required:
+                - id
+                - regionId
+                - version
+                - host
+                - port
+                - httpPort
+                - availabilityZoneId
+                - schedulingPolicy
+              properties:
+                id:
+                  type: integer
+                regionId:
+                  type: string
+                version:
+                  type: integer
+                host:
+                  type: string
+                port:
+                  type: integer
+                httpPort:
+                  type: integer
+                httpsPort:
+                  type: integer
+                availabilityZoneId:
+                  type: string
+                schedulingPolicy:
+                  type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: leaders.storagecontroller.peat.zabaca.com
+spec:
+  group: storagecontroller.peat.zabaca.com
+  scope: Namespaced
+  names:
+    kind: Leader
+    listKind: LeaderList
+    plural: leaders
+    singular: leader
+    categories: [peat-records]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Address
+          type: string
+          jsonPath: .spec.address
+        - name: Started
+          type: string
+          jsonPath: .spec.startedAt
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [address, startedAt]
+              properties:
+                address:
+                  type: string
+                startedAt:
+                  type: string
+                  format: date-time

@@ -1,0 +1,26 @@
+# What the storage controller's service account needs with --records kubernetes, in the
+# records' namespace only (README.md beside this file). Replace RECORDS_NAMESPACE and
+# CONTROLLER_ACCOUNT with the install's own; the copy tool needs the same Role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: storage-controller-records
+  namespace: RECORDS_NAMESPACE
+rules:
+  - apiGroups: [storagecontroller.peat.zabaca.com]
+    resources: [tenants, metadatahealths, timelines, pageservers, safekeepers, leaders]
+    verbs: [get, list, watch, create, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: storage-controller-records
+  namespace: RECORDS_NAMESPACE
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: storage-controller-records
+subjects:
+  - kind: ServiceAccount
+    name: CONTROLLER_ACCOUNT
+    namespace: RECORDS_NAMESPACE
