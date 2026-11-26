@@ -562,6 +562,6 @@ jobs:
           REPO: ghcr.io/${{ github.repository }}
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
         run: |
-          repo=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
-          .github/peat/push-images.sh "$repo" "$TAG"
-          PEAT_IMAGE_NAMES=compute-pg19 .github/peat/push-images.sh "$repo" "$TAG"
+          lowercase_repo=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          .github/peat/push-images.sh "$lowercase_repo" "$TAG"
+          PEAT_IMAGE_NAMES=compute-pg19 .github/peat/push-images.sh "$lowercase_repo" "$TAG"
