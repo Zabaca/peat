@@ -175,6 +175,31 @@ describe('keeping it as declared', () => {
   })
 })
 
+describe('what a client of a database needs, in its own namespace', () => {
+  test('the authority\'s certificate in every namespace that holds a Database, each made database\'s login (a branch uses its root\'s), named in its status; removed with the database', async () => {
+    k.put(platform({ gateways: { domain: 'db.example.com' } }))
+    await reconcile(k)
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'db-orders-login', namespace: 'peat' }, data: { password: Buffer.from('s3cret word').toString('base64') } })
+    const rec = (parent = '', root = true) => ({ tenant: 'a'.repeat(32), timeline: 'b'.repeat(32), pgVersion: 19, phase: 'Ready', record: { mode: 'primary', root, parent, port: 15010 } })
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders', namespace: 'shop' }, spec: {}, status: rec() })
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders-dev', namespace: 'shop' }, spec: { parent: 'orders' }, status: rec('orders', false) })
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'pending', namespace: 'other' }, spec: {} })
+    await reconcile(k)
+    expect(k.get('v1', 'configmaps', 'shop', 'peat-ca').data['ca.crt']).toContain('BEGIN CERTIFICATE')
+    expect(k.get('v1', 'configmaps', 'other', 'peat-ca')).toBeDefined()
+    const login = k.get('v1', 'secrets', 'shop', 'orders-login')
+    expect(decode(login, 'password')).toBe('s3cret word')
+    expect(decode(login, 'host')).toBe('orders.db.example.com')
+    expect(decode(login, 'url')).toBe('postgresql://app:s3cret%20word@orders.db.example.com:5432/app?sslmode=verify-full')
+    expect(decode(k.get('v1', 'secrets', 'shop', 'orders-dev-login'), 'password')).toBe('s3cret word')
+    expect(k.get('v1', 'secrets', 'other', 'pending-login')).toBeUndefined()
+    expect(k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status).toMatchObject({ loginSecret: 'orders-login', caConfigMap: 'peat-ca' })
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|databases|orders-dev'))!)
+    await reconcile(k)
+    expect(k.get('v1', 'secrets', 'shop', 'orders-dev-login')).toBeUndefined()
+  })
+})
+
 describe('a one-machine trial', () => {
   test('spread none: every piece on the one machine, one replica each, the safekeepers zones of their own, and the status says what it survives', async () => {
     for (const n of ['machine-2', 'machine-3']) k.objects.delete([...k.objects.keys()].find((x) => x.endsWith(`|${n}`))!)

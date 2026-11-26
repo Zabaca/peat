@@ -109,6 +109,37 @@ async function pieces(k: Kube, r: Resolved, rendered: Manifest[]): Promise<{ kin
   return out
 }
 
+export const CA_CONFIG_MAP = 'peat-ca'
+/**
+ * What a client of each database needs, in the database's own namespace: the authority's public certificate (a ConfigMap `peat-ca`,
+ * ca.crt, for sslmode=verify-full) in every namespace that holds a Database, and each made database's login (a Secret `<name>-login`:
+ * username, password, the names to connect to and a URL). A branch and a replica use their root's login. The control layer keeps the
+ * passwords in the platform namespace; these are copies, made and removed by the operator.
+ */
+async function published(k: Kube, r: Resolved, keys: Record<string, string>): Promise<{ manifests: Manifest[]; dbs: any[] }> {
+  const list = await k.request('GET', `/apis/${API_VERSION}/databases`)
+  if (list.status !== 200) return { manifests: [], dbs: [] }
+  const dbs = list.json.items as any[]
+  const meta = (name: string, namespace: string) => ({ name, namespace, labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name } })
+  const out: Manifest[] = []
+  for (const ns of [...new Set(dbs.map((d) => d.metadata.namespace as string))].sort()) out.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(CA_CONFIG_MAP, ns), data: { 'ca.crt': keys['ca.crt'] ?? '' } })
+  for (const d of dbs) {
+    const rec = d.status?.record
+    if (!d.status?.tenant || !rec || d.metadata.deletionTimestamp) continue
+    const root = rec.root ? d.metadata.name : rec.parent
+    const login = await k.request('GET', `/api/v1/namespaces/${r.names.namespace}/secrets/db-${root}-login`)
+    if (login.status !== 200) continue
+    const password = Buffer.from(String(login.json.data?.password ?? ''), 'base64').toString()
+    const serviceHost = `${d.metadata.name}.${r.names.dbNamespace}.svc`
+    const host = r.spec.gateways.domain ? `${d.metadata.name}.${r.spec.gateways.domain}` : serviceHost
+    out.push({ apiVersion: 'v1', kind: 'Secret', metadata: meta(`${d.metadata.name}-login`, d.metadata.namespace), type: 'Opaque', stringData: {
+      username: 'app', password, dbname: 'app', host, serviceHost, port: '5432',
+      url: `postgresql://app:${encodeURIComponent(password)}@${host}:5432/app?sslmode=verify-full`,
+    } })
+  }
+  return { manifests: out, dbs }
+}
+
 /** One pass. Returns what it did, for the log and the tests. */
 export async function reconcile(k: Kube): Promise<PassResult> {
   const all = (ok(await k.request('GET', platformsPath), 'list the Platforms').json.items ?? []) as Platform[]
@@ -159,8 +190,13 @@ export async function reconcile(k: Kube): Promise<PassResult> {
     ok(await serverApply(k, cm, FIELD_MANAGER), 'keep the placements')
   }
 
-  const rendered = render(r, keys)
+  const pub = await published(k, r, keys)
+  const rendered = [...render(r, keys), ...pub.manifests]
   for (const m of rendered.filter((x) => x.kind !== 'Namespace')) await applyOne(m)
+  for (const d of pub.dbs) {
+    if (!d.status?.tenant || d.metadata.deletionTimestamp || (d.status.loginSecret && d.status.caConfigMap)) continue
+    await k.request('PATCH', `/apis/${API_VERSION}/namespaces/${d.metadata.namespace}/databases/${d.metadata.name}/status`, { status: { loginSecret: `${d.metadata.name}-login`, caConfigMap: CA_CONFIG_MAP } }, 'application/merge-patch+json')
+  }
 
   // what the operator made for this platform and no longer renders: removed (the namespaces never are: what is in them may not be its own)
   const wanted = new Set(rendered.map(key))

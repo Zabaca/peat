@@ -77,7 +77,7 @@ describe('where the pods run', () => {
     const nss = new Set(['peat', 'peat-compute', 'peat-gateway', 'peat-db'])
     for (const m of all) if (m.metadata.namespace) expect([m.kind, m.metadata.name, nss.has(m.metadata.namespace)]).toEqual([m.kind, m.metadata.name, true])
     expect(all.filter((m) => !m.metadata.namespace).map((m) => m.kind).sort()).toEqual([
-      'ClusterRole', 'ClusterRoleBinding', 'Namespace', 'Namespace', 'Namespace', 'Namespace',
+      'ClusterRole', 'ClusterRole', 'ClusterRoleBinding', 'ClusterRoleBinding', 'Namespace', 'Namespace', 'Namespace', 'Namespace',
       'ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicyBinding', 'ValidatingAdmissionPolicyBinding', 'ValidatingAdmissionPolicyBinding',
     ])
   })
@@ -174,10 +174,15 @@ describe('the control layer\'s account', () => {
   test('no wildcard in any Role or ClusterRole the operator renders', () => {
     for (const role of all.filter((m) => m.kind === 'Role' || m.kind === 'ClusterRole')) for (const x of role.rules) for (const v of [...x.apiGroups, ...x.resources, ...x.verbs]) expect([role.metadata.name, v]).not.toEqual([role.metadata.name, '*'])
   })
-  test('the one cluster-wide grant: Nodes, get, list and patch, never create or delete (the node guard holds the patch to the platform\'s machines)', () => {
+  test('the two cluster-wide grants: Nodes, get, list and patch, never create or delete (the node guard holds the patch to the platform\'s machines); and the Database objects, the databases\' records, with their status', () => {
     const crs = all.filter((m) => m.kind === 'ClusterRole')
-    expect(crs.map((m) => m.metadata.name)).toEqual([`${CONTROL_ACCOUNT}-nodes`])
+    expect(crs.map((m) => m.metadata.name)).toEqual([`${CONTROL_ACCOUNT}-nodes`, `${CONTROL_ACCOUNT}-databases`])
     expect(crs[0]!.rules).toEqual([{ apiGroups: [''], resources: ['nodes'], verbs: ['get', 'list', 'patch'] }])
+    expect(crs[1]!.rules).toEqual([
+      { apiGroups: ['peat.zabaca.com'], resources: ['databases'], verbs: ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete'] },
+      { apiGroups: ['peat.zabaca.com'], resources: ['databases/status'], verbs: ['get', 'patch', 'update'] },
+    ])
+    for (const cr of crs) expect(all.find((m) => m.kind === 'ClusterRoleBinding' && m.metadata.name === cr.metadata.name)!.subjects).toEqual([{ kind: 'ServiceAccount', name: CONTROL_ACCOUNT, namespace: 'peat' }])
   })
   test('only the control layer and the storage controller (for its records) mount an API token; the gateways hold no credential at all', () => {
     const withToken = workloads(all).filter((m) => podOf(m).automountServiceAccountToken !== false).map((m) => m.metadata.name).sort()
