@@ -31,7 +31,8 @@ pub mod value;
 use bytes::Bytes;
 use pageserver_api::reltag::{RelTag, SlruKind};
 use postgres_ffi::walrecord::{
-    XlMultiXactCreate, XlMultiXactTruncate, XlRelmapUpdate, XlReploriginDrop, XlReploriginSet,
+    XlMultiXactCreate, XlMultiXactCreate64, XlMultiXactTruncate, XlMultiXactTruncate64,
+    XlRelmapUpdate, XlReploriginDrop, XlReploriginSet,
     XlSmgrTruncate, XlXactParsedRecord,
 };
 use postgres_ffi::{Oid, TransactionId};
@@ -227,6 +228,10 @@ pub enum MultiXactRecord {
     ZeroPage(MultiXactZeroPage),
     Create(XlMultiXactCreate),
     Truncate(XlMultiXactTruncate),
+    // Postgres 19 and later (64-bit offsets). New variants go last: this enum travels
+    // between the safekeeper and the pageserver, and the variants above keep their numbers.
+    Create64(XlMultiXactCreate64),
+    Truncate64(XlMultiXactTruncate64),
 }
 
 #[derive(Clone, Serialize, Deserialize)]

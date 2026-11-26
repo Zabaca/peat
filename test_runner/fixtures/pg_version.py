@@ -16,6 +16,7 @@ class PgVersion(StrEnum):
     V16 = "16"
     V17 = "17"
     V18 = "18"
+    V19 = "19"
 
     # Postgres Version for tests that uses `fixtures.utils.run_only_on_default_postgres`.
     # Peat: 18, the version Peat is built and tested on (Neon: 17).

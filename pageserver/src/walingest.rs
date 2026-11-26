@@ -64,9 +64,11 @@ impl CheckPoint {
         enum_pgversion_dispatch!(self, CheckPoint, cp, { cp.update_next_xid(xid) })
     }
 
-    pub fn update_next_multixid(&mut self, multi_xid: u32, multi_offset: u32) -> bool {
+    /// The offset is 64 bits wide here for every version: a MultiXactOffset is 32 bits
+    /// wide up to Postgres 18, and a caller of those passes a value that fits.
+    pub fn update_next_multixid(&mut self, multi_xid: u32, multi_offset: u64) -> bool {
         enum_pgversion_dispatch!(self, CheckPoint, cp, {
-            cp.update_next_multixid(multi_xid, multi_offset)
+            cp.update_next_multixid(multi_xid, multi_offset as pgv::bindings::MultiXactOffset)
         })
     }
 }
@@ -313,6 +315,14 @@ impl WalIngest {
                 }
                 MultiXactRecord::Truncate(truncate) => {
                     self.ingest_multixact_truncate(modification, &truncate, ctx)
+                        .await?;
+                }
+                MultiXactRecord::Create64(create) => {
+                    self.ingest_multixact_create64(modification, &create, ctx)
+                        .await?;
+                }
+                MultiXactRecord::Truncate64(truncate) => {
+                    self.ingest_multixact_truncate64(modification, &truncate, ctx)
                         .await?;
                 }
             },
@@ -1019,8 +1029,64 @@ impl WalIngest {
         xlrec: &XlMultiXactCreate,
         ctx: &RequestContext,
     ) -> Result<(), WalIngestError> {
-        let offsets_per_page = pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
-        let pageno = xlrec.mid / offsets_per_page;
+        self.ingest_multixact_create_common(
+            modification,
+            xlrec.mid,
+            xlrec.moff as u64,
+            xlrec.nmembers,
+            &xlrec.members,
+            ctx,
+        )
+        .await
+    }
+
+    /// Postgres 19 and later: the same record, with a 64-bit offset.
+    async fn ingest_multixact_create64(
+        &mut self,
+        modification: &mut DatadirModification<'_>,
+        xlrec: &XlMultiXactCreate64,
+        ctx: &RequestContext,
+    ) -> Result<(), WalIngestError> {
+        self.ingest_multixact_create_common(
+            modification,
+            xlrec.mid,
+            xlrec.moff,
+            xlrec.nmembers,
+            &xlrec.members,
+            ctx,
+        )
+        .await
+    }
+
+    /// The two kinds of multixact CREATE_ID record differ only in the width of the offset
+    /// (32 bits wide up to Postgres 18, wrapping around; 64 bits wide since 19, never
+    /// wrapping), so offsets are held as u64 here and wrapped to 32 bits for 18 and older.
+    /// The page and entry arithmetic follows the version: an offsets page holds 2048
+    /// offsets of 4 bytes, or 1024 offsets of 8 bytes since 19.
+    async fn ingest_multixact_create_common(
+        &mut self,
+        modification: &mut DatadirModification<'_>,
+        mid: u32,
+        moff: u64,
+        nmembers: u32,
+        xlrec_members: &[MultiXactMember],
+        ctx: &RequestContext,
+    ) -> Result<(), WalIngestError> {
+        let pg_version = modification.tline.pg_version;
+        let wide = pg_version >= PgMajorVersion::PG19;
+        let wrap = |offset: u64| if wide { offset } else { offset as u32 as u64 };
+        let offset_create_rec = |mid: u32, moff: u64| {
+            if wide {
+                NeonWalRecord::MultixactOffsetCreate64 { mid, moff }
+            } else {
+                NeonWalRecord::MultixactOffsetCreate {
+                    mid,
+                    moff: moff as u32,
+                }
+            }
+        };
+        let offsets_per_page = pg_constants::multixact_offsets_per_page(pg_version);
+        let pageno = mid / offsets_per_page;
         let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
         let rpageno = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
 
@@ -1035,13 +1101,13 @@ impl WalIngest {
         // When both offsets are on the same page, write this multixid's own offset
         // at an LSN just before this record's end LSN: two writes to the same page
         // at the same LSN would replace each other.
-        let next = if modification.tline.pg_version >= PgMajorVersion::PG17 {
-            let mut next_mid = xlrec.mid.wrapping_add(1);
+        let next = if pg_version >= PgMajorVersion::PG17 {
+            let mut next_mid = mid.wrapping_add(1);
             if next_mid < pg_constants::FIRST_MULTIXACT_ID {
                 next_mid = pg_constants::FIRST_MULTIXACT_ID;
             }
             // Like in GetNewMultiXactId(), skip over offset 0
-            let mut next_moff = xlrec.moff.wrapping_add(xlrec.nmembers);
+            let mut next_moff = wrap(moff.wrapping_add(nmembers as u64));
             if next_moff == 0 {
                 next_moff = 1;
             }
@@ -1049,10 +1115,7 @@ impl WalIngest {
         } else {
             None
         };
-        let own_rec = NeonWalRecord::MultixactOffsetCreate {
-            mid: xlrec.mid,
-            moff: xlrec.moff,
-        };
+        let own_rec = offset_create_rec(mid, moff);
         let before_end_lsn = Lsn(modification.get_lsn().0 - 1);
         match next {
             Some((next_mid, _)) if next_mid / offsets_per_page == pageno => {
@@ -1115,22 +1178,19 @@ impl WalIngest {
                 SlruKind::MultiXactOffsets,
                 next_segno,
                 next_rpageno,
-                NeonWalRecord::MultixactOffsetCreate {
-                    mid: next_mid,
-                    moff: next_moff,
-                },
+                offset_create_rec(next_mid, next_moff),
             )?;
         }
 
         // Create WAL records for the update of each affected multixact-members page
-        let mut members = xlrec.members.iter();
-        let mut offset = xlrec.moff;
+        let mut members = xlrec_members.iter();
+        let mut offset = moff;
         loop {
-            let pageno = offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
+            let pageno = (offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u64) as u32;
 
             // How many members fit on this page?
-            let page_remain = pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32
-                - offset % pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
+            let page_remain = pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u64
+                - offset % pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u64;
 
             let mut this_page_members: Vec<MultiXactMember> = Vec::new();
             for _ in 0..page_remain {
@@ -1150,17 +1210,25 @@ impl WalIngest {
                 SlruKind::MultiXactMembers,
                 pageno / pg_constants::SLRU_PAGES_PER_SEGMENT,
                 pageno % pg_constants::SLRU_PAGES_PER_SEGMENT,
-                NeonWalRecord::MultixactMembersCreate {
-                    moff: offset,
-                    members: this_page_members,
+                if wide {
+                    NeonWalRecord::MultixactMembersCreate64 {
+                        moff: offset,
+                        members: this_page_members,
+                    }
+                } else {
+                    NeonWalRecord::MultixactMembersCreate {
+                        moff: offset as u32,
+                        members: this_page_members,
+                    }
                 },
             )?;
 
-            // Note: The multixact members can wrap around, even within one WAL record.
-            offset = offset.wrapping_add(n_this_page as u32);
+            // Note: Up to Postgres 18 the multixact members can wrap around, even within one
+            // WAL record.
+            offset = wrap(offset.wrapping_add(n_this_page as u64));
         }
         let next_offset = offset;
-        assert!(xlrec.moff.wrapping_add(xlrec.nmembers) == next_offset);
+        assert!(wrap(moff.wrapping_add(nmembers as u64)) == next_offset);
 
         // Update next-multi-xid and next-offset
         //
@@ -1173,7 +1241,7 @@ impl WalIngest {
         // I don't know why it's done that way, it seems less error-prone to skip over 0
         // when the value is stored rather than when it's read. But let's do it the same
         // way here.
-        let next_multi_xid = xlrec.mid.wrapping_add(1);
+        let next_multi_xid = mid.wrapping_add(1);
 
         if self
             .checkpoint
@@ -1184,7 +1252,7 @@ impl WalIngest {
 
         // Also update the next-xid with the highest member. According to the comments in
         // multixact_redo(), this shouldn't be necessary, but let's do the same here.
-        let max_mbr_xid = xlrec.members.iter().fold(None, |acc, mbr| {
+        let max_mbr_xid = xlrec_members.iter().fold(None, |acc, mbr| {
             if let Some(max_xid) = acc {
                 if mbr.xid.wrapping_sub(max_xid) as i32 > 0 {
                     Some(mbr.xid)
@@ -1252,6 +1320,48 @@ impl WalIngest {
         Ok(())
     }
 
+    /// Postgres 19 and later. The record names the oldest multixact and the oldest members
+    /// offset that are kept, not the range that is cut as before; and a MultiXactOffset never
+    /// wraps around, so every members segment before the one holding the oldest offset goes.
+    /// (As in PerformMembersTruncation(): the segment of the oldest offset can still hold live
+    /// members and stays.) The offsets SLRU is left alone, as for the older versions.
+    async fn ingest_multixact_truncate64(
+        &mut self,
+        modification: &mut DatadirModification<'_>,
+        xlrec: &XlMultiXactTruncate64,
+        ctx: &RequestContext,
+    ) -> Result<(), WalIngestError> {
+        let oldest_segment: i32 = enum_pgversion_dispatch!(&mut self.checkpoint, CheckPoint, cp, {
+            cp.oldestMulti = xlrec.oldest_multi;
+            cp.oldestMultiDB = xlrec.oldest_multi_db;
+            pgv::nonrelfile_utils::mx_offset_to_member_segment(
+                xlrec.oldest_offset as pgv::bindings::MultiXactOffset,
+            )
+        });
+
+        self.checkpoint_modified = true;
+
+        if modification.tline.get_shard_identity().is_shard_zero() {
+            for segno in modification
+                .tline
+                .list_slru_segments(
+                    SlruKind::MultiXactMembers,
+                    Version::Modified(modification),
+                    ctx,
+                )
+                .await?
+            {
+                if (segno as i64) < oldest_segment as i64 {
+                    modification
+                        .drop_slru_segment(SlruKind::MultiXactMembers, segno, ctx)
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn ingest_multixact_zero_page(
         &mut self,
         zero_page: MultiXactZeroPage,
@@ -1307,6 +1417,10 @@ impl WalIngest {
                     cp.wal_level = v18::XlParameterChange::decode(&mut buf).wal_level;
                     self.checkpoint_modified = true;
                 }
+                CheckPoint::V19(cp) => {
+                    cp.wal_level = v19::XlParameterChange::decode(&mut buf).wal_level;
+                    self.checkpoint_modified = true;
+                }
                 _ => {}
             }
         } else if info == pg_constants::XLOG_END_OF_RECOVERY {
@@ -1319,7 +1433,32 @@ impl WalIngest {
                     cp.wal_level = v18::XlEndOfRecovery::decode(&mut buf).wal_level;
                     self.checkpoint_modified = true;
                 }
+                CheckPoint::V19(cp) => {
+                    cp.wal_level = v19::XlEndOfRecovery::decode(&mut buf).wal_level;
+                    self.checkpoint_modified = true;
+                }
                 _ => {}
+            }
+        } else if info == pg_constants::XLOG_LOGICAL_DECODING_STATUS_CHANGE {
+            // Postgres 19: the checkpoint also records whether logical decoding is on. The
+            // record's data is the new status, one bool (xlog.c, xlog_redo()).
+            if let CheckPoint::V19(cp) = &mut self.checkpoint {
+                cp.logicalDecodingEnabled = buf.get_u8() != 0;
+                self.checkpoint_modified = true;
+            }
+        }
+
+        // Postgres 19: a checkpoint record also carries whether logical decoding is on, which
+        // the checkpoint kept here, like oldestXid below, takes from it. (The dispatch below
+        // reads the record's bytes too; this reads them first, without consuming them.)
+        if info == pg_constants::XLOG_CHECKPOINT_ONLINE
+            || info == pg_constants::XLOG_CHECKPOINT_SHUTDOWN
+        {
+            if let CheckPoint::V19(cp) = &mut self.checkpoint {
+                let xlog_checkpoint = postgres_ffi::v19::CheckPoint::decode(
+                    &buf[..postgres_ffi::v19::xlog_utils::SIZEOF_CHECKPOINT],
+                )?;
+                cp.logicalDecodingEnabled = xlog_checkpoint.logicalDecodingEnabled;
             }
         }
 
@@ -1584,7 +1723,7 @@ impl WalIngest {
                 use utils::rate_limit::RateLimit;
 
                 struct RateLimitPerPgVersion {
-                    rate_limiters: [Lazy<Mutex<RateLimit>>; 5],
+                    rate_limiters: [Lazy<Mutex<RateLimit>>; 6],
                 }
 
                 impl RateLimitPerPgVersion {
@@ -1592,7 +1731,7 @@ impl WalIngest {
                         Self {
                             rate_limiters: [const {
                                 Lazy::new(|| Mutex::new(RateLimit::new(Duration::from_secs(30))))
-                            }; 5],
+                            }; 6],
                         }
                     }
 
@@ -1601,7 +1740,7 @@ impl WalIngest {
                         pg_version: PgMajorVersion,
                     ) -> Option<&Lazy<Mutex<RateLimit>>> {
                         const MIN_PG_VERSION: u32 = PgMajorVersion::PG14.major_version_num();
-                        const MAX_PG_VERSION: u32 = PgMajorVersion::PG18.major_version_num();
+                        const MAX_PG_VERSION: u32 = PgMajorVersion::PG19.major_version_num();
                         let pg_version = pg_version.major_version_num();
 
                         if pg_version < MIN_PG_VERSION || pg_version > MAX_PG_VERSION {

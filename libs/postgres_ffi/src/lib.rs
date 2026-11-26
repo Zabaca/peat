@@ -63,6 +63,7 @@ macro_rules! for_all_postgres_versions {
         $macro!(v16);
         $macro!(v17);
         $macro!(v18);
+        $macro!(v19);
     };
 }
 
@@ -99,6 +100,7 @@ macro_rules! dispatch_pgversion {
                 $crate::PgMajorVersion::PG16 => v16,
                 $crate::PgMajorVersion::PG17 => v17,
                 $crate::PgMajorVersion::PG18 => v18,
+                $crate::PgMajorVersion::PG19 => v19,
             ]
         )
     };
@@ -132,6 +134,7 @@ macro_rules! enum_pgversion_dispatch {
                 V16 : v16,
                 V17 : v17,
                 V18 : v18,
+                V19 : v19,
             ]
         )
     };
@@ -163,6 +166,7 @@ macro_rules! enum_pgversion {
                 V16 : v16,
                 V17 : v17,
                 V18 : v18,
+                V19 : v19,
             ]
         }
     };
@@ -177,6 +181,7 @@ macro_rules! enum_pgversion {
                 V16 : v16,
                 V17 : v17,
                 V18 : v18,
+                V19 : v19,
             ]
         }
     };
@@ -272,6 +277,7 @@ pub fn pg_control_layout_version(buf: &[u8]) -> anyhow::Result<PgMajorVersion> {
         1300 => PgMajorVersion::PG14,
         1700 => PgMajorVersion::PG17,
         1800 => PgMajorVersion::PG18,
+        1905 => PgMajorVersion::PG19,
         v => anyhow::bail!("unsupported pg_control version {v}"),
     })
 }

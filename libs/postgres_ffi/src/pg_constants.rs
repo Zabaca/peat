@@ -107,9 +107,16 @@ pub const XLOG_SWITCH: u8 = 0x40;
 pub const XLOG_FPI_FOR_HINT: u8 = 0xA0;
 pub const XLOG_FPI: u8 = 0xB0;
 
+// Postgres 19: new xlog record kinds. XLOG_ASSIGN_LSN has no data; the data of
+// XLOG_LOGICAL_DECODING_STATUS_CHANGE is the new status, one bool.
+pub const XLOG_ASSIGN_LSN: u8 = 0xC0;
+pub const XLOG_LOGICAL_DECODING_STATUS_CHANGE: u8 = 0xF0;
+
 // From multixact.h
 pub const FIRST_MULTIXACT_ID: u32 = 1;
 pub const MAX_MULTIXACT_ID: u32 = 0xFFFFFFFF;
+/// The largest MultiXactOffset up to Postgres 18, where it is 32 bits wide and wraps around.
+/// Since 19 it is 64 bits wide and never wraps.
 pub const MAX_MULTIXACT_OFFSET: u32 = 0xFFFFFFFF;
 
 pub const XLOG_MULTIXACT_ZERO_OFF_PAGE: u8 = 0x00;
@@ -117,7 +124,21 @@ pub const XLOG_MULTIXACT_ZERO_MEM_PAGE: u8 = 0x10;
 pub const XLOG_MULTIXACT_CREATE_ID: u8 = 0x20;
 pub const XLOG_MULTIXACT_TRUNCATE_ID: u8 = 0x30;
 
+/// Offsets per page of pg_multixact/offsets up to Postgres 18, where an offset is 4 bytes.
+/// Use [`multixact_offsets_per_page`] where the version is not known to be 18 or older.
 pub const MULTIXACT_OFFSETS_PER_PAGE: u16 = BLCKSZ / 4;
+/// Offsets per page of pg_multixact/offsets since Postgres 19, where an offset is 8 bytes.
+pub const MULTIXACT_OFFSETS_PER_PAGE_V19: u16 = BLCKSZ / 8;
+
+/// Number of multixact offsets (4 bytes each up to 18, 8 bytes each since 19) that fit on a
+/// page of pg_multixact/offsets. The members' pages are laid out the same in every version.
+pub const fn multixact_offsets_per_page(pg_version: crate::PgMajorVersion) -> u32 {
+    if pg_version.major_version_num() >= 19 {
+        MULTIXACT_OFFSETS_PER_PAGE_V19 as u32
+    } else {
+        MULTIXACT_OFFSETS_PER_PAGE as u32
+    }
+}
 pub const MXACT_MEMBER_BITS_PER_XACT: u16 = 8;
 pub const MXACT_MEMBER_FLAGS_PER_BYTE: u16 = 1;
 pub const MULTIXACT_FLAGBYTES_PER_GROUP: u16 = 4;

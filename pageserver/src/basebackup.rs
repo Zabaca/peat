@@ -919,7 +919,8 @@ fn current_slru_segments(
         (
             checkpoint.nextXid.value as u32,
             checkpoint.nextMulti,
-            checkpoint.nextMultiOffset,
+            // 32 bits wide up to Postgres 18, 64 bits wide since 19
+            checkpoint.nextMultiOffset as u64,
         )
     });
     let segno = |pageno: u32| pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
@@ -930,11 +931,11 @@ fn current_slru_segments(
         ),
         (
             SlruKind::MultiXactOffsets,
-            segno(next_multi / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32),
+            segno(next_multi / pg_constants::multixact_offsets_per_page(pg_version)),
         ),
         (
             SlruKind::MultiXactMembers,
-            segno(next_multi_offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32),
+            segno((next_multi_offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u64) as u32),
         ),
     ])
 }

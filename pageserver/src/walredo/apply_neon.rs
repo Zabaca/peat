@@ -7,6 +7,11 @@ use postgres_ffi::v14::nonrelfile_utils::{
     mx_offset_to_flags_bitshift, mx_offset_to_flags_offset, mx_offset_to_member_offset,
     transaction_id_set_status,
 };
+use postgres_ffi::v19::nonrelfile_utils::{
+    mx_offset_to_flags_bitshift as v19_mx_offset_to_flags_bitshift,
+    mx_offset_to_flags_offset as v19_mx_offset_to_flags_offset,
+    mx_offset_to_member_offset as v19_mx_offset_to_member_offset,
+};
 use postgres_ffi::{BLCKSZ, pg_constants};
 use postgres_ffi_types::forknum::VISIBILITYMAP_FORKNUM;
 use tracing::*;
@@ -236,6 +241,65 @@ pub(crate) fn apply_in_neon(
                 assert!(
                     blknum == expected_blknum,
                     "MultiXactMembersCreate record for offset {moff} with unexpected key {key}"
+                );
+
+                let mut flagsval = LittleEndian::read_u32(&page[flagsoff..flagsoff + 4]);
+                flagsval &= !(((1 << pg_constants::MXACT_MEMBER_BITS_PER_XACT) - 1) << bshift);
+                flagsval |= member.status << bshift;
+                LittleEndian::write_u32(&mut page[flagsoff..flagsoff + 4], flagsval);
+                LittleEndian::write_u32(&mut page[memberoff..memberoff + 4], member.xid);
+            }
+        }
+        NeonWalRecord::MultixactOffsetCreate64 { mid, moff } => {
+            // Postgres 19 and later: the offsets are 64 bits wide, 1024 to a page.
+            let (slru_kind, segno, blknum) = key.to_slru_block().context("invalid record")?;
+            assert_eq!(
+                slru_kind,
+                SlruKind::MultiXactOffsets,
+                "MultixactOffsetCreate64 record with unexpected key {key}"
+            );
+            let per_page = pg_constants::MULTIXACT_OFFSETS_PER_PAGE_V19 as u32;
+            let pageno = mid / per_page;
+            let entryno = mid % per_page;
+            let offset = (entryno * 8) as usize;
+
+            let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
+            let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
+            assert!(
+                segno == expected_segno,
+                "MultiXactOffsetsCreate64 record for multi-xid {mid} with unexpected key {key}"
+            );
+            assert!(
+                blknum == expected_blknum,
+                "MultiXactOffsetsCreate64 record for multi-xid {mid} with unexpected key {key}"
+            );
+
+            LittleEndian::write_u64(&mut page[offset..offset + 8], *moff);
+        }
+        NeonWalRecord::MultixactMembersCreate64 { moff, members } => {
+            let (slru_kind, segno, blknum) = key.to_slru_block().context("invalid record")?;
+            assert_eq!(
+                slru_kind,
+                SlruKind::MultiXactMembers,
+                "MultixactMembersCreate64 record with unexpected key {key}"
+            );
+            for (i, member) in members.iter().enumerate() {
+                let offset = moff + i as u64;
+
+                let pageno = (offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u64) as u32;
+                let memberoff = v19_mx_offset_to_member_offset(offset);
+                let flagsoff = v19_mx_offset_to_flags_offset(offset);
+                let bshift = v19_mx_offset_to_flags_bitshift(offset);
+
+                let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
+                let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
+                assert!(
+                    segno == expected_segno,
+                    "MultiXactMembersCreate64 record for offset {moff} with unexpected key {key}"
+                );
+                assert!(
+                    blknum == expected_blknum,
+                    "MultiXactMembersCreate64 record for offset {moff} with unexpected key {key}"
                 );
 
                 let mut flagsval = LittleEndian::read_u32(&page[flagsoff..flagsoff + 4]);

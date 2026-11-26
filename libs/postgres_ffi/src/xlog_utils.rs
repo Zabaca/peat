@@ -9,9 +9,9 @@
 
 use super::super::waldecoder::WalStreamDecoder;
 use super::bindings::{
-    CheckPoint, ControlFileData, DBState_DB_SHUTDOWNED, FullTransactionId, TimeLineID,
-    XLogLongPageHeaderData, XLogPageHeaderData, XLogRecPtr, XLogRecord, XLogSegNo, XLOG_PAGE_MAGIC,
-    MY_PGVERSION
+    CheckPoint, ControlFileData, DBState_DB_SHUTDOWNED, FullTransactionId, MultiXactOffset,
+    TimeLineID, XLogLongPageHeaderData, XLogPageHeaderData, XLogRecPtr, XLogRecord, XLogSegNo,
+    XLOG_PAGE_MAGIC, MY_PGVERSION
 };
 use postgres_ffi_types::TimestampTz;
 use super::wal_generator::LogicalMessageGenerator;
@@ -37,7 +37,13 @@ use utils::bin_ser::SerializeError;
 use utils::lsn::Lsn;
 
 pub const XLOG_FNAME_LEN: usize = 24;
-pub const XLP_BKP_REMOVABLE: u16 = 0x0004;
+/// XLP_BKP_REMOVABLE was dropped in PostgreSQL 19, which reuses its bit (0x0004) for
+/// XLP_FIRST_IS_OVERWRITE_CONTRECORD, so a page header we generate must not set it there.
+pub const XLP_BKP_REMOVABLE: u16 = if MY_PGVERSION.major_version_num() >= 19 {
+    0
+} else {
+    0x0004
+};
 pub const XLP_FIRST_IS_CONTRECORD: u16 = 0x0001;
 pub const XLP_REM_LEN_OFFS: usize = 2 + 2 + 4 + 8;
 pub const XLOG_RECORD_CRC_OFFS: usize = 4 + 4 + 8 + 1 + 1 + 2;
@@ -414,7 +420,14 @@ impl CheckPoint {
     /// MultiXactAdvanceNextMXact() logic in PostgreSQL's xlog_redo() function.
     ///
     /// Returns 'true' if the Checkpoint was updated.
-    pub fn update_next_multixid(&mut self, multi_xid: u32, multi_offset: u32) -> bool {
+    ///
+    /// MultiXactOffset is 32 bits wide up to PostgreSQL 18 and 64 bits wide since 19, which
+    /// never wraps around.
+    pub fn update_next_multixid(
+        &mut self,
+        multi_xid: u32,
+        multi_offset: MultiXactOffset,
+    ) -> bool {
         let mut modified = false;
 
         if multi_xid.wrapping_sub(self.nextMulti) as i32 > 0 {
@@ -422,7 +435,12 @@ impl CheckPoint {
             modified = true;
         }
 
-        if multi_offset.wrapping_sub(self.nextMultiOffset) as i32 > 0 {
+        let offset_advanced = if MultiXactOffset::BITS == 32 {
+            multi_offset.wrapping_sub(self.nextMultiOffset) as u32 as i32 > 0
+        } else {
+            multi_offset > self.nextMultiOffset
+        };
+        if offset_advanced {
             self.nextMultiOffset = multi_offset;
             modified = true;
         }

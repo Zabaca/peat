@@ -3178,7 +3178,9 @@ pub(crate) struct NextMultiXactOffset {
     segno: u32,
     blknum: BlockNumber,
     entry_off: usize,
-    value: u32,
+    /// The entry is 4 bytes wide up to Postgres 18 and 8 bytes wide since 19.
+    entry_size: usize,
+    value: u64,
 }
 
 impl NextMultiXactOffset {
@@ -3192,7 +3194,7 @@ impl NextMultiXactOffset {
         }
         let (next_multi, next_offset) = dispatch_pgversion!(pg_version, {
             let checkpoint = pgv::CheckPoint::decode(checkpoint)?;
-            (checkpoint.nextMulti, checkpoint.nextMultiOffset)
+            (checkpoint.nextMulti, checkpoint.nextMultiOffset as u64)
         });
         // No multixids have been created yet.
         if next_multi == pg_constants::FIRST_MULTIXACT_ID && next_offset == 0 {
@@ -3203,12 +3205,14 @@ impl NextMultiXactOffset {
         let mid = next_multi.max(pg_constants::FIRST_MULTIXACT_ID);
         let value = next_offset.max(1);
 
-        let per_page = pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
+        let per_page = pg_constants::multixact_offsets_per_page(pg_version);
+        let entry_size = if pg_version >= PgMajorVersion::PG19 { 8 } else { 4 };
         let pageno = mid / per_page;
         Ok(Some(Self {
             segno: pageno / pg_constants::SLRU_PAGES_PER_SEGMENT,
             blknum: pageno % pg_constants::SLRU_PAGES_PER_SEGMENT,
-            entry_off: (mid % per_page) as usize * 4,
+            entry_off: (mid % per_page) as usize * entry_size,
+            entry_size,
             value,
         }))
     }
@@ -3218,9 +3222,13 @@ impl NextMultiXactOffset {
         if kind != SlruKind::MultiXactOffsets || segno != self.segno || blknum != self.blknum {
             return;
         }
-        let entry = &mut block[self.entry_off..self.entry_off + 4];
-        if LittleEndian::read_u32(entry) == 0 {
-            LittleEndian::write_u32(entry, self.value);
+        let entry = &mut block[self.entry_off..self.entry_off + self.entry_size];
+        if self.entry_size == 8 {
+            if LittleEndian::read_u64(entry) == 0 {
+                LittleEndian::write_u64(entry, self.value);
+            }
+        } else if LittleEndian::read_u32(entry) == 0 {
+            LittleEndian::write_u32(entry, self.value as u32);
         }
     }
 }
