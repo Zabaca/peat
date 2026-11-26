@@ -48,8 +48,8 @@ pub struct StorageController {
 
 const COMMAND: &str = "storage_controller";
 
-// Peat: 18, the only version Peat builds (Neon: 16, falling back to the others below).
-const STORAGE_CONTROLLER_POSTGRES_VERSION: PgMajorVersion = PgMajorVersion::PG18;
+// Peat: 19, its default (Neon: 16), falling back to the others below; 18 is still supported.
+const STORAGE_CONTROLLER_POSTGRES_VERSION: PgMajorVersion = PgMajorVersion::PG19;
 
 const DB_NAME: &str = "storage_controller";
 

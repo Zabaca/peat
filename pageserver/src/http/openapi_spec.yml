@@ -610,7 +610,7 @@ paths:
         Create a timeline. Returns new timeline id on success.
         Recreating the same timeline will succeed if the parameters match the existing timeline.
         If no pg_version is specified, assume DEFAULT_PG_VERSION hardcoded in the pageserver
-        (Peat: 18). With existing_initdb_timeline_id, pg_version is required (Peat): the
+        (Peat: 19). With existing_initdb_timeline_id, pg_version is required (Peat): the
         request is refused with 400 without it, since the default would label that initdb's
         data with the default version, whatever version made it.
 
