@@ -24,6 +24,8 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
+#include "utils/timestamp.h"
+#include "varatt.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/varlena.h"
@@ -62,7 +64,9 @@ void
 _PG_init(void)
 {
 	/* Asserts verify that typedefs above match original declarations */
+#if PG_MAJORVERSION_NUM < 19
 	AssertVariableIsOfType(&neon_read_at_lsn, neon_read_at_lsn_type);
+#endif
 	neon_read_at_lsn_ptr = (neon_read_at_lsn_type)
 		load_external_function("$libdir/neon", "neon_read_at_lsn",
 							   true, NULL);
@@ -269,7 +273,11 @@ clear_buffer_cache(PG_FUNCTION_ARGS)
 			forknum = bufHdr->tag.forkNum;
 			blocknum = bufHdr->tag.blockNum;
 
+#if PG_MAJORVERSION_NUM >= 19
+			UnlockBufHdr(bufHdr);
+#else
 			UnlockBufHdr(bufHdr, buf_state);
+#endif
 
 			/*
 			 * Pin the buffer, and release it again. Because we have

@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "neon.h"
+#include "neon_pgversioncompat.h"
 #include "neon_lwlsncache.h"
 
 #include "miscadmin.h"
@@ -153,10 +154,17 @@ LwLsnCacheShmemInit(void)
 	{
 		info.keysize = sizeof(BufferTag);
 		info.entrysize = sizeof(LastWrittenLsnCacheEntry);
+#if PG_MAJORVERSION_NUM >= 19
+		lastWrittenLsnCache = ShmemInitHash("last_written_lsn_cache",
+										lwlsn_cache_size,
+										&info,
+										HASH_ELEM | HASH_BLOBS);
+#else
 		lastWrittenLsnCache = ShmemInitHash("last_written_lsn_cache",
 			lwlsn_cache_size, lwlsn_cache_size,
 										&info,
 										HASH_ELEM | HASH_BLOBS);
+#endif
 		LwLsnCache = ShmemInitStruct("neon/LwLsnCacheCtl", sizeof(LwLsnCacheCtl), &found);
 		// Now set the size in the struct
 		LwLsnCache->lastWrittenLsnCacheSize = lwlsn_cache_size;

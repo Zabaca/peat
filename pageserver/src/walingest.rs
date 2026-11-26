@@ -1282,13 +1282,18 @@ impl WalIngest {
             enum_pgversion_dispatch!(&mut self.checkpoint, CheckPoint, cp, {
                 cp.oldestMulti = xlrec.end_trunc_off;
                 cp.oldestMultiDB = xlrec.oldest_multi_db;
+                // A MultiXactOffset is 32 bits before Postgres 19 and 64 bits from 19 on (whose
+                // truncate record is a different one, ingest_multixact_truncate64), so these
+                // 32-bit values are widened to whatever the version uses.
                 let maxsegment: i32 = pgv::nonrelfile_utils::mx_offset_to_member_segment(
-                    pg_constants::MAX_MULTIXACT_OFFSET,
+                    pg_constants::MAX_MULTIXACT_OFFSET.into(),
                 );
-                let startsegment: i32 =
-                    pgv::nonrelfile_utils::mx_offset_to_member_segment(xlrec.start_trunc_memb);
-                let endsegment: i32 =
-                    pgv::nonrelfile_utils::mx_offset_to_member_segment(xlrec.end_trunc_memb);
+                let startsegment: i32 = pgv::nonrelfile_utils::mx_offset_to_member_segment(
+                    xlrec.start_trunc_memb.into(),
+                );
+                let endsegment: i32 = pgv::nonrelfile_utils::mx_offset_to_member_segment(
+                    xlrec.end_trunc_memb.into(),
+                );
                 (maxsegment, startsegment, endsegment)
             });
 

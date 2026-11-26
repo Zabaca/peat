@@ -12,6 +12,7 @@
 #include "pgstat.h"
 #include "access/subtrans.h"
 #include "access/twophase.h"
+#include "access/clog.h"
 #include "access/xlog.h"
 #if PG_MAJORVERSION_NUM >= 15
 #include "access/xlogrecovery.h"
@@ -894,11 +895,21 @@ neon_shmem_startup_hook(void)
 static void
 neon_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+#if PG_MAJORVERSION_NUM >= 19
+	/*
+	 * Postgres 19 keeps the query-level instrumentation in the QueryDesc and
+	 * allocates it in standard_ExecutorStart() from query_instr_options.
+	 */
+	if (monitor_query_exec_time)
+		queryDesc->query_instr_options |= INSTRUMENT_TIMER;
+#endif
+
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 
+#if PG_MAJORVERSION_NUM < 19
 	if (monitor_query_exec_time)
 	{
 		/*
@@ -915,6 +926,7 @@ neon_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}
+#endif
 }
 
 /*
@@ -923,6 +935,10 @@ neon_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 neon_ExecutorEnd(QueryDesc *queryDesc)
 {
+#if PG_MAJORVERSION_NUM >= 19
+	if (monitor_query_exec_time && queryDesc->query_instr)
+		inc_query_time(INSTR_TIME_GET_MICROSEC(queryDesc->query_instr->total));
+#else
 	if (monitor_query_exec_time && queryDesc->totaltime)
 	{
 		/*
@@ -933,6 +949,7 @@ neon_ExecutorEnd(QueryDesc *queryDesc)
 
 		inc_query_time(queryDesc->totaltime->total*1000000); /* convert to usec */
 	}
+#endif
 
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);

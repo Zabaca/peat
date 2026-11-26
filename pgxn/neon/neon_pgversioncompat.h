@@ -15,6 +15,14 @@
 typedef PGAlignedBlock PGIOAlignedBlock;
 #endif
 
+/* Removed or renamed in Postgres 19 */
+#if PG_MAJORVERSION_NUM >= 19
+typedef uint8 bits8;
+#ifndef PointerIsValid
+#define PointerIsValid(pointer) ((const void *) (pointer) != NULL)
+#endif
+#endif
+
 #if PG_MAJORVERSION_NUM < 17
 #define NRelFileInfoBackendIsTemp(rinfo) (rinfo.backend != InvalidBackendId)
 #else

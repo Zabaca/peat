@@ -47,7 +47,10 @@
 #include <utils/lsyscache.h>
 #include <utils/syscache.h>
 
+#include "access/htup_details.h"
+#include "catalog/pg_type_d.h"
 #include "neon_ddl_handler.h"
+#include "neon_pgversioncompat.h"
 #include "neon_utils.h"
 #include "neon.h"
 
@@ -108,8 +111,15 @@ static DdlHashTable RootTable;
 static DdlHashTable *CurrentDdlTable = &RootTable;
 static int SubtransLevel; /* current nesting level of subtransactions */
 
+/* Postgres 19 builds a Jsonb through a JsonbInState, earlier versions through a parse state stack */
+#if PG_MAJORVERSION_NUM >= 19
+typedef JsonbInState NeonJsonbBuildState;
+#else
+typedef JsonbParseState *NeonJsonbBuildState;
+#endif
+
 static void
-PushKeyValue(JsonbParseState **state, char *key, char *value)
+PushKeyValue(NeonJsonbBuildState *state, char *key, char *value)
 {
 	JsonbValue	k,
 				v;
@@ -127,7 +137,11 @@ PushKeyValue(JsonbParseState **state, char *key, char *value)
 static char *
 ConstructDeltaMessage()
 {
-	JsonbParseState *state = NULL;
+#if PG_MAJORVERSION_NUM >= 19
+	NeonJsonbBuildState state = {0};
+#else
+	NeonJsonbBuildState state = NULL;
+#endif
 
 	pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
 	if (RootTable.db_table)
@@ -208,8 +222,17 @@ ConstructDeltaMessage()
 		pushJsonbValue(&state, WJB_END_ARRAY, NULL);
 	}
 	{
+#if PG_MAJORVERSION_NUM >= 19
+		JsonbValue *result;
+		Jsonb	   *jsonb;
+
+		pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+		result = state.result;
+		jsonb = JsonbValueToJsonb(result);
+#else
 		JsonbValue *result = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
 		Jsonb	   *jsonb = JsonbValueToJsonb(result);
+#endif
 
 		return JsonbToCString(NULL, &jsonb->root, 0 /* estimated_len */ );
 	}

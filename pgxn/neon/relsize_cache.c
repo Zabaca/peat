@@ -21,7 +21,9 @@
 #include "storage/ipc.h"
 #include "storage/shmem.h"
 #include "catalog/pg_tablespace_d.h"
+#if PG_MAJORVERSION_NUM < 19
 #include "utils/dynahash.h"
+#endif
 #include "utils/guc.h"
 
 typedef struct
@@ -70,10 +72,17 @@ RelsizeCacheShmemInit(void)
 		relsize_lock = (LWLockId) GetNamedLWLockTranche("neon_relsize");
 		info.keysize = sizeof(RelTag);
 		info.entrysize = sizeof(RelSizeEntry);
+#if PG_MAJORVERSION_NUM >= 19
+		relsize_hash = ShmemInitHash("neon_relsize",
+									 relsize_hash_size,
+									 &info,
+									 HASH_ELEM | HASH_BLOBS);
+#else
 		relsize_hash = ShmemInitHash("neon_relsize",
 									 relsize_hash_size, relsize_hash_size,
 									 &info,
 									 HASH_ELEM | HASH_BLOBS);
+#endif
 		relsize_ctl->size = 0;
 		relsize_ctl->hits = 0;
 		relsize_ctl->misses = 0;

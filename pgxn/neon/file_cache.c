@@ -17,7 +17,11 @@
 
 #include "neon_pgversioncompat.h"
 
+#include "access/htup_details.h"
 #include "access/parallel.h"
+#include "catalog/pg_type_d.h"
+#include "executor/instrument.h"
+#include "port/pg_bitutils.h"
 #include "access/xlog.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -36,7 +40,9 @@
 #include "storage/procsignal.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#if PG_MAJORVERSION_NUM < 19
 #include "utils/dynahash.h"
+#endif
 #include "utils/guc.h"
 
 #if PG_VERSION_NUM >= 150000
@@ -364,10 +370,17 @@ LfcShmemInit(void)
 		 * n_chunks+1 because we add new element to hash table before eviction
 		 * of victim
 		 */
+#if PG_MAJORVERSION_NUM >= 19
+		lfc_hash = ShmemInitHash("lfc_hash",
+								 n_chunks + 1,
+								 &info,
+								 HASH_ELEM | HASH_BLOBS);
+#else
 		lfc_hash = ShmemInitHash("lfc_hash",
 								 n_chunks + 1, n_chunks + 1,
 								 &info,
 								 HASH_ELEM | HASH_BLOBS);
+#endif
 		memset(lfc_ctl, 0, sizeof(FileCacheControl));
 		dlist_init(&lfc_ctl->lru);
 		dlist_init(&lfc_ctl->holes);
