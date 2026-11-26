@@ -3,7 +3,7 @@ name: Peat CI
 # Every change (pull requests, pushes to main): the release build and Neon's Rust tests,
 # on arm64 and on amd64, each on its own native runner.
 # Merges to main, release tags and manual runs: also Neon's Python regression suite on
-# Postgres 18 on both, and on Postgres 19 on arm64, split into shards that each fit one
+# Postgres 18 and on Postgres 19, each on both, split into shards that each fit one
 # standard GitHub-hosted runner (4 vCPU, 16 GB of memory, free and unlimited for public
 # repositories), and the images, one per architecture, which the publish job joins into one
 # multi-arch image per tag. Postgres 18 is Peat's default and what every database runs on;
@@ -276,10 +276,10 @@ jobs:
           retention-days: 7
 
   # The same suite on Postgres 19 (peat-postgres's REL_19_STABLE_peat), built beside 18 by the
-  # build job above; arm64 only, where 18 is tested on both. 19 is not what any database
-  # runs on: its result is judged, not gated, by the rule of the stage 3 record (a failure, or
-  # a measure off by 2x or more, is flagged); the publish job waits for it all the same, so
-  # that no image carrying 19 goes out untested. The tests Neon marks as default-version only
+  # build job above, on both architectures like 18. It gates: the publish job needs every
+  # one of its shards, so no image carrying 19 goes out untested or after a failed shard,
+  # on either architecture. 19 is not yet what any database runs on (18 is), but a failure
+  # here holds the publish all the same. The tests Neon marks as default-version only
   # (`run_only_on_default_postgres`, Postgres 18 here) are skipped, as they are on 17 in
   # Neon's own CI.
   regress-pg19:
@@ -297,7 +297,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [ arm64 ]
+        arch: [ arm64, amd64 ]
         # 'solo': the tests of .github/peat/solo-tests.txt, one at a time on a larger
         # filesystem (each peaks at about 12 GB of test output).
         shard: [ '1', '2', '3', '4', '5', '6', '7', '8', 'solo' ]
