@@ -19,6 +19,8 @@ node_image='kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880
 minio_image='docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20'
 postgres_image='docker.io/library/postgres:17-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73'
 work=$(mktemp -d)
+# a kubeconfig of the test's own: kind writes its context there, and the user's own kubeconfig (and its current context) is never touched
+export KUBECONFIG="$work/kubeconfig"
 k() { kubectl --context "kind-$cluster" "$@"; }
 started=$(date +%s)
 since() { echo "$(( $(date +%s) - $1 ))"; }
@@ -252,5 +254,20 @@ k -n shop delete database orders-then --timeout=120s
 if k -n peat-compute get deployment compute-orders-then >/dev/null 2>&1; then fail 'the compute of a deleted database is still there'; fi
 held=$(k -n peat get configmap held-orders-then -o jsonpath='{.data.deleteAfter}') || fail 'no hold was recorded for the deleted data'
 echo "  orders-then deleted: its compute gone, its data held until $held"
+
+echo "== the peat command, through the test's own login"
+peatc() { (cd "$root/control" && bun src/cli/peat.ts "$@"); }
+peatc make cli-made -n shop --timeout 120 || fail 'peat make failed'
+peatc list -n shop | grep -q '^shop/cli-made  Ready' || fail 'peat list does not show the database it made'
+cli_url=$(peatc url cli-made -n shop) || fail 'peat url failed'
+peatc ca -n shop > "$work/cli-ca.crt"
+cli_password=$(sed -E 's|^postgresql://app:([^@]*)@.*$|\1|' <<< "$cli_url")
+t0=$(date +%s); until PGPASSWORD="$cli_password" psql "host=cli-made.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/cli-ca.crt connect_timeout=30" -XAtqc 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'the database peat made did not answer'; sleep 3; done
+peatc stop cli-made -n shop || fail 'peat stop failed'
+peatc close cli-made -n shop || fail 'peat close failed'
+peatc open cli-made -n shop || fail 'peat open failed'
+peatc delete cli-made -n shop --yes || fail 'peat delete failed'
+peatc status | grep -q '^peat: Ready' || fail 'peat status does not say Ready'
+echo "  make, list, url, ca, stop, close, open, delete and status, each through the kubeconfig; the database answered with its published URL's login"
 
 echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s"

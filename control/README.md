@@ -16,7 +16,7 @@ made a setting, and the operator that installs and keeps a whole platform from o
 | Shared names | Namespaces, the machine label, the dead taint, the API group: neutral defaults, each a setting. | `src/names.ts` |
 
 Still to come in this folder: the ordered upgrade (today a changed release reaches every piece at once), adoption of a platform installed
-another way, the `peat` command and the move of a database to a newer Postgres major.
+another way, and the move of a database to a newer Postgres major (`peat move` and `pgVersion` raised are refused until then).
 
 ## Databases
 
@@ -67,7 +67,9 @@ platform.spec` and `kubectl explain database.spec` print the same text. In short
 
 ## The command
 
-`peat`, working through the user's own Kubernetes login on Database objects (so the cluster's permissions decide who may do what):
+`peat` (`src/cli/peat.ts`; `bun src/cli/peat.ts`, or the one-file program CI builds for Linux and macOS on every merge), working through the
+user's own Kubernetes login on Database objects (so the cluster's permissions decide who may do what; a token, a client certificate or an
+exec credential plugin, as kubectl reads them), each change read back until the control layer has answered it:
 `peat list`, `peat show <db>`, `peat make <db> [--pg 18|19]`, `peat branch <from> <db>`, `peat restore <from> <db> --at <time>`,
 `peat replica <of> <db>`, `peat stop <db>`, `peat close <db>`, `peat open <db>`, `peat move <db> --pg <version> [--rehearse]`,
 `peat delete <db>`, `peat ca`, and for the platform `peat status` and `peat retry`.
