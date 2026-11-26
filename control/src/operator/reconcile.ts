@@ -132,7 +132,9 @@ async function published(k: Kube, r: Resolved, keys: Record<string, string>): Pr
   const meta = (name: string, namespace: string, owners: any[]) => ({ name, namespace, labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name }, ...(owners.length ? { ownerReferences: owners.map(owner) } : {}) })
   const out: Manifest[] = []
   // the database namespace has its own (render.ts), owned by the platform, not by its Databases
-  for (const ns of [...new Set(dbs.map((d) => d.metadata.namespace as string))].filter((x) => x !== r.names.dbNamespace).sort()) out.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(CA_CONFIG_MAP, ns, dbs.filter((d) => d.metadata.namespace === ns && d.metadata.uid)), data: { 'ca.crt': keys['ca.crt'] ?? '' } })
+  // the authority that signs the databases' certificates: with an issuer, only the one keys.caSecret names (none is published otherwise)
+  const caPublished = !r.spec.certificates.issuer || Boolean(r.spec.keys.caSecret)
+  if (caPublished) for (const ns of [...new Set(dbs.map((d) => d.metadata.namespace as string))].filter((x) => x !== r.names.dbNamespace).sort()) out.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(CA_CONFIG_MAP, ns, dbs.filter((d) => d.metadata.namespace === ns && d.metadata.uid)), data: { 'ca.crt': keys['ca.crt'] ?? '' } })
   for (const d of dbs) {
     const rec = d.status?.record
     if (!d.status?.tenant || !rec || d.metadata.deletionTimestamp) continue
@@ -223,8 +225,9 @@ export async function reconcile(k: Kube): Promise<PassResult> {
   const rendered = [...render(r, keys), ...pub.manifests]
   for (const m of rendered.filter((x) => x.kind !== 'Namespace')) await applyOne(m)
   for (const d of pub.dbs) {
-    if (!d.status?.tenant || d.metadata.deletionTimestamp || (d.status.loginSecret && d.status.caConfigMap)) continue
-    await k.request('PATCH', `/apis/${API_VERSION}/namespaces/${d.metadata.namespace}/databases/${d.metadata.name}/status`, { status: { loginSecret: `${d.metadata.name}-login`, caConfigMap: CA_CONFIG_MAP } }, 'application/merge-patch+json')
+    const caPublished = !r.spec.certificates.issuer || Boolean(r.spec.keys.caSecret)
+    if (!d.status?.tenant || d.metadata.deletionTimestamp || (d.status.loginSecret && (d.status.caConfigMap || !caPublished))) continue
+    await k.request('PATCH', `/apis/${API_VERSION}/namespaces/${d.metadata.namespace}/databases/${d.metadata.name}/status`, { status: { loginSecret: `${d.metadata.name}-login`, ...(caPublished ? { caConfigMap: CA_CONFIG_MAP } : {}) } }, 'application/merge-patch+json')
   }
 
   // what the operator made and no longer renders, by its record: removed only inside the platform's namespaces, or cluster-scoped and still
@@ -239,7 +242,7 @@ export async function reconcile(k: Kube): Promise<PassResult> {
     const known = kindOf(k2)
     if (!known || kind === 'Namespace') continue
     // outside the platform's namespaces the operator deletes nothing: what it published there goes with its Database (an owner reference)
-    if (known.namespaced && !platformNamespaces.has(ns)) { delete owned[k2]; continue }
+    if (known.namespaced && !platformNamespaces.has(ns)) { await owned.forget(k2); continue }
     const m = { apiVersion: known.apiVersion, kind, metadata: { name, ...(known.namespaced ? { namespace: ns } : {}) } }
     const live = await k.request('GET', pathOf(m))
     if (live.status === 404) { await owned.forget(k2); continue }
