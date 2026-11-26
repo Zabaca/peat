@@ -15,12 +15,12 @@
 // would otherwise take the pieces with it). Each object carries the operator's own two labels and nothing of the Platform's.
 import { durationMs } from '../api/schema'
 import { GROUP, controlUser, frontDoor, placement, toEnv, type Names } from '../names'
-
-/** The pieces read a database's idle time in whole minutes (IDLE_MINUTES): the kinds' duration, at least one. */
-const idleMinutesOf = (d: string) => Math.max(1, Math.round(durationMs(d) / 60_000))
 import { SAFEKEEPER_RESOURCES } from '../storage-spec'
 import type { Resolved } from './platform'
 import { TOKENS, type Holder } from './keys'
+
+/** The pieces read a database's idle time in whole minutes (IDLE_MINUTES): the kinds' duration, at least one. */
+const idleMinutesOf = (d: string) => Math.max(1, Math.round(durationMs(d) / 60_000))
 
 export type Manifest = Record<string, any> & { apiVersion: string; kind: string; metadata: { name: string; namespace?: string; labels?: Record<string, string>; annotations?: Record<string, string> } }
 
@@ -122,8 +122,9 @@ export function keySecrets(r: Resolved, kept: Record<string, string>): Manifest[
     secret(SECRETS.safekeeperTokens, n.namespace, tokens('safekeeper')),
     // the authority's key is in the platform namespace alone, where the control layer signs each database's certificate with it (when no issuer is named)
     ...(r.spec.certificates.issuer ? [] : [secret(SECRETS.caKey, n.namespace, { 'tls.crt': kept['ca.crt'] ?? '', 'tls.key': kept['ca.key'] ?? '' }, 'kubernetes.io/tls')]),
-    // and its public certificate, for clients, in the database namespace (where each database's name is)
-    { apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(r, CA_CONFIG_MAP, n.dbNamespace), data: { 'ca.crt': kept['ca.crt'] ?? '' } },
+    // and its public certificate, for clients, in the database namespace (where each database's name is): the authority that signs the
+    // databases' certificates, so with an issuer only when keys.caSecret names the issuer's authority (the platform's own would sign nothing)
+    ...(r.spec.certificates.issuer && !r.spec.keys.caSecret ? [] : [{ apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(r, CA_CONFIG_MAP, n.dbNamespace), data: { 'ca.crt': kept['ca.crt'] ?? '' } } as Manifest]),
   ]
 }
 
@@ -588,16 +589,14 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
   ]
 }
 
-/** Every object of the platform, in the order it is applied: the base first, the guards before the account they hold. */
 /** The annotation each workload carries: the release it was rendered at (what the status reports, whatever its image's name says). */
 export const RELEASE_ANNOTATION = `${GROUP}/release`
-/** The upgrade's piece a workload belongs to. */
-export const pieceOf = (m: Manifest): string => (m.metadata.name === 'storage-controller' || m.metadata.name === 'storage-broker' ? 'controller' : m.metadata.name === 'peat-gateway' ? 'gateways' : m.metadata.name === 'peat-control' ? 'control' : m.metadata.name)
-const stamped = (ms: Manifest[], release: (m: Manifest) => string): Manifest[] =>
-  ms.map((m) => (m.kind === 'Deployment' || m.kind === 'StatefulSet' ? { ...m, metadata: { ...m.metadata, annotations: { ...(m.metadata.annotations ?? {}), [RELEASE_ANNOTATION]: release(m) } } } : m))
+const stamped = (ms: Manifest[], release: string): Manifest[] =>
+  ms.map((m) => (m.kind === 'Deployment' || m.kind === 'StatefulSet' ? { ...m, metadata: { ...m.metadata, annotations: { ...(m.metadata.annotations ?? {}), [RELEASE_ANNOTATION]: release } } } : m))
 
+/** Every object of the platform, in the order it is applied: the base first, the guards before the account they hold. */
 export function render(r: Resolved, kept: Record<string, string>, storageImages?: string[]): Manifest[] {
-  return stamped([...base(r), ...keySecrets(r, kept), ...guards(r, storageImages), ...storage(r), ...keeperPrep(r), ...control(r), ...gateways(r)], () => r.images.release)
+  return stamped([...base(r), ...keySecrets(r, kept), ...guards(r, storageImages), ...storage(r), ...keeperPrep(r), ...control(r), ...gateways(r)], r.images.release)
 }
 
 export { SAFEKEEPER_RESOURCES }

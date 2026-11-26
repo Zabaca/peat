@@ -124,7 +124,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     memory: memory('a gateway', '48Mi', '192Mi'),
   }, { default: {} }),
   certificates: obj("The databases' certificates.", {
-    issuer: obj('A cert-manager issuer to sign them; none (the default): the platform\'s own certificate authority signs them.', {
+    issuer: obj('A cert-manager issuer to sign them; none (the default): the platform\'s own certificate authority signs them. With an issuer, the ConfigMap peat-ca clients verify with carries the authority keys.caSecret names, or is not published (the platform\'s own authority would sign nothing).', {
       name: str('The issuer.'), kind: str('Issuer (in the compute namespace) or ClusterIssuer.', { enum: ['Issuer', 'ClusterIssuer'], default: 'Issuer' }),
     }, { required: ['name'] }),
   }, { default: {} }),
@@ -144,7 +144,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
   }, { default: {} }),
   keys: obj('The keys the platform signs with. None given: the operator makes them once and keeps them.', {
     authSecret: str("A Secret in the platform namespace holding the Ed25519 pair the storage's tokens are signed with (auth_private_key.pem, auth_public_key.pem)."),
-    caSecret: str("A Secret in the compute namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key)."),
+    caSecret: str("A Secret in the platform namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key): the platform namespace holds every key; clients get only its certificate (the ConfigMap peat-ca). With certificates.issuer, name the issuer's authority here, so peat-ca carries the certificate that signs the databases'."),
   }, { default: {} }),
   control: obj('The control layer.', {
     replicas: int('How many pods; one acts at a time.', { minimum: 1, maximum: 5, default: 2 }),
