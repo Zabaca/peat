@@ -27,8 +27,9 @@ export class FakeKube implements Kube {
   readonly objects = new Map<string, any>()
   readonly calls: string[] = []
   private rv = 1
-  /** Answers to force, by "METHOD path" (for a refusal or an outage). */
+  /** Answers to force, by "METHOD path" (for a refusal or an outage); `forcedOnce` answers once and is gone. */
   readonly forced = new Map<string, Answer>()
+  readonly forcedOnce = new Map<string, Answer>()
 
   private keyOf(group: string, ns: string | null, plural: string, name: string) { return `${group}|${ns ?? ''}|${plural}|${name}` }
   put(o: any) {
@@ -45,6 +46,8 @@ export class FakeKube implements Kube {
     this.calls.push(`${method} ${path}`)
     const forced = this.forced.get(`${method} ${path.split('?')[0]}`)
     if (forced) return clone(forced)
+    const once = this.forcedOnce.get(`${method} ${path.split('?')[0]}`)
+    if (once) { this.forcedOnce.delete(`${method} ${path.split('?')[0]}`); return clone(once) }
     const [bare, query] = path.split('?') as [string, string | undefined]
     const q = new URLSearchParams(query ?? '')
     const { group, ns, plural, name, sub } = parse(bare)
@@ -108,6 +111,9 @@ export class FakeKube implements Kube {
     }
     if (method === 'DELETE') {
       if (!live) return { status: 404, json: { message: 'not found' } }
+      // a delete with a UID precondition removes only that very object
+      const want = (parsed as any)?.preconditions?.uid
+      if (want && want !== live.metadata.uid) return { status: 409, json: { message: 'the UID in the precondition does not match' } }
       this.objects.delete(k)
       return { status: 200, json: {} }
     }

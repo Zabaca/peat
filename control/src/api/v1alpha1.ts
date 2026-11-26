@@ -4,7 +4,7 @@
 // types. Field names follow Kubernetes's conventions (camelCase; a Secret named by `...Secret`; durations as strings).
 import { GROUP, VERSION } from '../names'
 import type { Window } from '../quiet-hours'
-import { bool, int, list, map, obj, str, type Schema } from './schema'
+import { bool, duration, int, list, map, obj, rules, str, type Schema } from './schema'
 
 export { GROUP, VERSION }
 export const API_VERSION = `${GROUP}/${VERSION}`
@@ -56,6 +56,7 @@ const condition: Schema = obj('A condition, as Kubernetes objects report them.',
 // ---- Platform
 
 const imagesSchema = (description: string): Schema => obj(description, {
+  release: str('The release these images are.'),
   storage: str('The storage image.'), control: str('The control image.'),
   compute: obj('The compute image of each Postgres version.', { '18': str('Postgres 18.'), '19': str('Postgres 19.') }),
 })
@@ -70,12 +71,15 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     control: str('The control image (the operator, the control layer and the gateways).'),
     compute: obj('The compute image of each Postgres version.', { '18': str('Postgres 18.'), '19': str('Postgres 19.') }),
   }, { default: { registry: 'ghcr.io/zabaca/peat' } }),
-  namespaces: obj('The namespaces the platform uses.', {
+  namespaces: obj('The namespaces the platform uses (the status records them). They cannot change once the platform is made (its pieces and its data live in them), and none may be a namespace of the cluster\'s own.', {
     platform: str('The storage, the control layer and its records.', { default: 'peat' }),
     computes: str("The databases' computes.", { default: 'peat-compute' }),
     gateways: str('The gateways and the front door.', { default: 'peat-gateway' }),
-    databases: str("Each database's name inside the cluster (an ExternalName Service per database).", { default: 'peat-db' }),
-  }, { default: { platform: 'peat', computes: 'peat-compute', gateways: 'peat-gateway', databases: 'peat-db' } }),
+    databases: str("Each database's name inside the cluster (an ExternalName Service per database), and the ConfigMap peat-ca: the authority's public certificate (ca.crt), which every namespace that holds a Database also gets.", { default: 'peat-db' }),
+  }, { default: { platform: 'peat', computes: 'peat-compute', gateways: 'peat-gateway', databases: 'peat-db' }, ...rules(
+    ['self == oldSelf', 'the namespaces cannot change: the platform\'s pieces and its data live in them'],
+    ["[self.platform, self.computes, self.gateways, self.databases].all(n, n != 'default' && !n.startsWith('kube-'))", 'a namespace of the platform may not be default or one of the kube- namespaces'],
+  ) }),
   machines: obj('The machines the platform runs on.', {
     label: label('The label that marks them: the operator places every piece on these and the control layer probes and taints these and no other.', { key: `${GROUP}/machine`, value: 'true' }),
     taint: taint('A taint the machines carry, which every piece tolerates (none: the machines are shared with other work).'),
@@ -91,9 +95,9 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     safekeepers: store('the safekeepers'),
     records: store("the copy of the storage controller's records"),
     walTrim: obj("The key the control layer's WAL trim lists and deletes the safekeepers' old WAL with, when it is not the safekeepers' own.", { credentialsSecret: str('A Secret holding AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.') }, { required: ['credentialsSecret'] }),
-  }, { required: ['endpoint'] }),
+  }, { required: ['endpoint'], ...rules(['(has(self.bucket) && has(self.credentialsSecret)) || (has(self.pageservers) && has(self.safekeepers) && has(self.records))', 'the store needs the one bucket and its credentialsSecret, or a bucket of their own for the pageservers, the safekeepers and the records']) }),
   pageservers: obj('The pageservers: where the databases\' pages are kept and served.', {
-    count: int('How many (spread none: 1).', { minimum: 1, maximum: 64, default: 2 }),
+    count: int('How many; default 2, and 1 with spread none (which allows no more: two would share one machine\'s directory).', { minimum: 1, maximum: 64 }),
     machines: list('The machine of each, by node name, in order; default the operator chooses from the labelled machines.', str('A node name.')),
     memory: memory('a pageserver', '768Mi', '1536Mi'),
     storage: storage('the pageservers', '/var/lib/peat/pageserver'),
@@ -115,7 +119,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     postgres: obj('The Postgres the records are kept in, for records postgres.', { urlSecret: str('A Secret in the platform namespace holding the database URL.'), key: str('The key of that Secret.', { default: 'uri' }) }, { required: ['urlSecret'] }),
     machine: str('The machine of the controller and the broker, by node name; never a pageserver\'s (spread machines); default the operator chooses.'),
     memory: memory('the controller', '64Mi', '256Mi'),
-  }, { default: {} }),
+  }, { default: {}, ...rules(["!has(self.records) || self.records != 'postgres' || has(self.postgres)", 'records postgres needs controller.postgres: the Secret holding the database\'s URL']) }),
   gateways: obj('The gateways: the one front door every database is reached through, which wakes a sleeping database when a client connects.', {
     count: int('How many, each on its own machine.', { minimum: 1, maximum: 16, default: 2 }),
     domain: str('The domain the databases are reached under from outside the cluster: a client connects to <database>.<domain> and the front door reads the name from TLS. Point its wildcard at the front door.'),
@@ -126,40 +130,43 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     memory: memory('a gateway', '48Mi', '192Mi'),
   }, { default: {} }),
   certificates: obj("The databases' certificates.", {
-    issuer: obj('A cert-manager issuer to sign them; none (the default): the platform\'s own certificate authority signs them.', {
+    issuer: obj('A cert-manager issuer to sign them; none (the default): the platform\'s own certificate authority signs them. With an issuer, the ConfigMap peat-ca clients verify with carries the authority keys.caSecret names, or is not published (the platform\'s own authority would sign nothing).', {
       name: str('The issuer.'), kind: str('Issuer (in the compute namespace) or ClusterIssuer.', { enum: ['Issuer', 'ClusterIssuer'], default: 'Issuer' }),
     }, { required: ['name'] }),
   }, { default: {} }),
   computes: obj('How the databases\' computes run.', {
     defaultPgVersion: int('The Postgres version of a database that names none.', { enum: [...PG_VERSIONS], default: 19 }),
-    idleMinutes: int('A database with no session for this long is put to sleep (its compute removed); the next connection wakes it.', { minimum: 1, default: 30 }),
+    idleAfter: duration('A database with no session for this long is put to sleep (its compute removed); the next connection wakes it. A duration (30m).', { default: '30m' }),
     memory: memory('a compute', '512Mi', '1Gi'),
     scratch: str('The size of a compute\'s scratch directory (temporary files, sorts).', { default: '2Gi' }),
   }, { default: {} }),
   databases: obj('How databases are kept.', {
-    deleteHold: str("How long a deleted database's data stays in the store before it is removed: a duration in days or hours (7d, 36h), or never.", { pattern: '^(never|[0-9]+[dh])$', default: '7d' }),
+    deleteHold: str("How long a deleted database's data stays in the store before it is removed: a duration (7d, 36h), or never.", { pattern: '^(never|[0-9]+(s|m|h|d))$', default: '7d' }),
   }, { default: {} }),
   upgrades: obj('How an upgrade moves.', {
     quietHours: windows('Windows in which no upgrade step and no drill starts. An upgrade under way pauses at the next step and goes on when they end.'),
     restartHours: windows('Windows in which an awake database is restarted onto a new compute image; outside them a compute takes it at its next sleep. None: only at sleep.'),
-    checkSeconds: int('How long each check between steps waits for the platform to settle before it fails.', { minimum: 30, default: 600 }),
+    checkTimeout: duration('How long each check between steps waits for the platform to settle before the upgrade halts there. A duration (10m).', { default: '10m' }),
   }, { default: {} }),
   keys: obj('The keys the platform signs with. None given: the operator makes them once and keeps them.', {
     authSecret: str("A Secret in the platform namespace holding the Ed25519 pair the storage's tokens are signed with (auth_private_key.pem, auth_public_key.pem)."),
-    caSecret: str("A Secret in the compute namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key)."),
+    caSecret: str("A Secret in the platform namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key): the platform namespace holds every key; clients get only its certificate (the ConfigMap peat-ca). With certificates.issuer, name the issuer's authority here, so peat-ca carries the certificate that signs the databases'."),
   }, { default: {} }),
   control: obj('The control layer.', {
     replicas: int('How many pods; one acts at a time.', { minimum: 1, maximum: 5, default: 2 }),
     memory: memory('a control layer pod', '64Mi', '256Mi'),
   }, { default: {} }),
-  adopt: list('Objects the operator may take over by name from an install made another way. It compares each with what it would make, takes ownership without a change that restarts a pod, and lists any difference as a pending change in the status, applied only when the object is removed from this list.', obj('An object.', {
+  adopt: list('Objects the operator may take over by name from an install made another way. It compares each with what it would make: one it would not change is taken over as it is; one it would change is taken over and left as it is, the difference listed in status.pendingChanges, until requests.applyPending asks for it to be applied (taking an object off the list applies nothing). It is also how the operator takes back objects its record of what it made has lost (a cluster restored with new UIDs).', obj('An object.', {
     kind: str('Its kind.'), namespace: str('Its namespace (none: cluster-scoped).'), name: str('Its name.'),
   }, { required: ['kind', 'name'] })),
   suspend: bool('True: the operator changes nothing (it reports, and lets go of nothing it adopted). The way to hand the platform back to another way of running it.', { default: false }),
   requests: obj('One-off requests: set a new value to ask again.', {
     retry: str('Go on with a halted upgrade from the step that halted.'),
+    applyPending: str('Apply the changes listed in status.pendingChanges to the adopted objects (each may restart its pods).'),
   }),
-}, { required: ['release', 'objectStore'] })
+}, { required: ['release', 'objectStore'], ...rules(
+  ["!has(self.spread) || self.spread != 'none' || !has(self.pageservers) || !has(self.pageservers.count) || self.pageservers.count == 1", 'spread none runs one pageserver: two would share one machine and its directory'],
+) })
 
 export const platformStatus: Schema = obj('What the operator found and did.', {
   observedGeneration: int('The generation of the spec this status is about.'),
@@ -168,6 +175,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
   images: imagesSchema('The images of that release: what the next upgrade starts from.'),
   message: str('What a person reads first.'),
   survives: str("What the platform survives: one machine's loss, or none (spread none)."),
+  namespaces: obj('The namespaces the platform runs in, recorded: a Platform that names others is refused.', { platform: str('The platform namespace.'), computes: str('The computes\' namespace.'), gateways: str('The gateways\' namespace.'), databases: str('The database namespace.') }),
   pieces: list('Every piece and the release it runs.', obj('A piece.', {
     kind: str('Its kind.'), namespace: str('Its namespace.'), name: str('Its name.'),
     release: str('The release it runs.'), ready: bool('Whether it is ready.'), adopted: bool('Whether the operator took it over.'), message: str('Why not, when not.'),
@@ -185,26 +193,34 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
     halted: obj('Where and why it halted.', { at: str('When.', { format: 'date-time' }), step: str('The step.'), reason: str('Why.') }),
     retried: str('The last retry request answered.'),
   }),
-  pendingChanges: list('Differences between an adopted object and what the operator would make, not applied.', obj('A difference.', { kind: str('Kind.'), namespace: str('Namespace.'), name: str('Name.'), change: str('What would change.') })),
+  answered: obj('The requests answered, by the value that was asked (the retry an upgrade answered is upgrade.retried).', { applyPending: str('The applyPending answered.') }),
+  pendingChanges: list('Differences between an adopted object and what the operator would make, not applied (requests.applyPending applies them).', obj('A difference.', { kind: str('Kind.'), namespace: str('Namespace.'), name: str('Name.'), change: str('What would change.') })),
   conditions: list('Conditions.', condition),
 })
 
 // ---- Database
 
 export const databaseSpec: Schema = obj('A database on the platform. Its name is the object\'s name (1 to 31 lowercase letters, digits or hyphens, starting with a letter), unique across the platform; it is reached at <name>.<the platform\'s domain> through the front door, and inside the cluster at <name>.<database namespace>.svc.', {
-  pgVersion: int("Its Postgres version; default the platform's. Raising it moves the database to the newer version under its own name, address and login (the door is shut for the copy, every table is compared, the old copy is kept stopped); lowering it is refused.", { enum: [...PG_VERSIONS] }),
+  pgVersion: int("Its Postgres version; default the platform's. Raising it moves the database to the newer version under its own name, address and login (the door is shut for the copy, every table is compared, the old copy is kept stopped); lowering it is refused, and so is any version below the one it runs (status.pgVersion), as for a database made without one and later given an older one.", { enum: [...PG_VERSIONS] }),
   parent: str('A database (in the same namespace) this one is made from: a copy-on-write branch of it, or, with at, a restore of it to a moment. The parent is untouched.', { pattern: DATABASE_NAME }),
   at: str('With parent: the moment (an RFC 3339 time) or the log position (X/Y) the copy is made at; none: now.'),
   replicaOf: str("A database this one is a read replica of: a second compute on its parent's data, read only.", { pattern: DATABASE_NAME }),
-  idleMinutes: int("Minutes with no session before it sleeps; default the platform's.", { minimum: 1 }),
+  idleAfter: duration("How long with no session before it sleeps; default the platform's. A duration (30m)."),
   memory: obj('The memory of its compute; default the platform\'s.', { request: str('What it asks for.'), limit: str('What it may use.') }),
   closed: bool('True: every connection is refused and it stays asleep until this is false again.', { default: false }),
-  keepOldDays: int('After a move to a newer Postgres version, how long the old copy is kept, stopped, as the way back.', { minimum: 0, default: 30 }),
+  keepOldFor: duration('After a move to a newer Postgres version, how long the old copy is kept, stopped, as the way back. A duration (30d).', { default: '30d' }),
   requests: obj('One-off requests: set a new value to ask again; the status says which value was answered.', {
     stop: str('Put it to sleep now (the next connection wakes it).'),
     rehearseMove: str('Copy and compare to the version named in pgVersion without shutting the door or switching: how long the move would take.'),
   }),
-})
+}, rules(
+  ['!has(self.at) || has(self.parent)', 'at is the moment of a parent: name the parent'],
+  ['!(has(self.parent) && has(self.replicaOf))', 'a database is made from a parent or is a replica of one, not both'],
+  ['(has(self.parent) == has(oldSelf.parent)) && (!has(self.parent) || self.parent == oldSelf.parent)', 'parent cannot change: it is what the database was made from'],
+  ['(has(self.at) == has(oldSelf.at)) && (!has(self.at) || self.at == oldSelf.at)', 'at cannot change: it is the moment the database was made from'],
+  ['(has(self.replicaOf) == has(oldSelf.replicaOf)) && (!has(self.replicaOf) || self.replicaOf == oldSelf.replicaOf)', 'replicaOf cannot change'],
+  ['!has(oldSelf.pgVersion) || (has(self.pgVersion) && self.pgVersion >= oldSelf.pgVersion)', 'pgVersion is never lowered: a database moves to a newer Postgres, never back'],
+))
 
 export const databaseStatus: Schema = obj('The database as it is.', {
   observedGeneration: int('The generation of the spec this status is about.'),
@@ -249,29 +265,29 @@ export interface PlatformSpec {
   machines: { label: { key: string; value: string }; taint?: { key: string; value?: string; effect: string }; deadTaint?: { key: string; value?: string; effect: string } }
   spread: 'machines' | 'none'
   objectStore: { endpoint: string; region: string; bucket?: string; credentialsSecret?: string; pageservers?: Store; safekeepers?: Store; records?: Store; walTrim?: { credentialsSecret: string } }
-  pageservers: { count: number; machines?: string[]; memory: Memory; storage: Storage }
+  pageservers: { count?: number; machines?: string[]; memory: Memory; storage: Storage }
   safekeepers: { count: 3 | 5; zoneLabel: string; machines?: string[]; outside?: { machines?: string[]; label: { key: string; value: string }; tolerations?: Record<string, unknown>[] }; memory: Memory; storage: Storage }
   controller: { records: 'kubernetes' | 'postgres'; postgres?: { urlSecret: string; key: string }; machine?: string; memory: Memory }
   gateways: { count: number; domain?: string; service: { type: 'ClusterIP' | 'LoadBalancer' | 'NodePort'; annotations?: Record<string, string> }; memory: Memory }
   certificates: { issuer?: { name: string; kind: 'Issuer' | 'ClusterIssuer' } }
-  computes: { defaultPgVersion: PgVersion; idleMinutes: number; memory: Memory; scratch: string }
+  computes: { defaultPgVersion: PgVersion; idleAfter: string; memory: Memory; scratch: string }
   databases: { deleteHold: string }
-  upgrades: { quietHours: Window[]; restartHours: Window[]; checkSeconds: number }
+  upgrades: { quietHours: Window[]; restartHours: Window[]; checkTimeout: string }
   keys: { authSecret?: string; caSecret?: string }
   control: { replicas: number; memory: Memory }
   adopt?: { kind: string; namespace?: string; name: string }[]
   suspend: boolean
-  requests?: { retry?: string }
+  requests?: { retry?: string; applyPending?: string }
 }
 export interface DatabaseSpec {
   pgVersion?: PgVersion
   parent?: string
   at?: string
   replicaOf?: string
-  idleMinutes?: number
+  idleAfter?: string
   memory?: Partial<Memory>
   closed: boolean
-  keepOldDays: number
+  keepOldFor: string
   requests?: { stop?: string; rehearseMove?: string }
 }
 export interface ObjectMeta { name: string; namespace?: string; uid?: string; generation?: number; resourceVersion?: string; labels?: Record<string, string>; annotations?: Record<string, string>; finalizers?: string[]; deletionTimestamp?: string; creationTimestamp?: string }

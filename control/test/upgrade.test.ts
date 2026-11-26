@@ -7,7 +7,7 @@ import { FakeKube } from './fake-kube'
 // The ordered upgrade, first as decisions, then as passes of the operator over an API server in memory with a stand-in storage: the order,
 // the checks between steps, a halt that waits for a person, a retry, going back over only what moved, quiet hours, and adoption.
 
-const img = (rel: string) => ({ storage: `s:${rel}`, control: `c:${rel}`, compute: { 18: `p18:${rel}`, 19: `p19:${rel}` } })
+const img = (rel: string) => ({ release: rel, storage: `s:${rel}`, control: `c:${rel}`, compute: { 18: `p18:${rel}`, 19: `p19:${rel}` } })
 const NOW = new Date('2026-12-01T12:00:00Z')
 const steps = stepsOf([2, 1], ['safekeeper-w3', 'safekeeper-w1', 'safekeeper-w2'])
 
@@ -83,7 +83,7 @@ const storage: Storage = {
   fill: async (id) => { calls.push(`fill ${id}`) },
   filled: async () => ({ done: true, why: '' }),
 }
-const platform = (release: string, more: Record<string, unknown> = {}) => ({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Platform', metadata: { name: 'peat' }, spec: { release, objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's' }, upgrades: { checkSeconds: 60 }, ...more } })
+const platform = (release: string, more: Record<string, unknown> = {}) => ({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Platform', metadata: { name: 'peat' }, spec: { release, objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's' }, upgrades: { checkTimeout: '1m' }, ...more } })
 const statusOf = () => k.get('peat.zabaca.com/v1alpha1', 'platforms', null, 'peat').status
 /** A change to the Platform's spec, as kubectl apply makes one: the status stays. */
 const respec = (release: string, more: Record<string, unknown> = {}) => { const o = k.get('peat.zabaca.com/v1alpha1', 'platforms', null, 'peat'); o.spec = platform(release, more).spec; o.metadata.generation = (o.metadata.generation ?? 1) + 1 }
@@ -171,7 +171,7 @@ describe('an upgrade, pass by pass', () => {
     expect(image('deployments', 'peat', 'storage-controller')).toBe('ghcr.io/zabaca/peat/storage:release-a')
   })
   test('quiet hours: no step starts inside them; the upgrade waits Paused and goes on after', async () => {
-    respec('release-b', { upgrades: { checkSeconds: 60, quietHours: [{ start: '12:00', end: '12:30' }] } })
+    respec('release-b', { upgrades: { checkTimeout: '1m', quietHours: [{ start: '12:00', end: '12:30' }] } })
     await pass()
     expect(statusOf().phase).toBe('Paused')
     expect(image('deployments', 'peat', 'storage-controller')).toBe('ghcr.io/zabaca/peat/storage:release-a')
@@ -182,9 +182,12 @@ describe('an upgrade, pass by pass', () => {
 })
 
 describe('adoption', () => {
-  test('an object of a piece\'s name made another way is taken over only when nothing would change; a difference waits as a pending change until it leaves the list', async () => {
+  const fresh = () => {
     k = new FakeKube()
     for (const n of ['machine-1', 'machine-2', 'machine-3']) k.put({ apiVersion: 'v1', kind: 'Node', metadata: { name: n, labels: LABEL } })
+  }
+  test('an object of a piece\'s name made another way is taken over as it is; its difference waits as a pending change, even off the list, until requests.applyPending asks', async () => {
+    fresh()
     k.put({ apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name: 'storage-broker', namespace: 'peat' }, spec: { replicas: 1, strategy: { type: 'Recreate' }, selector: { matchLabels: { app: 'storage-broker' } }, template: { metadata: { labels: { app: 'storage-broker' } }, spec: { containers: [{ name: 'storage-broker', image: 'ghcr.io/zabaca/peat/storage:older' }] } } } })
     const adopt = [{ kind: 'Deployment', namespace: 'peat', name: 'storage-broker' }]
     k.put(platform('release-a', { adopt }))
@@ -193,9 +196,32 @@ describe('adoption', () => {
     const pendingChange = (statusOf().pendingChanges as any[]).find((x) => x.name === 'storage-broker')
     expect(pendingChange.change).toContain('.spec.template.spec.containers[0].image: "ghcr.io/zabaca/peat/storage:older" would be "ghcr.io/zabaca/peat/storage:release-a"')
     expect(k.get('apps/v1', 'deployments', 'peat', 'storage-broker').metadata.labels['peat.zabaca.com/adopted']).toBe('true')
+    // off the list it is still the operator's, still as it was: nothing restarts by a change of the list
     respec('release-a')
+    await pass()
+    expect(image('deployments', 'peat', 'storage-broker')).toBe('ghcr.io/zabaca/peat/storage:older')
+    // asked for: applied, nothing left pending, the request answered
+    respec('release-a', { requests: { applyPending: 'now' } })
     await pass()
     expect(image('deployments', 'peat', 'storage-broker')).toBe('ghcr.io/zabaca/peat/storage:release-a')
     expect(statusOf().pendingChanges).toEqual([])
+    expect(statusOf().answered).toEqual({ applyPending: 'now' })
+    expect(k.get('apps/v1', 'deployments', 'peat', 'storage-broker').metadata.labels['peat.zabaca.com/adopted']).toBeUndefined()
+  })
+  test('a lost record is taken back by adoption: what the operator would not change is recorded again and applied, nothing restarts', async () => {
+    fresh()
+    k.put(platform('release-a'))
+    await pass()
+    const ctl = k.get('apps/v1', 'deployments', 'peat', 'storage-controller')
+    // the record lost (or a cluster restored with new UIDs): every piece is refused
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|configmaps|peat-owned'))!)
+    const refused = await reconcile(k, { storage: () => storage, now: () => clock })
+    expect(refused.refused.some((x) => x.includes('Deployment/peat/storage-controller'))).toBe(true)
+    // listed in adopt, it is taken back into the record as it is
+    respec('release-a', { adopt: [{ kind: 'Deployment', namespace: 'peat', name: 'storage-controller' }] })
+    const r = await reconcile(k, { storage: () => storage, now: () => clock })
+    expect(r.refused.some((x) => x.includes('Deployment/peat/storage-controller'))).toBe(false)
+    expect(k.get('v1', 'configmaps', 'peat-system', 'peat-owned').data['Deployment.peat.storage-controller']).toBe(`uid:${ctl.metadata.uid}`)
+    expect(statusOf().pendingChanges.find((x: any) => x.name === 'storage-controller')).toBeUndefined()
   })
 })

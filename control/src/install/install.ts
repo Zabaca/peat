@@ -5,15 +5,14 @@
 //   bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> [--out peat.yaml]
 //
 // The operator makes every other piece (namespaces, accounts, Roles, admission rules, the storage, the control layer, the gateways), so its
-// account may make those kinds, and may grant (`bind`, `escalate`) the Roles it gives the pieces' accounts. That is the account of a
-// cluster administrator in all but name; the guards it installs hold the control layer, the platform's least trusted piece with node rights.
+// account may make those kinds. It holds every rule it grants the pieces' accounts, so it needs neither `bind` nor `escalate`. Its rights
+// are cluster-wide today; holding its Secrets and workloads to the platform's own namespaces (Roles made per namespace) is later work.
+// The guards it installs hold the control layer, the platform's piece with node rights.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { crds } from '../api/crds'
 import { GROUP } from '../names'
 import { OPERATOR_NAMESPACE } from '../operator/render'
-
-export { OPERATOR_NAMESPACE }
 
 export const OPERATOR_ACCOUNT = 'peat-operator'
 const RECORDS_CRDS = join(import.meta.dir, '../../../storage_controller/kubernetes/crds.yaml')
@@ -40,15 +39,16 @@ export function installManifests(image: string): Record<string, unknown>[] {
         { apiGroups: [GROUP], resources: ['platforms', 'databases'], verbs: ALL },
         { apiGroups: [GROUP], resources: ['platforms/status', 'databases/status'], verbs: ['get', 'update', 'patch'] },
         { apiGroups: [`storagecontroller.${GROUP}`], resources: ['*'], verbs: ALL },
-        { apiGroups: [''], resources: ['namespaces', 'configmaps', 'secrets', 'services', 'serviceaccounts', 'pods', 'persistentvolumeclaims'], verbs: ALL },
+        { apiGroups: [''], resources: ['namespaces', 'configmaps', 'secrets', 'services', 'serviceaccounts'], verbs: ALL },
+        // pods: read, and deleted (an upgrade restarts a pageserver by deleting its pod); the operator makes none. patch on nodes: the control layer's grant, held so it can be given
+        { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'watch', 'delete'] },
         { apiGroups: [''], resources: ['nodes'], verbs: ['get', 'list', 'watch', 'patch'] },
-        { apiGroups: [''], resources: ['events'], verbs: ['create', 'patch'] },
         { apiGroups: ['apps'], resources: ['deployments', 'statefulsets'], verbs: ALL },
         { apiGroups: ['batch'], resources: ['jobs'], verbs: ALL },
         { apiGroups: ['networking.k8s.io'], resources: ['networkpolicies'], verbs: ALL },
         { apiGroups: ['coordination.k8s.io'], resources: ['leases'], verbs: ALL },
         { apiGroups: ['cert-manager.io'], resources: ['certificates'], verbs: ALL },
-        { apiGroups: ['rbac.authorization.k8s.io'], resources: ['roles', 'rolebindings', 'clusterroles', 'clusterrolebindings'], verbs: [...ALL, 'bind', 'escalate'] },
+        { apiGroups: ['rbac.authorization.k8s.io'], resources: ['roles', 'rolebindings', 'clusterroles', 'clusterrolebindings'], verbs: ALL },
         { apiGroups: ['admissionregistration.k8s.io'], resources: ['validatingadmissionpolicies', 'validatingadmissionpolicybindings'], verbs: ALL },
       ],
     },

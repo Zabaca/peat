@@ -32,7 +32,7 @@ if (withError.size > 0) {
     })
   }
 }
-const { problems, warnings } = storageStateReport(nodes, tenants, [1, 2], statuses, locations)
+const { problems, warnings } = storageStateReport(nodes, tenants, nodes.map((n) => Number(n.id)), statuses, locations) // every pageserver the controller knows is expected Active
 for (const n of nodes) console.log(`node ${n.id}: availability ${JSON.stringify(n.availability)}, scheduling ${JSON.stringify(n.scheduling)}`)
 const perNode: Record<string, number> = {}
 for (const t of tenants) for (const s of t.shards ?? []) perNode[String(s.node_attached)] = (perNode[String(s.node_attached)] ?? 0) + 1

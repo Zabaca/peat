@@ -75,10 +75,12 @@ platform.spec` and `kubectl explain database.spec` print the same text. In short
   platform's machines, their taint), `spread` (`machines`, or `none` for a one-machine trial), `objectStore` (one bucket and Secret, or one
   per piece), `pageservers`, `safekeepers` (three or five, their zone label, `outside` machines that may hold one member), `controller`
   (`records: kubernetes` or `postgres`), `gateways` (count, `domain`, how the front door is exposed), `certificates` (a cert-manager issuer,
-  or the platform's own authority), `computes` (default Postgres version, idle minutes, memory), `databases.deleteHold`, `upgrades`
-  (`quietHours`, `restartHours`), `keys` (given, or made), `control`, `adopt`, `suspend`, `requests.retry`.
+  or the platform's own authority), `computes` (default Postgres version, `idleAfter`, memory), `databases.deleteHold`, `upgrades`
+  (`quietHours`, `restartHours`, `checkTimeout`), `keys` (given, or made), `control`, `adopt`, `suspend`, `requests.retry`,
+  `requests.applyPending`. Every duration is a number and a unit (`30m`, `7d`). Rules across fields (a namespace never changes; a
+  version never lowered; `parent`, `at` and `replicaOf` fixed once made) are the API server's, in the CustomResourceDefinitions.
 - **Database** `spec`: `pgVersion` (raising it moves the database to the newer major under its own name), `parent` and `at` (a branch, or
-  a restore to a moment as a new database), `replicaOf`, `idleMinutes`, `memory`, `closed`, `keepOldDays`, `requests.stop`,
+  a restore to a moment as a new database), `replicaOf`, `idleAfter`, `memory`, `closed`, `keepOldFor`, `requests.stop`,
   `requests.rehearseMove`. Its `status` says where to connect (`host`, `serviceHost`, `port`), the login Secret and the authority's
   certificate in the database's own namespace.
 
@@ -96,7 +98,9 @@ exec credential plugin, as kubectl reads them), each change read back until the 
 Each piece reads its settings from its environment, which the operator writes from the Platform; unset, each is the neutral default.
 The names every piece shares are `NAMESPACE`, `COMPUTE_NAMESPACE`, `GATEWAY_NAMESPACE`, `DB_NAMESPACE`, `MACHINE_LABEL` (`key=value`),
 `MACHINE_TAINT` and `DEAD_TAINT` (`key=value:Effect`), read by `src/names.ts`. The rest are read where they are used, at the top of each
-program: `src/control.ts`, `src/gateway/settings.ts`, `src/drills/guard.ts`.
+program: `src/control.ts`, `src/gateway/settings.ts`, `src/drills/guard.ts` (the drills also take `--kubeconfig`, which `run` and `recover`
+require), and the storage's scripts, `src/storage/api.ts` (`KEY_DIR`, the signing key's folder, `/keys` by default) and
+`src/storage/roll.ts` (`ROLL_ACTION`, `ROLL_NODE`, `ROLL_WAIT_S`).
 
 ## Working here
 

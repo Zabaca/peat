@@ -1,6 +1,7 @@
 // One pass of an upgrade's current step: the work its phase does to the cluster and what it waits for, bounded by the Platform's
 // upgrades.checkSeconds (past it the upgrade halts there, with why). The check before and after each step is the whole platform's: every
 // piece ready and the storage settled (storage.ts).
+import { durationMs } from '../api/schema'
 import { ok, type Kube } from '../kube'
 import type { Resolved } from './platform'
 import type { Storage } from './storage'
@@ -30,7 +31,8 @@ export async function runStep(k: Kube, r: Resolved, storage: Storage, u: Upgrade
     return { state: { ...u, ...extra, phase: next as Phase, since: at }, message: msg }
   }
   const wait = (why: string, extra: Partial<UpgradeState> = {}): StepWork => {
-    if (overdue(u, now, r.spec.upgrades.checkSeconds)) return { state: { ...u, ...extra, halted: { at, step, reason: `${phase}: ${why} (for more than ${r.spec.upgrades.checkSeconds} s)` } }, message: `halted at ${step}: ${why}` }
+    const bound = Math.round(durationMs(r.spec.upgrades.checkTimeout) / 1000)
+    if (overdue(u, now, bound)) return { state: { ...u, ...extra, halted: { at, step, reason: `${phase}: ${why} (for more than ${r.spec.upgrades.checkTimeout})` } }, message: `halted at ${step}: ${why}` }
     return { state: { ...u, ...extra }, message: `${step}, ${phase}: ${why}` }
   }
   const pageserverId = step.startsWith('pageserver-w') ? Number(step.slice('pageserver-w'.length)) : 0
