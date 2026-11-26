@@ -13,26 +13,26 @@ if TYPE_CHECKING:
 
 
 #
-# Peat builds Postgres 18 only, and its storage image carries only 18's initdb, so a
-# timeline created without a Postgres version must be 18 (Neon's default is 17, which a
-# Peat image cannot create). Both through the pageserver and through the storage
-# controller.
+# Peat's default Postgres is 19 (Neon's is 17, which a Peat image cannot create), so a
+# timeline created without a Postgres version must be 19, both through the pageserver and
+# through the storage controller. 18 is still supported: a timeline that asks for it gets it
+# (the rest of the suite, run on 18, makes every timeline with an explicit version).
 #
 @run_only_on_default_postgres("the default is the same whatever the run's version")
-def test_timeline_without_pg_version_is_18(neon_simple_env: NeonEnv):
+def test_timeline_without_pg_version_is_19(neon_simple_env: NeonEnv):
     env = neon_simple_env
     tenant_id = env.initial_tenant
     ps_http = env.pageserver.http_client()
 
     direct = TimelineId.generate()
     ps_http.timeline_create(PgVersion.NOT_SET, tenant_id, direct)
-    assert ps_http.timeline_detail(tenant_id, direct)["pg_version"] == 18
+    assert ps_http.timeline_detail(tenant_id, direct)["pg_version"] == 19
 
     via_controller = TimelineId.generate()
     env.storage_controller.pageserver_api().timeline_create(
         PgVersion.NOT_SET, tenant_id, via_controller
     )
-    assert ps_http.timeline_detail(tenant_id, via_controller)["pg_version"] == 18
+    assert ps_http.timeline_detail(tenant_id, via_controller)["pg_version"] == 19
 
 
 #
@@ -60,7 +60,7 @@ def test_existing_initdb_needs_pg_version(neon_simple_env: NeonEnv):
     assert e.value.status_code == 400
 
     # Through the storage controller, a sharded tenant's timeline created with no version:
-    # every shard's timeline is 18.
+    # every shard's timeline is 19.
     sharded, _ = env.create_tenant(shard_count=2)
     timeline_id = TimelineId.generate()
     env.storage_controller.pageserver_api().timeline_create(PgVersion.NOT_SET, sharded, timeline_id)
@@ -68,4 +68,4 @@ def test_existing_initdb_needs_pg_version(neon_simple_env: NeonEnv):
     assert len(shards) == 2
     for shard in shards:
         detail = ps_http.timeline_detail(TenantShardId.parse(shard["shard_id"]), timeline_id)
-        assert detail["pg_version"] == 18
+        assert detail["pg_version"] == 19

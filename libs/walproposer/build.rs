@@ -7,8 +7,8 @@ use std::process::Command;
 
 use anyhow::{Context, anyhow};
 
-// Peat: 18, the only version Peat builds in full (Neon: 17); keep it equal to the
-// Makefile's walproposer-lib.
+// Peat: 18 (Neon: 17), whatever the default version; keep it equal to the Makefile's
+// walproposer-lib.
 const WALPROPOSER_PG_VERSION: &str = "v18";
 
 fn main() -> anyhow::Result<()> {

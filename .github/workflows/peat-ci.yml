@@ -6,8 +6,9 @@ name: Peat CI
 # Postgres 18 and on Postgres 19, each on both, split into shards that each fit one
 # standard GitHub-hosted runner (4 vCPU, 16 GB of memory, free and unlimited for public
 # repositories), and the images, one per architecture, which the publish job joins into one
-# multi-arch image per tag. Postgres 18 is Peat's default and what every database runs on;
-# Postgres 19 (peat-postgres's REL_19_STABLE_peat) is built and tested beside it.
+# multi-arch image per tag. Postgres 19 (peat-postgres's REL_19_STABLE_peat) is Peat's default
+# (the version of a timeline created without one); Postgres 18 is still supported, built and
+# tested beside it.
 # No job needs a machine of ours. See README.md, "Continuous integration".
 
 on:
@@ -185,6 +186,8 @@ jobs:
           retention-days: 7
           compression-level: 0
 
+  # Neon's regression suite on Postgres 18, still supported. The tests Neon marks as
+  # default-version only (`run_only_on_default_postgres`, Postgres 19 here) are skipped on it.
   regress:
     # No expression in the name: GitHub does not evaluate a skipped job's name (pull requests
     # skip this job), and appends the matrix (architecture, then shard 1 to 8 or solo) to a
@@ -275,13 +278,12 @@ jobs:
           path: ${{ runner.temp }}/results
           retention-days: 7
 
-  # The same suite on Postgres 19 (peat-postgres's REL_19_STABLE_peat), built beside 18 by the
-  # build job above, on both architectures like 18. It gates: the publish job needs every
-  # one of its shards, so no image carrying 19 goes out untested or after a failed shard,
-  # on either architecture. 19 is not yet what any database runs on (18 is), but a failure
-  # here holds the publish all the same. The tests Neon marks as default-version only
-  # (`run_only_on_default_postgres`, Postgres 18 here) are skipped, as they are on 17 in
-  # Neon's own CI.
+  # The same suite on Postgres 19 (peat-postgres's REL_19_STABLE_peat), Peat's default,
+  # built beside 18 by the build job above, on both architectures like 18. It gates: the
+  # publish job needs every one of its shards, so no image carrying 19 goes out untested or
+  # after a failed shard, on either architecture. The tests Neon marks as default-version
+  # only (`run_only_on_default_postgres`, Postgres 19 here) run here and are skipped on 18,
+  # as Neon's own CI skips them on every version but its default.
   regress-pg19:
     # No expression in the name: GitHub does not evaluate a skipped job's name (pull requests
     # skip this job), and appends the matrix (architecture, then shard 1 to 8 or solo) to a

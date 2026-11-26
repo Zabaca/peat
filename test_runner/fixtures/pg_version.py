@@ -19,8 +19,9 @@ class PgVersion(StrEnum):
     V19 = "19"
 
     # Postgres Version for tests that uses `fixtures.utils.run_only_on_default_postgres`.
-    # Peat: 18, the version Peat is built and tested on (Neon: 17).
-    DEFAULT = V18
+    # Peat: 19, its default version (Neon: 17); 18 is still built and tested, with the
+    # whole suite on it, but the tests marked to run only on the default do not run on 18.
+    DEFAULT = V19
 
     # Instead of making version an optional parameter in methods, we can use this fake entry
     # to explicitly rely on the default server version (could be different from pg_version fixture value)
