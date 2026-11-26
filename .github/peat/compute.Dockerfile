@@ -1,4 +1,5 @@
-# Peat's compute image for Postgres 18: Postgres 18 with Neon's extension (neon, neon_rmgr,
+# Peat's compute image for one Postgres major (PG_MAJOR, 18 by default; the workflow also
+# builds it for 19): Postgres with Neon's extension (neon, neon_rmgr,
 # neon_utils, neon_walredo) installed at /usr/local, and Neon's compute manager compute_ctl
 # as the entrypoint, built with the default features. Only what the lab's control layer
 # and tests use: compute_ctl starts and configures Postgres from a spec, and the lab's
@@ -8,9 +9,10 @@
 # pinned by digest. The build context is the unpacked peat-images artifact.
 FROM ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
 ARG REVISION=unknown
+ARG PG_MAJOR=18
 LABEL org.opencontainers.image.source="https://github.com/Zabaca/peat" \
-      org.opencontainers.image.title="Peat compute, Postgres 18" \
-      org.opencontainers.image.description="Postgres 18 with Neon's extension and compute_ctl, from Peat. A fork of Neon's code; not affiliated with or endorsed by Neon or Databricks." \
+      org.opencontainers.image.title="Peat compute, Postgres ${PG_MAJOR}" \
+      org.opencontainers.image.description="Postgres ${PG_MAJOR} with Neon's extension and compute_ctl, from Peat. A fork of Neon's code; not affiliated with or endorsed by Neon or Databricks." \
       org.opencontainers.image.licenses="Apache-2.0 AND PostgreSQL" \
       org.opencontainers.image.revision="${REVISION}"
 RUN apt-get update \
@@ -24,9 +26,9 @@ RUN apt-get update \
  && mkdir -p /var/db/postgres/specs /usr/local/download_extensions \
  && chown -R postgres:postgres /var/db/postgres /usr/local/download_extensions \
  && install -d -o postgres -g postgres -m 0700 /neon/cache
-COPY pg/v18/bin /usr/local/bin
-COPY pg/v18/lib /usr/local/lib
-COPY pg/v18/share /usr/local/share
+COPY pg/v${PG_MAJOR}/bin /usr/local/bin
+COPY pg/v${PG_MAJOR}/lib /usr/local/lib
+COPY pg/v${PG_MAJOR}/share /usr/local/share
 COPY bin/compute_ctl /usr/local/bin/compute_ctl
 COPY LICENSE NOTICE PROVENANCE /usr/share/doc/peat/
 RUN ldconfig \

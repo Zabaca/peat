@@ -1,5 +1,10 @@
 #include "postgres.h"
 
+#if PG_MAJORVERSION_NUM >= 19
+/* RepOriginId was renamed in Postgres 19 */
+#define RepOriginId ReplOriginId
+#endif
+
 #if PG_MAJORVERSION_NUM >= 16
 
 #include "access/heapam_xlog.h"

@@ -5,7 +5,7 @@ use crate::pg_constants;
 use crate::transaction_id_precedes;
 use bytes::BytesMut;
 
-use super::bindings::MultiXactId;
+use super::bindings::MultiXactOffset;
 
 pub fn transaction_id_set_status(xid: u32, status: u8, page: &mut BytesMut) {
     tracing::trace!(
@@ -55,30 +55,34 @@ pub fn slru_may_delete_clogsegment(segpage: u32, cutoff_page: u32) -> bool {
 
 // Multixact utils
 
-pub fn mx_offset_to_flags_offset(xid: MultiXactId) -> usize {
-    ((xid / pg_constants::MULTIXACT_MEMBERS_PER_MEMBERGROUP as u32)
-        % pg_constants::MULTIXACT_MEMBERGROUPS_PER_PAGE as u32
-        * pg_constants::MULTIXACT_MEMBERGROUP_SIZE as u32) as usize
+// The multixact members are addressed by a MultiXactOffset, which is 32 bits wide up to
+// Postgres 18 and 64 bits wide since 19. The members' pages are laid out the same in both.
+
+pub fn mx_offset_to_flags_offset(offset: MultiXactOffset) -> usize {
+    ((offset as u64 / pg_constants::MULTIXACT_MEMBERS_PER_MEMBERGROUP as u64)
+        % pg_constants::MULTIXACT_MEMBERGROUPS_PER_PAGE as u64
+        * pg_constants::MULTIXACT_MEMBERGROUP_SIZE as u64) as usize
 }
 
-pub fn mx_offset_to_flags_bitshift(xid: MultiXactId) -> u16 {
-    (xid as u16) % pg_constants::MULTIXACT_MEMBERS_PER_MEMBERGROUP
+pub fn mx_offset_to_flags_bitshift(offset: MultiXactOffset) -> u16 {
+    (offset as u64 % pg_constants::MULTIXACT_MEMBERS_PER_MEMBERGROUP as u64) as u16
         * pg_constants::MXACT_MEMBER_BITS_PER_XACT
 }
 
 /* Location (byte offset within page) of TransactionId of given member */
-pub fn mx_offset_to_member_offset(xid: MultiXactId) -> usize {
-    mx_offset_to_flags_offset(xid)
+pub fn mx_offset_to_member_offset(offset: MultiXactOffset) -> usize {
+    mx_offset_to_flags_offset(offset)
         + (pg_constants::MULTIXACT_FLAGBYTES_PER_GROUP
-            + (xid as u16 % pg_constants::MULTIXACT_MEMBERS_PER_MEMBERGROUP) * 4) as usize
+            + (offset as u64 % pg_constants::MULTIXACT_MEMBERS_PER_MEMBERGROUP as u64) as u16 * 4)
+            as usize
 }
 
-fn mx_offset_to_member_page(xid: u32) -> u32 {
-    xid / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32
+fn mx_offset_to_member_page(offset: MultiXactOffset) -> u64 {
+    offset as u64 / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u64
 }
 
-pub fn mx_offset_to_member_segment(xid: u32) -> i32 {
-    (mx_offset_to_member_page(xid) / pg_constants::SLRU_PAGES_PER_SEGMENT) as i32
+pub fn mx_offset_to_member_segment(offset: MultiXactOffset) -> i32 {
+    (mx_offset_to_member_page(offset) / pg_constants::SLRU_PAGES_PER_SEGMENT as u64) as i32
 }
 
 #[cfg(test)]
@@ -106,15 +110,15 @@ mod tests {
         assert_eq!(mx_offset_to_flags_offset(123456789), 4780);
         assert_eq!(mx_offset_to_flags_bitshift(123456789), 8);
         assert_eq!(mx_offset_to_member_offset(123456789), 4788);
-        assert_eq!(mx_offset_to_member_segment(u32::MAX - 1), 82040);
-        assert_eq!(mx_offset_to_member_page(u32::MAX - 1), 2625285);
-        assert_eq!(mx_offset_to_flags_offset(u32::MAX - 1), 5160);
-        assert_eq!(mx_offset_to_flags_bitshift(u32::MAX - 1), 16);
-        assert_eq!(mx_offset_to_member_offset(u32::MAX - 1), 5172);
-        assert_eq!(mx_offset_to_member_segment(u32::MAX), 82040);
-        assert_eq!(mx_offset_to_member_page(u32::MAX), 2625285);
-        assert_eq!(mx_offset_to_flags_offset(u32::MAX), 5160);
-        assert_eq!(mx_offset_to_flags_bitshift(u32::MAX), 24);
-        assert_eq!(mx_offset_to_member_offset(u32::MAX), 5176);
+        assert_eq!(mx_offset_to_member_segment((u32::MAX as MultiXactOffset) - 1), 82040);
+        assert_eq!(mx_offset_to_member_page((u32::MAX as MultiXactOffset) - 1), 2625285);
+        assert_eq!(mx_offset_to_flags_offset((u32::MAX as MultiXactOffset) - 1), 5160);
+        assert_eq!(mx_offset_to_flags_bitshift((u32::MAX as MultiXactOffset) - 1), 16);
+        assert_eq!(mx_offset_to_member_offset((u32::MAX as MultiXactOffset) - 1), 5172);
+        assert_eq!(mx_offset_to_member_segment(u32::MAX as MultiXactOffset), 82040);
+        assert_eq!(mx_offset_to_member_page(u32::MAX as MultiXactOffset), 2625285);
+        assert_eq!(mx_offset_to_flags_offset(u32::MAX as MultiXactOffset), 5160);
+        assert_eq!(mx_offset_to_flags_bitshift(u32::MAX as MultiXactOffset), 24);
+        assert_eq!(mx_offset_to_member_offset(u32::MAX as MultiXactOffset), 5176);
     }
 }

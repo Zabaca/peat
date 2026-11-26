@@ -114,6 +114,9 @@
 #include "storage/sinvaladt.h"
 #include "storage/smgr.h"
 #include "storage/spin.h"
+#if PG_MAJORVERSION_NUM >= 19
+#include "storage/shmem_internal.h"
+#endif
 #if PG_MAJORVERSION_NUM >= 18
 #include "storage/aio.h"
 #include "storage/aio_subsys.h"
@@ -309,7 +312,18 @@ WalRedoMain(int argc, char *argv[])
 	InitializeFastPathLocks();
 #endif
 
-#if PG_VERSION_NUM >= 150000
+#if PG_MAJORVERSION_NUM >= 19
+	/*
+	 * Postgres 19 collects every subsystem's shared memory needs through
+	 * registered callbacks: register the built-in ones, then let the loaded
+	 * libraries (neon_rmgr) and every subsystem request, as single-user mode
+	 * does before it computes the shared memory size.
+	 */
+	RegisterBuiltinShmemCallbacks();
+	process_shmem_requests();
+	ShmemCallRequestCallbacks();
+	InitializeShmemGUCs();
+#elif PG_VERSION_NUM >= 150000
 	process_shmem_requests();
 	InitializeShmemGUCs();
 
@@ -484,6 +498,59 @@ WalRedoMain(int argc, char *argv[])
  * any sizeable effect on RSS, so probably such clean up not worth the risk of having
  * half-initialized postgres.
  */
+#if PG_MAJORVERSION_NUM >= 19
+static void
+CreateFakeSharedMemoryAndSemaphores(void)
+{
+	PGShmemHeader *hdr;
+	Size		size;
+	char		cwd[MAXPGPATH];
+
+	size = CalculateShmemSize();
+
+	/* Dummy implementation of PGSharedMemoryCreate() */
+	hdr = (PGShmemHeader *) malloc(size);
+	if (!hdr)
+		ereport(FATAL,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("[neon-wal-redo] can not allocate (pseudo-) shared memory")));
+
+	memset(hdr, 0, sizeof(PGShmemHeader));
+	hdr->creatorPID = getpid();
+	hdr->magic = PGShmemMagic;
+	hdr->dsm_control = 0;
+	hdr->device = 42; /* not relevant for non-shared memory */
+	hdr->inode = 43; /* not relevant for non-shared memory */
+	hdr->totalsize = size;
+	hdr->content_offset = MAXALIGN(sizeof(PGShmemHeader));
+
+	UsedShmemSegAddr = hdr;
+	UsedShmemSegID = (unsigned long) 42; /* not relevant for non-shared memory */
+
+	/*
+	 * Reserving semaphores uses the dir name as a source of entropy. Set it
+	 * to cwd() while the subsystems initialize. Nothing else needs DataDir
+	 * so nullify it afterwards to error out if something tries to access it.
+	 */
+	if (!getcwd(cwd, MAXPGPATH))
+		ereport(FATAL,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("[neon-wal-redo] can not read current directory name")));
+	DataDir = cwd;
+
+	/* Set up the shared memory allocator and initialize every requested area */
+	InitShmemAllocator(hdr);
+	ShmemInitRequested();
+
+	DataDir = NULL;
+
+	/*
+	 * Now give loadable modules a chance to set up their shmem allocations
+	 */
+	if (shmem_startup_hook)
+		shmem_startup_hook();
+}
+#else
 static void
 CreateFakeSharedMemoryAndSemaphores(void)
 {
@@ -659,6 +726,7 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	if (shmem_startup_hook)
 		shmem_startup_hook();
 }
+#endif /* PG_MAJORVERSION_NUM >= 19 */
 
 
 /* Version compatility wrapper for ReadBufferWithoutRelcache */

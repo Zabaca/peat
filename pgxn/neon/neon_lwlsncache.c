@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "neon.h"
+#include "neon_pgversioncompat.h"
 #include "neon_lwlsncache.h"
 
 #include "miscadmin.h"
@@ -130,7 +131,16 @@ LwLsnCacheShmemRequest(void)
 {
 	Size requested_size = sizeof(LwLsnCacheCtl);
 
+#if PG_MAJORVERSION_NUM >= 19
+	/*
+	 * Postgres 19 sizes a shared hash table by exactly the number of entries
+	 * asked for, and the cache adds an entry before it evicts one, so it
+	 * needs room for one more than its limit.
+	 */
+	requested_size += hash_estimate_size(lwlsn_cache_size + 1, sizeof(LastWrittenLsnCacheEntry));
+#else
 	requested_size += hash_estimate_size(lwlsn_cache_size, sizeof(LastWrittenLsnCacheEntry));
+#endif
 
 	RequestAddinShmemSpace(requested_size);
 
@@ -153,10 +163,17 @@ LwLsnCacheShmemInit(void)
 	{
 		info.keysize = sizeof(BufferTag);
 		info.entrysize = sizeof(LastWrittenLsnCacheEntry);
+#if PG_MAJORVERSION_NUM >= 19
+		lastWrittenLsnCache = ShmemInitHash("last_written_lsn_cache",
+										lwlsn_cache_size + 1,
+										&info,
+										HASH_ELEM | HASH_BLOBS);
+#else
 		lastWrittenLsnCache = ShmemInitHash("last_written_lsn_cache",
 			lwlsn_cache_size, lwlsn_cache_size,
 										&info,
 										HASH_ELEM | HASH_BLOBS);
+#endif
 		LwLsnCache = ShmemInitStruct("neon/LwLsnCacheCtl", sizeof(LwLsnCacheCtl), &found);
 		// Now set the size in the struct
 		LwLsnCache->lastWrittenLsnCacheSize = lwlsn_cache_size;

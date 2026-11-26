@@ -70,6 +70,67 @@ impl XlMultiXactTruncate {
     }
 }
 
+/// XLOG_MULTIXACT_CREATE_ID of PostgreSQL 19 and later, where the offset is 64 bits wide.
+///
+/// A separate type from [`XlMultiXactCreate`], not a widening of it, because that one is
+/// serialized between the safekeeper and the pageserver and in the layer files' records, and
+/// those formats stay as they are for 18.
+#[repr(C)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct XlMultiXactCreate64 {
+    pub mid: MultiXactId,
+    /* new MultiXact's ID */
+    pub moff: u64,
+    /* its starting offset in members file */
+    pub nmembers: u32,
+    /* number of member XIDs */
+    pub members: Vec<MultiXactMember>,
+}
+
+impl XlMultiXactCreate64 {
+    pub fn decode(buf: &mut Bytes) -> XlMultiXactCreate64 {
+        // xl_multixact_create: mid (4 bytes), 4 bytes of padding before the 8-byte moff,
+        // nmembers (4 bytes); the members follow at offset 20 (SizeOfMultiXactCreate).
+        let mid = buf.get_u32_le();
+        buf.advance(4);
+        let moff = buf.get_u64_le();
+        let nmembers = buf.get_u32_le();
+        let mut members = Vec::new();
+        for _ in 0..nmembers {
+            members.push(MultiXactMember::decode(buf));
+        }
+        XlMultiXactCreate64 {
+            mid,
+            moff,
+            nmembers,
+            members,
+        }
+    }
+}
+
+/// XLOG_MULTIXACT_TRUNCATE_ID of PostgreSQL 19 and later: only the oldest multixact and the
+/// oldest member offset that are kept (xl_multixact_truncate).
+#[repr(C)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct XlMultiXactTruncate64 {
+    pub oldest_multi_db: Oid,
+    /* truncate multixact offsets older than this */
+    pub oldest_multi: MultiXactId,
+    /* truncate multixact members older than this */
+    pub oldest_offset: u64,
+}
+
+impl XlMultiXactTruncate64 {
+    pub fn decode(buf: &mut Bytes) -> XlMultiXactTruncate64 {
+        // oldestMultiDB (4 bytes), oldestMulti (4 bytes), oldestOffset (8 bytes, 8-aligned)
+        XlMultiXactTruncate64 {
+            oldest_multi_db: buf.get_u32_le(),
+            oldest_multi: buf.get_u32_le(),
+            oldest_offset: buf.get_u64_le(),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XlRelmapUpdate {
@@ -212,6 +273,7 @@ impl DecodedWALRecord {
                 PgMajorVersion::PG16 => info == crate::v16::bindings::XLOG_DBASE_CREATE_FILE_COPY,
                 PgMajorVersion::PG17 => info == crate::v17::bindings::XLOG_DBASE_CREATE_FILE_COPY,
                 PgMajorVersion::PG18 => info == crate::v18::bindings::XLOG_DBASE_CREATE_FILE_COPY,
+                PgMajorVersion::PG19 => info == crate::v19::bindings::XLOG_DBASE_CREATE_FILE_COPY,
             }
         } else {
             false
@@ -892,6 +954,16 @@ pub mod v17 {
 pub mod v18 {
     // None of the records decoded here changed between PostgreSQL 17 and 18
     pub use super::v17::{
+        XlEndOfRecovery, XlHeapDelete, XlHeapInsert, XlHeapLock, XlHeapLockUpdated,
+        XlHeapMultiInsert, XlHeapUpdate, XlParameterChange, rm_neon,
+    };
+}
+
+pub mod v19 {
+    // None of the records decoded here changed between PostgreSQL 18 and 19. What did change
+    // is the multixact records (64-bit offsets): see XlMultiXactCreate64 and
+    // XlMultiXactTruncate64 in the parent module.
+    pub use super::v18::{
         XlEndOfRecovery, XlHeapDelete, XlHeapInsert, XlHeapLock, XlHeapLockUpdated,
         XlHeapMultiInsert, XlHeapUpdate, XlParameterChange, rm_neon,
     };

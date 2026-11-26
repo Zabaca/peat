@@ -29,3 +29,9 @@
 	# against this repository's own remote.
 	url = ../peat-postgres.git
 	branch = REL_18_STABLE_peat
+[submodule "vendor/postgres-v19"]
+	path = vendor/postgres-v19
+	# Peat's Postgres 19 lives in the same repository as its 18, peat-postgres, on its own
+	# branch: the relative URL resolves against this repository's own remote.
+	url = ../peat-postgres.git
+	branch = REL_19_STABLE_peat

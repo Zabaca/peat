@@ -13,7 +13,8 @@ done
 cp -a pg_install "$stage/pg_install"
 # The upstream pg_regress and isolation suites run from the Postgres build tree
 # (test_runner/regress/test_pg_regress.py looks for pg_install/../build/vNN/src/test/...).
-for t in build/v18/src/test/regress build/v18/src/test/isolation; do
+for t in build/v18/src/test/regress build/v18/src/test/isolation \
+         build/v19/src/test/regress build/v19/src/test/isolation; do
   [ -d "$t" ] || continue
   mkdir -p "$stage/$(dirname "$t")"
   cp -a "$t" "$stage/$t"

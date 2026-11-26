@@ -226,6 +226,18 @@ where
     io_concurrency: IoConcurrency,
 }
 
+/// The path of an SLRU segment file in the data directory. Postgres 19 numbers the
+/// segments of the multixact members SLRU with 64 bits and names them with fifteen hex
+/// digits (`long_segment_names`); every other segment, and every segment of an earlier
+/// version, has four.
+fn slru_segment_name(pg_version: PgMajorVersion, kind: SlruKind, segno: u32) -> String {
+    if kind == SlruKind::MultiXactMembers && pg_version >= PgMajorVersion::PG19 {
+        format!("{kind}/{segno:015X}")
+    } else {
+        format!("{kind}/{segno:>04X}")
+    }
+}
+
 /// A sink that accepts SLRU blocks ordered by key and forwards
 /// full segments to the archive.
 struct SlruSegmentsBuilder<'a, 'b, W>
@@ -237,6 +249,7 @@ where
     current_segment: Option<(SlruKind, u32)>,
     total_blocks: usize,
     next_multixact_offset: Option<NextMultiXactOffset>,
+    pg_version: PgMajorVersion,
 }
 
 impl<'a, 'b, W> SlruSegmentsBuilder<'a, 'b, W>
@@ -246,6 +259,7 @@ where
     fn new(
         ar: &'a mut Builder<&'b mut W>,
         next_multixact_offset: Option<NextMultiXactOffset>,
+        pg_version: PgMajorVersion,
     ) -> Self {
         Self {
             ar,
@@ -253,6 +267,7 @@ where
             current_segment: None,
             total_blocks: 0,
             next_multixact_offset,
+            pg_version,
         }
     }
 
@@ -310,7 +325,7 @@ where
     async fn flush(&mut self) -> Result<(), BasebackupError> {
         let nblocks = self.buf.len() / BLCKSZ as usize;
         let (kind, segno) = self.current_segment.take().unwrap();
-        let segname = format!("{kind}/{segno:>04X}");
+        let segname = slru_segment_name(self.pg_version, kind, segno);
         let header = new_tar_header(&segname, self.buf.len() as u64)?;
         self.ar
             .append(&header, self.buf.as_slice())
@@ -416,7 +431,7 @@ where
             let next_multixact_offset =
                 NextMultiXactOffset::from_checkpoint(pgversion, &checkpoint_bytes)
                     .context("failed to decode checkpoint")?;
-            let mut slru_builder = SlruSegmentsBuilder::new(&mut self.ar, next_multixact_offset);
+            let mut slru_builder = SlruSegmentsBuilder::new(&mut self.ar, next_multixact_offset, pgversion);
 
             for part in slru_partitions.parts {
                 let query = VersionedKeySpaceQuery::uniform(part, self.lsn);
@@ -453,7 +468,7 @@ where
                     .timeline
                     .get_slru_segment(kind, segno, self.lsn, self.ctx)
                     .await?;
-                let segname = format!("{kind}/{segno:>04X}");
+                let segname = slru_segment_name(pgversion, kind, segno);
                 let header = new_tar_header(&segname, segment.len() as u64)?;
                 self.ar
                     .append(&header, segment.as_ref())
@@ -919,7 +934,8 @@ fn current_slru_segments(
         (
             checkpoint.nextXid.value as u32,
             checkpoint.nextMulti,
-            checkpoint.nextMultiOffset,
+            // 32 bits wide up to Postgres 18, 64 bits wide since 19
+            checkpoint.nextMultiOffset as u64,
         )
     });
     let segno = |pageno: u32| pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
@@ -930,11 +946,11 @@ fn current_slru_segments(
         ),
         (
             SlruKind::MultiXactOffsets,
-            segno(next_multi / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32),
+            segno(next_multi / pg_constants::multixact_offsets_per_page(pg_version)),
         ),
         (
             SlruKind::MultiXactMembers,
-            segno(next_multi_offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32),
+            segno((next_multi_offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u64) as u32),
         ),
     ])
 }

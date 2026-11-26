@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # CI (the publish job): push the checked images of both architectures and join them into
-# one multi-arch image per name and tag, for storage and compute-pg18. The order is what
+# one multi-arch image per name and tag, for storage and compute-pg18 (or the names in
+# PEAT_IMAGE_NAMES, which the publish job sets to compute-pg19 for a second call). The order is what
 # keeps a bad or half release off <tag>, the tag a user pulls:
 #   1. Look at every <tag> first. One that exists must already be this very image (an
 #      index of exactly linux/arm64 and linux/amd64 whose two images have the configs, so
@@ -16,12 +17,12 @@
 # a rerun overwrites them). Expects the checked images loaded as peat-storage:ci-<arch>
 # and peat-compute:ci-<arch> (the publish job compares their IDs with the ones checked)
 # and a registry login. Tested by test-push-images.sh.
-# Usage: push-images.sh <registry path, e.g. ghcr.io/zabaca/peat> <tag>
+# Usage: [PEAT_IMAGE_NAMES='storage compute-pg18'] push-images.sh <registry path, e.g. ghcr.io/zabaca/peat> <tag>
 set -euo pipefail
 dest=$1; tag=$2
 arches=(arm64 amd64)
-names=(storage compute-pg18)
-local_image() { case $1 in storage) echo peat-storage;; compute-pg18) echo peat-compute;; esac; }
+read -ra names <<< "${PEAT_IMAGE_NAMES:-storage compute-pg18}"
+local_image() { case $1 in storage) echo peat-storage;; compute-pg18) echo peat-compute;; compute-pg19) echo peat-compute-pg19;; esac; }
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
 fail() { echo "::error::$*"; exit 1; }
 inspect_raw() { docker buildx imagetools inspect --raw "$1"; }

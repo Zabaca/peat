@@ -48,6 +48,19 @@ pub enum NeonWalRecord {
         trunc_offs: usize,
     },
 
+    // The two multixact records for Postgres 19 and later, where a MultiXactOffset is 64 bits
+    // wide, so an offsets page holds 1024 of them (2048 before) and these records carry
+    // the offset as 64 bits. Separate variants, placed here and not widened above, because
+    // the records are persisted in layer files and the variants above keep their encoding;
+    // keep them before the testing-only variant.
+    /// Extend multixact offsets SLRU (Postgres 19 and later)
+    MultixactOffsetCreate64 { mid: MultiXactId, moff: u64 },
+    /// Extend multixact members SLRU (Postgres 19 and later)
+    MultixactMembersCreate64 {
+        moff: u64,
+        members: Vec<MultiXactMember>,
+    },
+
     /// A testing record for unit testing purposes. It supports append data to an existing image, or clear it.
     #[cfg(feature = "testing")]
     Test {

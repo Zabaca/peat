@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from fixtures.log_helper import log
+from fixtures.pg_version import PgVersion
 from psycopg2.errors import QueryCanceled
 
 if TYPE_CHECKING:
@@ -42,6 +43,14 @@ unfortunate connection startup and request states.
 
 def test_cancellations(neon_simple_env: NeonEnv):
     env = neon_simple_env
+    if env.pg_version >= PgVersion.V19:
+        # Known issue of Peat's Postgres 19 port. The test lists which request to the pageserver
+        # (exists, nblocks, getpage, dbsize) each query needs, and 19's SELECT needs one more: with
+        # the `exists` failpoint paused, `SELECT min(id) FROM test1` is cancelled, which it is not
+        # on 18. Pruning on access (heap_page_prune_opt) in 19 pins the visibility map page and may
+        # record free space in the free space map, which asks the pageserver whether those forks
+        # exist and for their pages. See README, Known issues.
+        pytest.xfail("Postgres 19: a SELECT also asks the pageserver about the visibility map and free space map")
     ps = env.pageserver
     ps_http = ps.http_client()
     ps_http.is_testing_enabled_or_skip()

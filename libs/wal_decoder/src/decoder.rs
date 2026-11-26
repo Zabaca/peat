@@ -406,7 +406,7 @@ impl MetadataRecord {
                     anyhow::bail!("Unknown RMGR {} for Heap decoding", decoded.xl_rmid);
                 }
             }
-            PgMajorVersion::PG17 | PgMajorVersion::PG18 => {
+            PgMajorVersion::PG17 | PgMajorVersion::PG18 | PgMajorVersion::PG19 => {
                 if decoded.xl_rmid == pg_constants::RM_HEAP_ID {
                     let info = decoded.xl_info & pg_constants::XLOG_HEAP_OPMASK;
 
@@ -513,7 +513,10 @@ impl MetadataRecord {
         assert_eq!(decoded.xl_rmid, pg_constants::RM_NEON_ID);
 
         match pg_version {
-            PgMajorVersion::PG16 | PgMajorVersion::PG17 | PgMajorVersion::PG18 => {
+            PgMajorVersion::PG16
+            | PgMajorVersion::PG17
+            | PgMajorVersion::PG18
+            | PgMajorVersion::PG19 => {
                 let info = decoded.xl_info & pg_constants::XLOG_HEAP_OPMASK;
 
                 match info {
@@ -716,7 +719,7 @@ impl MetadataRecord {
                     return Ok(Some(record));
                 }
             }
-            PgMajorVersion::PG17 | PgMajorVersion::PG18 => {
+            PgMajorVersion::PG17 | PgMajorVersion::PG18 | PgMajorVersion::PG19 => {
                 if info == postgres_ffi::v17::bindings::XLOG_DBASE_CREATE_WAL_LOG {
                     tracing::debug!("XLOG_DBASE_CREATE_WAL_LOG: noop");
                 } else if info == postgres_ffi::v17::bindings::XLOG_DBASE_CREATE_FILE_COPY {
@@ -876,11 +879,24 @@ impl MetadataRecord {
                 },
             ))));
         } else if info == pg_constants::XLOG_MULTIXACT_CREATE_ID {
+            // Since Postgres 19 a MultiXactOffset is 64 bits wide
+            if pg_version >= PgMajorVersion::PG19 {
+                let xlrec = XlMultiXactCreate64::decode(buf);
+                return Ok(Some(MetadataRecord::MultiXact(MultiXactRecord::Create64(
+                    xlrec,
+                ))));
+            }
             let xlrec = XlMultiXactCreate::decode(buf);
             return Ok(Some(MetadataRecord::MultiXact(MultiXactRecord::Create(
                 xlrec,
             ))));
         } else if info == pg_constants::XLOG_MULTIXACT_TRUNCATE_ID {
+            if pg_version >= PgMajorVersion::PG19 {
+                let xlrec = XlMultiXactTruncate64::decode(buf);
+                return Ok(Some(MetadataRecord::MultiXact(MultiXactRecord::Truncate64(
+                    xlrec,
+                ))));
+            }
             let xlrec = XlMultiXactTruncate::decode(buf);
             return Ok(Some(MetadataRecord::MultiXact(MultiXactRecord::Truncate(
                 xlrec,

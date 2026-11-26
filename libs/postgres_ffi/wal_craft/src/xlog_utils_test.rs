@@ -229,10 +229,14 @@ pub fn test_update_next_multixid() {
     assert_eq!(checkpoint.nextMulti, 0xffff00ff);
     assert_eq!(checkpoint.nextMultiOffset, 0xfffe00ff);
 
+    // MultiXactOffset is 32 bits wide up to PostgreSQL 18, and wraps around; since 19 it is
+    // 64 bits wide and does not.
+    let offset_wraps = MultiXactOffset::BITS == 32;
+
     // Wraparound
     checkpoint.update_next_multixid(1, 900);
     assert_eq!(checkpoint.nextMulti, 1);
-    assert_eq!(checkpoint.nextMultiOffset, 900);
+    assert_eq!(checkpoint.nextMultiOffset, if offset_wraps { 900 } else { 0xfffe00ff });
 
     // Wraparound nextMulti to 0.
     //
@@ -249,7 +253,7 @@ pub fn test_update_next_multixid() {
     // Wraparound nextMultiOffset to 0
     checkpoint.update_next_multixid(0, 0);
     assert_eq!(checkpoint.nextMulti, 0);
-    assert_eq!(checkpoint.nextMultiOffset, 0);
+    assert_eq!(checkpoint.nextMultiOffset, if offset_wraps { 0 } else { 0xfffe00ff });
 }
 
 #[test]
