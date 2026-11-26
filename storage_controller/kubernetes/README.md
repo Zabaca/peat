@@ -19,7 +19,7 @@ A pageserver's re-attach, one transaction on Postgres, becomes one write per ten
 
 The controller reads every object at start, as it reads every row today. Reads that must be current (a generation, a timeline's membership) go to the API server, never to a cache.
 
-Within one controller, writes to one tenant's object are taken one at a time (a lock per tenant), so a tenant with many shards reconciling at once does not spend its retries on conflicts with itself; the compare-and-swap stays the guard against a second controller. A pageserver's generation validation (a batch of its shards) is answered from one list of the Tenant objects labelled with that pageserver (below), not one read per tenant.
+Within one controller, writes to one tenant's object are taken one at a time (a lock per tenant), so a tenant with many shards reconciling at once does not spend its retries on conflicts with itself; the compare-and-swap stays the guard against a second controller. A pageserver's generation validation (a batch of its shards) is answered from one list of the Tenant objects labelled with that pageserver (below), not one read per tenant; a shard whose tenant does not carry that pageserver's label is answered invalid, since its latest generation was issued to another pageserver.
 
 ### Writes that touch more than one object
 
@@ -40,8 +40,8 @@ The controller's command line, beside Neon's:
 | `--database-url`, or `DATABASE_URL` | With `postgres` only: the database's address, as in Neon. Given with `kubernetes`, the controller refuses to start, so a setting is never silently ignored. |
 | `--records-namespace <namespace>` | With `kubernetes` only: the namespace holding the record objects. Default: the namespace of the pod's own service account (`/var/run/secrets/kubernetes.io/serviceaccount/namespace`), and outside a pod the current namespace of the kubeconfig. |
 | `--records-copy-storage <TOML>` | With `kubernetes` only: where the copy of the records goes (below), in the syntax of the pageserver's `remote_storage` setting, for example `{ bucket_name = "records", bucket_region = "auto", endpoint = "https://store.example.com", prefix_in_bucket = "storage-controller/" }`. Required unless `--dev`. |
-| `--records-start-without-copy` | With `kubernetes` only: start once without reading the copy (below). |
-| `--records-accept-missing <kind/name,...>` | With `kubernetes` only: start although these records, in the copy, have no object and no deletion mark (below). |
+| `--records-start-without-copy <until>` | With `kubernetes` only, a last resort chosen by a person: start without reading the copy, before the time given (below). |
+| `--records-accept-deleted <kind/name,...>` | With `kubernetes` only: start although these records, in the copy, have no object and no deletion mark, taking them as deleted (below). |
 
 The API server is reached as any Kubernetes client reaches it: in a pod, through the pod's service account; outside one, through the kubeconfig named by `KUBECONFIG` (or `~/.kube/config`).
 
@@ -49,43 +49,73 @@ The copy's bucket is reached the way the pageserver reaches its own: `AWS_ACCESS
 
 ### Records that went back, or went missing
 
-The controller is the only writer of its records, so in a healthy cluster the objects are always at or ahead of the copy in the bucket, which follows them within a second. The checks below compare the two, record by record, and treat any record where the copy is ahead as a sign that the cluster's store (etcd) was taken back to an older snapshot, or lost objects. They hold for every kind:
+The controller is the only writer of its records, so in a healthy cluster the objects are always at or ahead of the copy in the bucket (below), which follows them within a second. If the cluster's store (etcd) is taken back to an older snapshot, or loses objects, records go back or go missing, and a controller that went on would hand out generations already held. To see it, the controller keeps three things beside the records, and one rule for each record it reads.
 
-- **Revisions.** Every write of an object adds one to its revision, kept in its annotation `storagecontroller.peat.zabaca.com/revision` (an integer), and the copy holds each record's revision. An object whose revision is below the copy's **went back**.
-- **Highest-ever values.** The copy keeps, for good, the highest generation it has seen for any shard of each tenant and the highest safekeeper membership generation it has seen for each timeline, even after the tenant or timeline is gone. A tenant all of whose shards are below its highest-ever generation, or a timeline whose membership generation is below its highest-ever one, **went back**, whatever its revision says (an older object brought back after its deletion, or a tenant made again under the same id).
-- **Deletion marks.** Before it deletes an object, the controller writes a mark for it in the bucket (`deleted/<kind>/<name>`, with the revision deleted), and the delete waits for it; while the bucket cannot be written, deletes fail and their callers retry. Marks are kept 30 days. A record the copy holds with no object and no mark **went missing**; an object back at or below the revision its mark records **went back**. (Without the mark, the second between a delete and the copy's next write would look the same.)
-- A record with an object and none in the copy is the copy behind (a change in its last second, or made while the bucket was unreachable), and is fine.
+- **Revisions.** Every write of an object adds one to its revision, an integer in its annotation `storagecontroller.peat.zabaca.com/revision`. It is the controller's own count, not the API server's `resourceVersion`, which goes back with an etcd restore and is not a number to compare. The copy holds each record's revision. A create starts above the name's deletion mark, above the copy's revision for the name, and above any revision this controller has seen for it, so a name made again (a pageserver id registered again after its hard delete, a tenant's tenant-wide Timeline object, a tenant made again under its id) never starts at or below what it once was. An object with no revision, or one that is not an integer, fails closed: the controller refuses it, naming it.
+- **Highest-ever values.** The copy keeps, for good, the highest generation it has seen for any shard of each tenant, and the highest safekeeper membership generation it has seen for each timeline, after the tenant or timeline is gone. They are the floor a restore sets every generation above (below), the one place they are used. They are not a start check: revisions and marks, which are kept for good, already see every record that went back, and a tenant made again under its id (as Neon's restore of a tenant to an earlier time does) starts its generations afresh, as on Postgres, without reading as gone back.
+- **Deletion marks.** Before it deletes an object, the controller writes a mark in the bucket (`deleted/<kind>/<name>`) holding the revision it read and is deleting, and the delete waits for it: while the bucket cannot be written, deletes fail and their callers retry. A delete that loses its compare-and-swap to another write reads again and, if it still deletes, writes a new mark first. Marks are kept as long as the highest-ever values, for good, so a deleted record brought back by however old a snapshot is still seen for what it is. A mark **covers** a missing record only when its revision is at or above the copy's revision for that record; a mark below it is stale (the record was written again after the mark, by a write that won over the delete), and covers nothing.
+
+How a record reads, compared with the copy and the marks:
+
+| What is found | Means | Done |
+|---|---|---|
+| An object below the copy's revision for it, or below its mark's | went back | refused |
+| An object exactly at its mark's revision | a delete decided and not done (a crash between the mark and the delete) | finished: the delete is done |
+| An object above its mark's revision | a delete that lost to a later write; the mark is stale | nothing: the object lives |
+| A record in the copy, no object, a mark covering it | deleted | nothing |
+| A record in the copy, no object, no mark covering it | went missing | refused |
+| An object with no record in the copy | the copy behind (a change in its last second, or made while the bucket was unreachable) | nothing |
+| A MetadataHealth entry whose shard is gone | a removal half done (above) | the entry is removed |
 
 What going back or going missing would do, kind by kind, and so why each refuses:
 
 | Record | Went back | Went missing |
 |---|---|---|
-| Tenant | A shard's generation is below what was issued: the next attach hands out a generation a pageserver already held, and two pageservers can own the same data. | A pageserver that re-attaches is told nothing of it and drops it, and the copy's next write would lose the only record of its stripe size, placement and config. |
+| Tenant | A shard's generation is below what was issued: the next attach hands out a generation a pageserver already held, and two pageservers can own the same data. A validation answered from it can let a pageserver that lost the shard delete what the new owner reads. | A pageserver that re-attaches is told nothing of it and drops it, and the copy's next write would lose the only record of its stripe size, placement and config. |
 | Timeline | A membership generation is below what the safekeepers hold: the next change issues that generation again with another set, and the timeline's safekeepers split. A lost pending operation leaves a safekeeper unreconciled. | Its membership, and the operations owed to its safekeepers, are lost. |
 | MetadataHealth | The scrubber's findings undone. | The same. |
 | Pageserver | A scheduling policy or a tombstone undone: a deleted pageserver could register again. | A registered pageserver forgotten. |
 | Safekeeper | A scheduling policy undone. | A safekeeper forgotten. |
 | Leader | A handover undone. | The same. |
 
-### What the controller refuses at start, with `kubernetes`
+### At start, with `kubernetes`
+
+The controller refuses to start, naming why, when:
 
 - **The kinds are missing:** the namespace answers 404 for any of the six kinds (the install file has not applied `crds.yaml`).
 - **No copy is configured,** outside `--dev`.
-- **The copy cannot be read.** The copy is how the controller knows its objects did not go back, so it starts only once it has read it (or found that the bucket holds none yet), as a controller on Postgres starts only once it reaches its database. The cost: a controller that restarts while the bucket is unreachable stays down until it is reachable again, and meanwhile no tenant or timeline is made, branched, migrated or attached, and a pageserver that restarts cannot re-attach. A running controller is not stopped by the bucket: its copy's writes wait, and its deletes fail until the bucket is back (their marks are written first). `--records-start-without-copy` overrides this for one start: the controller starts, writes no copy until it has read one, and when it has, runs the checks below and exits if they fail.
+- **The copy or its marks cannot be read.** The copy is how the controller knows its objects did not go back, so it starts only once it has read it (or found that the bucket holds none yet), as a controller on Postgres starts only once it reaches its database. The cost: a controller that restarts while the bucket is unreachable stays down until it is reachable again, and meanwhile no tenant or timeline is made, branched, migrated or attached, and a pageserver that restarts cannot re-attach.
 - **The records are empty but the copy is not:** a cluster whose objects were all lost would otherwise start from nothing, tell every pageserver to drop its tenants, and later hand out generations the store has already seen. On a first install both are empty and the controller starts.
-- **A record went back or went missing** (above). The refusal lists every such record. The way on is a restore (below). For records that went missing because they were deleted while the bucket was being replaced or by hand, `--records-accept-missing <kind/name,...>` starts with exactly those listed, writing their deletion marks; nothing that went back can be accepted.
+- **A record went back or went missing** (the table above), listing every such record. The way on is a restore (below). For records that went missing because they were deleted without a mark (by hand, or while the bucket was being replaced), `--records-accept-deleted <kind/name,...>` starts with exactly those listed, writing their marks. Such a mark is flagged as accepted, and restore's check that the store holds nothing the copy lacks does not count it. Nothing that went back can be accepted.
 
-These checks run before the controller does anything else with its records, and before a controller started as a candidate asks the current leader to step down, so a candidate that would refuse never takes the leader down first.
+The order of the reads: the copy, then the objects, then the marks. A controller started as a candidate runs these checks while the leader still writes; read in this order, the leader's writes meanwhile can only put objects ahead of the copy and add marks, never make a record look as if it went back. The checks run before anything else is done with the records, and before a candidate asks the current leader to step down, so a candidate that would refuse never takes the leader down first. They only read: what the table says to do (finishing a delete, removing an orphaned health entry, writing accepted marks) is done once the controller leads, after it reads again, and before it loads the records to work from.
 
-A running controller that sees a record go back in the watch its copy is written from (an object whose revision is lower than before) stops writing the copy and exits with an error, so its restart meets the checks above. A record deleted without a mark (by hand, or by another program) is not written out of the copy: the copy keeps it, the metric below shows the copy behind, and the next start refuses until it is accepted or restored.
+`--records-start-without-copy <until>` starts without the copy, as a last resort chosen by a person; the operator never sets it. Its value is a time at most 24 hours ahead, and after that time the flag is refused, so a flag left in a manifest stops the next start rather than staying. The checks that need no copy (the kinds) still run before the step-down request. Until the copy is read, a restored etcd goes unseen, and a generation handed out meanwhile may repeat one a pageserver held. The controller writes no copy until it has read one; it tries every 10 seconds, and when it reads it, runs the checks above against it and exits if they fail.
+
+### While it runs
+
+Every object the controller reads, for a write or not (a generation validation, a list, a re-attach), is compared with the highest revision this controller has seen for that name (from the copy and marks at start and on taking over, its own reads and writes, and the watch the copy is written from). An object below it, or below the name's mark, or absent though this controller saw it and no mark covers it, means the store went back under it (an object at its mark is this controller's own delete under way, or one the start finished): it writes nothing more and exits with an error, so its restart meets the checks above. A running controller is not stopped by the bucket: its copy's writes wait, and its deletes fail (above).
+
+A record deleted without a mark (by hand, or by another program) is not written out of the copy: the copy keeps it, the metric below shows the copy behind, and the next start refuses until it is accepted or restored.
+
+### The four cases, walked
+
+Each holds for all six kinds, since the rules above do not depend on the kind.
+
+- **etcd restored while the controller runs.** Its next read of a restored object (the read before a write, a validation, a list, or the watch's list after the restore breaks it) is below what it saw, so it exits before writing or answering from it; the restart compares every object with the copy. An object it has not read since its start is compared at that restart.
+- **A crash between the mark, the delete and the copy's write.** Mark written, delete not done: the object is at its mark's revision, and the next leader finishes the delete. Delete done, copy not yet written: the mark covers the record. A delete that lost its compare-and-swap, then a crash before it read again: the object is above its stale mark and lives; if the store later loses it, the copy's later revision means the stale mark does not cover it, and the start refuses. A Tenant removed and its health entries not yet: the entries are removed once the controller leads.
+- **A name made again.** It starts above its mark, the copy's revision and this controller's, so it never reads as gone back, and its old mark no longer covers it (the copy's revision for it is now above the mark). Its generations start afresh, as on Postgres: the record that held the old ones was deleted with the tenant's data on the pageservers.
+- **Two controllers in a handover.** The candidate checks before asking the leader to step down, reading the copy, then the objects, then the marks, so the leader's writes meanwhile only move things forward. Only the leader writes the copy: a leader asked to step down finishes the copy's write under way before it answers, and the new leader, on taking over, reads the copy's highest-ever values and the marks again and merges them into its own before it writes, so no value is lost between the two.
+
+What is left: a change made in the last second before both the controller stops and etcd is taken back can be lost from both the objects and the copy, which follows them within that second. The metric below bounds it.
 
 ## The copy in the bucket
 
-Within a second of each change to the records, the controller writes the copy: one document holding every record with its revision, the highest-ever generations (above) and the time it was written. It follows the API server rather than its own writes (it watches every kind and writes what the API server holds), so a leader and a candidate during a handover write what the API server held a moment before, not what each believes.
+Within a second of each change to the records, the leader writes the copy: one document holding every record with its revision, the highest-ever values, and the time it was written. It follows the API server rather than its own writes: it watches every kind and writes what the API server holds. The marks are objects of their own beside it, written before each delete (above).
 
-The controller does not write a document that goes back from the copy it last read or wrote: one in which a record's revision is lower, or which lacks a record that copy holds and no mark covers, or which holds no records over one that holds some (from inside the cluster, every record gone at once is what a loss looks like, and the copy is then the way back). Such a document is not written, and the metric below shows the copy falling behind. The comparison is with the copy this controller last read or wrote, not a conditional write: two controllers writing at once each write what the API server held, and the checks at the next start compare against whichever wrote last.
+The leader does not write a document that goes back from the copy it last read or wrote: one in which a record's revision is lower, which lacks a record that copy holds and no mark covers, or which holds no records over one that holds some (from inside the cluster, every record gone at once is what a loss looks like, and the copy is then the way back). Such a document is not written, and the metric below shows the copy falling behind. The comparison is with what this controller last read or wrote, not a conditional write on the bucket; the handover's order (above) is what keeps two controllers from writing at once.
 
-The copy is one document rewritten whole, so its size and the time to write it grow with the records. The scale measure (P7) records both, and the metric below, at 10,000 tenants; if a write takes more than a second there, the copy is split into parts.
+The copy is one document rewritten whole, so its size and write time grow with the records, and the highest-ever values and the marks grow with every tenant and timeline ever deleted. The scale measure records the copy's size, its write time and the metric below at 10,000 tenants, and the count of highest-ever values and marks after churn; if a write takes more than a second there, the copy is split into parts.
 
 The copy is for one use: rebuilding the records after the cluster's objects are lost or undone, with `storcon_records restore` (below). Its layout under the prefix is the controller's and may change between releases; read it through the tool.
 
@@ -95,7 +125,7 @@ The controller's database metrics (`storage_controller_database_query_latency`, 
 
 ## The object kinds
 
-Group `storagecontroller.peat.zabaca.com`, version `v1alpha1`, all namespaced, all in the category `peat-records` (`kubectl get peat-records` lists them). The group is its own, apart from the operator's kinds (which sit under `peat.zabaca.com`), so permissions can be given for one without the other: the controller's account touches only these, and a person or tool allowed to manage databases is not thereby allowed to edit generations. Every field sits under `spec`; there is no `status`. Field names are camelCase; integers are JSON numbers; times are RFC 3339 strings in UTC with microseconds, as Postgres keeps them.
+Group `storagecontroller.peat.zabaca.com`, version `v1alpha1`, all namespaced, all in the category `peat-records` (`kubectl get peat-records` lists them). Every object carries the revision annotation (above). The group is its own, apart from the operator's kinds (which sit under `peat.zabaca.com`), so permissions can be given for one without the other: the controller's account touches only these, and a person or tool allowed to manage databases is not thereby allowed to edit generations. Every field sits under `spec`; there is no `status`. Field names are camelCase; integers are JSON numbers; times are RFC 3339 strings in UTC with microseconds, as Postgres keeps them.
 
 Three fields keep the exact text Neon's Postgres backend stores, so a copy between the two stores is exact and needs no translation: a tenant shard's `placementPolicy`, `config` and `schedulingPolicy` (each the JSON text serde writes, for example `"\"Active\""` for a shard's scheduling policy and `"{\"Attached\":1}"` for a placement), and an import's `shardStatuses` (JSON text; Postgres keeps it as `jsonb`, which reorders keys, so every comparison reads it as JSON, not as text).
 
@@ -122,11 +152,11 @@ One per tenant, named by the tenant id (32 lowercase hex characters). Neon's `te
 | `.schedulingPolicy` | string, JSON text | `scheduling_policy` |
 | `.preferredAzId` | string, absent when none | `preferred_az_id` |
 
-Label kept by the controller: `generation.storagecontroller.peat.zabaca.com/<node id>: "true"` for every pageserver that some shard's `generationPageserver` names, so a re-attach lists only that pageserver's tenants.
+Kept by the controller: the label `generation.storagecontroller.peat.zabaca.com/<node id>: "true"` for every pageserver that some shard's `generationPageserver` names, so a re-attach and a validation list only that pageserver's tenants; and the revision annotation.
 
 ### MetadataHealth
 
-One per tenant, named by the tenant id. Neon's `metadata_health` rows of that tenant (the scrubber's findings), kept apart from the generations so the scrubber's writes never conflict with them.
+One per tenant, named by the tenant id. Neon's `metadata_health` rows of that tenant (the scrubber's findings), kept apart from the generations so the scrubber's writes never conflict with them. Kept by the controller: the revision annotation.
 
 | Field | Type | Neon's column |
 |---|---|---|
@@ -159,11 +189,11 @@ One per timeline that has a record on safekeepers, pending safekeeper operations
 | `spec.import` | object, absent when there is no import | `timeline_imports` |
 | `.shardStatuses` | string, JSON text | `shard_statuses` |
 
-Label kept by the controller: `storagecontroller.peat.zabaca.com/tenant: <tenant id>`.
+Kept by the controller: the label `storagecontroller.peat.zabaca.com/tenant: <tenant id>`, and the revision annotation.
 
 ### Pageserver
 
-One per pageserver, named `pageserver-<node id>`, deleted ones included (a tombstone keeps a deleted node from registering again). Neon's `nodes` table.
+One per pageserver, named `pageserver-<node id>`, deleted ones included (a tombstone keeps a deleted node from registering again). Neon's `nodes` table. Kept by the controller: the revision annotation.
 
 | Field | Type | Neon's column |
 |---|---|---|
@@ -178,7 +208,7 @@ One per pageserver, named `pageserver-<node id>`, deleted ones included (a tombs
 
 ### Safekeeper
 
-One per safekeeper, named `safekeeper-<id>`. Neon's `safekeepers` table.
+One per safekeeper, named `safekeeper-<id>`. Neon's `safekeepers` table. Kept by the controller: the revision annotation.
 
 | Field | Type | Neon's column |
 |---|---|---|
@@ -192,7 +222,7 @@ One per safekeeper, named `safekeeper-<id>`. Neon's `safekeepers` table.
 
 ### Leader
 
-At most one, named `leader`. Neon's `controllers` table: the controller that leads, so a new controller started as a candidate asks it to step down and then takes its place by a compare-and-swap, Neon's own handover.
+At most one, named `leader`. Neon's `controllers` table: the controller that leads, so a new controller started as a candidate asks it to step down and then takes its place by a compare-and-swap, Neon's own handover. Kept by the controller: the revision annotation.
 
 | Field | Type | Neon's column |
 |---|---|---|
@@ -215,7 +245,7 @@ It names a store as one of:
 
 - `postgres`: the database at `--database-url` or `DATABASE_URL`, as the controller reaches it. The tool runs the controller's migrations on an empty database before writing to it.
 - `kubernetes`: the objects in `--records-namespace`, reached as the controller reaches them.
-- `bucket`: the copy at `--records-copy-storage`, with the controller's credentials. Read only, by `dump`, `compare` and `restore`. Health entries whose shard is gone are dropped from every store's records as they are read (Postgres has none), so they never reach a comparison or a write.
+- `bucket`: the copy at `--records-copy-storage`, with the controller's credentials, and its marks. Read by `dump`, `compare` and `restore`, and written only by `restore` and `copy --to kubernetes`, which write a new copy of what they wrote (keeping the marks and the highest-ever values). Health entries whose shard is gone are dropped from every store's records as they are read (Postgres has none), so they never reach a comparison or a write.
 
 Commands:
 
@@ -223,23 +253,24 @@ Commands:
 storcon_records dump --from <store> [--output <file>]
 storcon_records compare <store> <store> [--json]
 storcon_records copy --from <postgres|kubernetes> --to <postgres|kubernetes> [--replace]
+                     [--records-copy-storage <TOML>]   (required with --to kubernetes)
 storcon_records scan-generations --pageserver-storage <TOML> --output <file>
 storcon_records restore --to <postgres|kubernetes> --records-copy-storage <TOML> --generations <file>
-                        [--replace] [--generation-margin <N>] [--accept-missing <list>]
+                        [--replace] [--generation-margin <N>] [--leave-out <list>]
                         [--accept-silent-safekeepers]
 ```
 
 Every command that writes also takes `--controller-address <url>` and `--assume-stopped` (below).
 
 - **`dump`** writes every record as one JSON document (to the file, or to standard output), sorted, the same shape from any store, for a baseline or a person to read.
-- **`compare`** reads both stores and reports every difference, field by field (with `--json`, as one JSON document), and the count of each kind on each side. Revisions are not records, and are not compared.
-- **`copy`** writes every record of one store into the other, then compares them. The destination must be empty unless `--replace` is given, which first removes what it holds. Generations are copied as they are. Into `kubernetes` it also needs `--records-copy-storage`: it writes every object at a revision above any the copy in the bucket holds, then writes a new copy of what it wrote (keeping the old copy's highest-ever values where they are higher), so the controller's start checks meet a copy that matches its objects.
-- **`scan-generations`** reads the pageservers' store (`--pageserver-storage`, the pageservers' own `remote_storage` setting, run with the pageservers' credentials in its environment) and writes, per tenant shard found under `tenants/`, the highest generation any object under the shard's prefix carries as its suffix, and the timelines found under it; with the storage it scanned (the setting, which holds no secret) and when. It is a separate step so that each run holds one store's key: the pageservers' bucket and the records' copy have keys of their own. Run it after every pageserver is stopped, so nothing writes a newer generation after the scan.
+- **`compare`** reads both stores and reports every difference, field by field (with `--json`, as one JSON document), and the count of each kind on each side. Revisions and marks are not records, and are not compared.
+- **`copy`** writes every record of one store into the other, then compares them. The destination must be empty unless `--replace` is given, which first removes what it holds. Generations are copied as they are. Into `kubernetes` it also needs `--records-copy-storage`: it writes every object at a revision above both the copy's revision and the mark's for its name, with its generations as the source holds them, then writes a new copy of what it wrote (keeping the highest-ever values and the marks), so the controller's start checks meet a copy that matches its objects.
+- **`scan-generations`** reads the pageservers' store (`--pageserver-storage`, the pageservers' own `remote_storage` setting, run with the pageservers' credentials in its environment) and writes, per tenant shard found under `tenants/`, the highest generation any object under the shard's prefix carries as its suffix, and the timelines found under it; with the storage it scanned (the setting, which holds no secret) and when it scanned. It is a separate step so that each run holds one store's key: the pageservers' bucket and the records' copy have keys of their own. Run it after every pageserver is stopped, so nothing writes a newer generation after the scan.
 - **`restore`** rebuilds the records from the bucket's copy (run with the copy's credentials), for a platform whose objects were lost or undone. Every shard of a tenant gets one generation, `--generation-margin` (1000 by default) above the highest of the copy's generations for the tenant's shards, the highest the copy has ever seen for the tenant, and the highest `scan-generations` found for any of its shards. The margin covers generations handed out after the copy was last written and never used to write. A shard the copy holds without a generation, of which the store holds nothing, stays without one. So no generation a pageserver held can be issued again.
-  - It refuses a generations file that looks like the wrong storage: one in which none of the copy's shards that hold a generation appears (a mistyped bucket or prefix).
-  - It refuses when the store shows what the copy does not hold (a copy behind during a bucket outage), and no deletion mark covers it: a tenant with data in the store and no record in the copy; a tenant split further in the store (a shard count higher than any the copy holds for it); or, for a tenant of which the copy holds a safekeeper membership for some timeline, a timeline in the store with no record in the copy (a branch made while the bucket was unreachable). It lists them; `--accept-missing` with that list goes on without them (they keep their data in the store, with no record).
+  - It prints the storage and the time the generations file records, and refuses a file that looks like the wrong storage (none of the copy's shards that hold a generation appears in it: a mistyped bucket or prefix) or is older than the copy's last write (a scan from before the loss).
+  - It refuses when the store shows what the copy does not hold (a copy behind during a bucket outage), and no deletion mark covers it (an accepted mark does not count): a tenant with data in the store and no record in the copy; a tenant split further in the store (a shard count higher than any the copy holds for it); or, for a tenant of which the copy holds a safekeeper membership for some timeline, a timeline in the store with no record in the copy (a branch made while the bucket was unreachable). It lists them; `--leave-out` with that list goes on without them (they keep their data in the store, with no record).
   - Each timeline's safekeeper membership is read back from its safekeepers (with `SAFEKEEPER_JWT_TOKEN` when they need one), keeping the highest configuration any holds. It refuses unless every member of the timeline's current and next sets answers: a silent one may hold a higher configuration (generation g+1 with a set X while the copy says g), and the controller's next change would issue g+1 again with another set Y, splitting the timeline's safekeepers. `--accept-silent-safekeepers` goes on for those timelines with the copy's set and its membership generation raised by `--generation-margin`, so the next change issues a generation above any a silent member can hold; the real risk left is that the kept set is not the set that last held the timeline's data, so the change that follows must be checked by hand against the safekeepers once they answer.
-  - It writes every Kubernetes object at a revision above any in the copy, and then a new copy of what it wrote (keeping the old copy's highest-ever values, and its marks), so the controller's start checks pass on what the restore made and nothing else.
+  - It writes every Kubernetes object at a revision above both the copy's revision and the mark's for its name, and then a new copy of what it wrote (keeping the highest-ever values, raised to what it wrote, and the marks), so the controller's start checks pass on what the restore made and nothing else.
   - Then it reads what it wrote back and compares it with the copy, the shards' generations and the timelines' membership generations aside.
 
 **The check that nothing still runs.** Every command that writes refuses (exit 3) while the controller runs, and `restore` and `copy --to postgres` also while any pageserver runs:
@@ -248,4 +279,4 @@ Every command that writes also takes `--controller-address <url>` and `--assume-
 - Pageservers are found at the HTTP ports their records name (for `restore`, the copy's). `restore` needs them stopped because a pageserver still attached could hold a generation the copy does not show; `copy --to postgres` is the way back of a move to Kubernetes, which the move's plan runs with every pageserver stopped. `copy --to kubernetes`, the move itself, runs with the pageservers up: with the controller stopped no generation can be issued, so the records cannot change under the copy.
 - An address that accepts a connection runs; one that refuses it (the host answers, the port is closed, as a Service with no pod behind it does) is stopped; one that does not resolve, or does not answer within 5 seconds, is unknown, and unknown refuses. A name that vanished with its pod (a StatefulSet pod's own name) is unknown too: check that the pod is gone, then give `--assume-stopped`, which skips the whole check and says so in the output.
 
-Exit codes: 0 done (for `compare`, the stores are equal); 1 an error; 2 a wrong command line; 3 refused, with the reason (something runs or may run, the destination is not empty without `--replace`, the store holds what the copy does not, or a safekeeper did not answer); 4 the stores differ (from `compare`, or from the check at the end of `copy` and `restore`).
+Exit codes: 0 done (for `compare`, the stores are equal); 1 an error; 2 a wrong command line; 3 refused, with the reason (something runs or may run, the destination is not empty without `--replace`, the generations file is of the wrong storage or older than the copy, the store holds what the copy does not, or a safekeeper did not answer); 4 the stores differ (from `compare`, or from the check at the end of `copy` and `restore`).
