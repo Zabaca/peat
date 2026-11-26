@@ -661,6 +661,7 @@ impl KubernetesStore {
         .await
     }
 
+    #[tracing::instrument(skip_all, fields(node_id))]
     pub(crate) async fn re_attach(
         &self,
         input_node_id: NodeId,

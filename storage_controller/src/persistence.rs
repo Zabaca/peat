@@ -62,9 +62,9 @@ use crate::timeline_import::{TimelineImport, TimelineImportUpdateError};
 /// ## Where the records are kept
 ///
 /// This type is the one interface the rest of the controller uses; each operation is passed to
-/// the store the records are kept in: Postgres ([`postgres::PostgresStore`], Neon's code
-/// unchanged, and the default) or Kubernetes objects ([`kubernetes::KubernetesStore`], described
-/// in `storage_controller/kubernetes/README.md`).
+/// the store the records are kept in: Postgres (`PostgresStore` in `persistence/postgres.rs`,
+/// Neon's code unchanged, and the default) or Kubernetes objects (`KubernetesStore` in
+/// `persistence/kubernetes.rs`, described in `storage_controller/kubernetes/README.md`).
 pub struct Persistence {
     store: Store,
 }
@@ -390,7 +390,6 @@ impl Persistence {
     /// When a tenant invokes the /re-attach API, this function is responsible for doing an efficient
     /// batched increment of the generations of all tenants whose generation_pageserver is equal to
     /// the node that called /re-attach.
-    #[tracing::instrument(skip_all, fields(node_id))]
     pub(crate) async fn re_attach(
         &self,
         input_node_id: NodeId,
