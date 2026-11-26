@@ -36,6 +36,12 @@ const DATABASE_URL_ENV: &str = "STORCON_TEST_DATABASE_URL";
 const REQUIRED_ENV: &str = "STORCON_TEST_STORES_REQUIRED";
 
 async fn kubernetes_store() -> Option<Persistence> {
+    Some(kubernetes_store_and_client().await?.0)
+}
+
+/// The Kubernetes store, with a client and namespace of its own for a test to change the objects
+/// behind the store's back (as an etcd restore would).
+async fn kubernetes_store_and_client() -> Option<(Persistence, kube::Client, String)> {
     let path = std::env::var(KUBECONFIG_ENV).ok()?;
     let kubeconfig = kube::config::Kubeconfig::read_from(&path).expect("read the test kubeconfig");
     let mut config = kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
@@ -56,9 +62,9 @@ async fn kubernetes_store() -> Option<Persistence> {
         .create(&PostParams::default(), &ns)
         .await
         .expect("make the test's namespace");
-    let p = Persistence::kubernetes_with_client(client, namespace);
+    let p = Persistence::kubernetes_with_client(client.clone(), namespace.clone()).do_not_exit();
     p.migration_run().await.expect("the kinds are installed");
-    Some(p)
+    Some((p, client, namespace))
 }
 
 async fn postgres_store() -> Option<Persistence> {
@@ -547,17 +553,22 @@ async fn leader() {
     on_every_store(|p| async move {
         let mut trace = Vec::new();
         trace.push(format!("{:?}", p.get_leader().await.unwrap()));
+        // A time finer than a microsecond, as a Linux clock gives
         let first = ControllerPersistence {
             address: "http://controller-0.example.com:1234".to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: chrono::DateTime::parse_from_rfc3339("2026-11-26T12:00:00.123456789Z")
+                .unwrap()
+                .to_utc(),
         };
         p.update_leader(None, first.clone()).await.unwrap();
         let stored = p.get_leader().await.unwrap().unwrap();
         trace.push(stored.address.clone());
-        // Postgres keeps the time to the microsecond, and so does the Kubernetes store
+        // Postgres keeps the time to the whole microsecond below, and so does the Kubernetes store
         assert_eq!(
-            stored.started_at,
-            kubernetes::objects::round_to_micros(first.started_at)
+            stored
+                .started_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            "2026-11-26T12:00:00.123456000Z"
         );
         let second = ControllerPersistence {
             address: "http://controller-1.example.com:1234".to_string(),
@@ -954,7 +965,7 @@ async fn concurrent_attaches_never_share_a_generation() {
                     unreachable!()
                 };
                 Arc::new(Persistence {
-                    store: Store::Kubernetes(k.second_client()),
+                    store: Store::Kubernetes(Box::new(k.second_client())),
                 })
             }
             _ => p.clone(),
@@ -1040,4 +1051,200 @@ async fn re_attach_races_attaches() {
             }
         }
     }
+}
+
+fn raw<S: kubernetes::objects::Spec>(
+    client: &kube::Client,
+    namespace: &str,
+) -> Api<kubernetes::objects::Object<S>> {
+    Api::namespaced(client.clone(), namespace)
+}
+
+/// Put an object back as it was when `old` was read, as an etcd restore would (its revision
+/// annotation included), over whatever it holds now.
+async fn put_back<S: kubernetes::objects::Spec>(
+    client: &kube::Client,
+    namespace: &str,
+    old: &kubernetes::objects::Object<S>,
+) {
+    let api = raw::<S>(client, namespace);
+    let now = api.get(old.name()).await.unwrap();
+    let mut back = old.clone();
+    back.metadata.resource_version = now.metadata.resource_version;
+    api.replace(old.name(), &PostParams::default(), &back)
+        .await
+        .unwrap();
+}
+
+/// The cluster's store taken back under a running controller: a pageserver's re-attach arrives
+/// before anything else, reads the tenant as it was before its migration, and would raise its
+/// generation to the one the migration already handed out. The read is refused (the controller
+/// would exit), and nothing is written; so is a plain read, and a list that misses an object.
+#[tokio::test]
+async fn a_read_of_records_that_went_back_writes_nothing() {
+    use kubernetes::objects::{PageserverSpec, TenantSpec};
+    let Some((p, client, ns)) = kubernetes_store_and_client().await else {
+        return;
+    };
+    p.insert_node(&node(1)).await.unwrap();
+    p.insert_node(&node(2)).await.unwrap();
+    p.insert_tenant_shards(vec![shard_row(TENANT, 0, 0)])
+        .await
+        .unwrap();
+    let id = shard_id(TENANT, 0, 0);
+    p.increment_generation(id, NodeId(1)).await.unwrap();
+    // The snapshot: generation 1, on pageserver 1
+    let snapshot = raw::<TenantSpec>(&client, &ns).get(TENANT).await.unwrap();
+    // The migration: generation 2, on pageserver 2
+    assert_eq!(
+        p.increment_generation(id, NodeId(2)).await.unwrap(),
+        Generation::new(2)
+    );
+    put_back(&client, &ns, &snapshot).await;
+
+    let err = p.re_attach(NodeId(1)).await.unwrap_err();
+    assert!(err.to_string().contains("went back"), "{err}");
+    let now = raw::<TenantSpec>(&client, &ns).get(TENANT).await.unwrap();
+    assert_eq!(
+        now.spec.shards[0].generation,
+        Some(1),
+        "nothing was written"
+    );
+    assert_eq!(now.revision().unwrap(), snapshot.revision().unwrap());
+    assert!(p.tenant_generations(tenant(TENANT)).await.is_err());
+    assert!(
+        p.shard_generations_on(NodeId(1), [id].iter())
+            .await
+            .is_err()
+    );
+
+    // An object gone that this controller saw and did not delete
+    raw::<PageserverSpec>(&client, &ns)
+        .delete("pageserver-2", &Default::default())
+        .await
+        .unwrap();
+    let Err(err) = p.list_nodes().await else {
+        panic!("a list that misses a seen object is refused");
+    };
+    assert!(err.to_string().contains("pageserver-2 is gone"), "{err}");
+}
+
+/// A tenant whose generation label went back (lost while its revision did not move) is left out
+/// of its pageserver's re-attach: that costs the tenant its attachment until it is reconciled,
+/// never a generation handed out twice.
+#[tokio::test]
+async fn a_re_attach_missing_a_tenant_costs_only_availability() {
+    use kubernetes::objects::{GENERATION_LABEL_PREFIX, TenantSpec};
+    let Some((p, client, ns)) = kubernetes_store_and_client().await else {
+        return;
+    };
+    p.insert_node(&node(1)).await.unwrap();
+    for t in [TENANT, TENANT_B] {
+        p.insert_tenant_shards(vec![shard_row(t, 0, 0)])
+            .await
+            .unwrap();
+        p.increment_generation(shard_id(t, 0, 0), NodeId(1))
+            .await
+            .unwrap();
+    }
+    let api = raw::<TenantSpec>(&client, &ns);
+    let mut obj = api.get(TENANT).await.unwrap();
+    obj.metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .retain(|k, _| !k.starts_with(GENERATION_LABEL_PREFIX));
+    api.replace(TENANT, &PostParams::default(), &obj)
+        .await
+        .unwrap();
+
+    let reattached = p.re_attach(NodeId(1)).await.unwrap();
+    assert_eq!(
+        reattached.keys().copied().collect::<Vec<_>>(),
+        vec![shard_id(TENANT_B, 0, 0)]
+    );
+    let g = p.tenant_generations(tenant(TENANT)).await.unwrap()[0].generation;
+    assert_eq!(g, Some(Generation::new(1)), "left as it was");
+    // Its next attach takes a generation above every one it had
+    assert_eq!(
+        p.increment_generation(shard_id(TENANT, 0, 0), NodeId(1))
+            .await
+            .unwrap(),
+        Generation::new(2)
+    );
+    // And a validation by that pageserver answers it only once it carries the label again
+    let valid = p
+        .shard_generations_on(NodeId(1), [shard_id(TENANT, 0, 0)].iter())
+        .await
+        .unwrap();
+    assert_eq!(
+        valid,
+        vec![(shard_id(TENANT, 0, 0), Some(Generation::new(2)))]
+    );
+}
+
+/// A name made again (a pageserver id registered again after its hard delete) starts above the
+/// revision it was deleted at, so it never reads as gone back.
+#[tokio::test]
+async fn a_name_made_again_starts_above_its_old_revision() {
+    use kubernetes::objects::PageserverSpec;
+    let Some((p, client, ns)) = kubernetes_store_and_client().await else {
+        return;
+    };
+    p.insert_node(&node(5)).await.unwrap();
+    p.set_tombstone(NodeId(5)).await.unwrap();
+    let deleted_at = raw::<PageserverSpec>(&client, &ns)
+        .get("pageserver-5")
+        .await
+        .unwrap()
+        .revision()
+        .unwrap();
+    p.delete_node(NodeId(5)).await.unwrap();
+    p.insert_node(&node(5)).await.unwrap();
+    let again = raw::<PageserverSpec>(&client, &ns)
+        .get("pageserver-5")
+        .await
+        .unwrap();
+    assert_eq!(again.revision().unwrap(), deleted_at + 1);
+    assert_eq!(p.list_nodes().await.unwrap().len(), 1);
+}
+
+/// A health entry left without its shard (a tenant removed, its health entries' second write not
+/// yet landed) is not read, and is removed at start.
+#[tokio::test]
+async fn a_health_entry_without_its_shard_is_dropped_and_swept() {
+    use kubernetes::objects::{MetadataHealthSpec, TenantSpec};
+    let Some((p, client, ns)) = kubernetes_store_and_client().await else {
+        return;
+    };
+    p.insert_tenant_shards(vec![shard_row(TENANT, 0, 0)])
+        .await
+        .unwrap();
+    p.insert_tenant_shards(vec![shard_row(TENANT_B, 0, 0)])
+        .await
+        .unwrap();
+    // The Tenant removed, its health entries not (behind the store's back)
+    raw::<TenantSpec>(&client, &ns)
+        .delete(TENANT, &Default::default())
+        .await
+        .unwrap();
+    let fresh = Persistence::kubernetes_with_client(client.clone(), ns.clone()).do_not_exit();
+    let health = fresh.list_metadata_health_records().await.unwrap();
+    assert_eq!(
+        health
+            .iter()
+            .map(|h| h.tenant_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![TENANT_B]
+    );
+    fresh.migration_run().await.unwrap();
+    let left: Vec<String> = raw::<MetadataHealthSpec>(&client, &ns)
+        .list(&Default::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|o| o.spec.tenant_id)
+        .collect();
+    assert_eq!(left, vec![TENANT_B.to_string()]);
 }

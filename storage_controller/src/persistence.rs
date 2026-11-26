@@ -72,7 +72,7 @@ pub struct Persistence {
 /// Where the records are kept.
 enum Store {
     Postgres(postgres::PostgresStore),
-    Kubernetes(kubernetes::KubernetesStore),
+    Kubernetes(Box<kubernetes::KubernetesStore>),
 }
 
 /// Legacy format, for use in JSON compat objects in test environment
@@ -213,10 +213,22 @@ impl Persistence {
         Ok(Self::kubernetes_with_client(client, namespace))
     }
 
+    /// Return an error when the Kubernetes store finds its records went back, instead of exiting
+    /// the process (tests).
+    #[cfg(test)]
+    pub(crate) fn do_not_exit(mut self) -> Self {
+        if let Store::Kubernetes(store) = &mut self.store {
+            store.do_not_exit();
+        }
+        self
+    }
+
     /// Keep the records in Kubernetes objects in `namespace`, through `client`.
     pub(crate) fn kubernetes_with_client(client: kube::Client, namespace: String) -> Self {
         Self {
-            store: Store::Kubernetes(kubernetes::KubernetesStore::new(client, namespace)),
+            store: Store::Kubernetes(Box::new(kubernetes::KubernetesStore::new(
+                client, namespace,
+            ))),
         }
     }
 
@@ -431,6 +443,21 @@ impl Persistence {
         match &self.store {
             Store::Postgres(store) => store.shard_generations(tenant_shard_ids).await,
             Store::Kubernetes(store) => store.shard_generations(tenant_shard_ids).await,
+        }
+    }
+
+    /// A pageserver's generation validation: the generations of shards whose latest generation
+    /// was issued to `node_id`. On Postgres, the same query as [`Self::shard_generations`]; the
+    /// Kubernetes store answers from one list of that pageserver's tenants, and leaves out a
+    /// shard whose latest generation went to another pageserver (answered invalid).
+    pub(crate) async fn shard_generations_on(
+        &self,
+        node_id: NodeId,
+        tenant_shard_ids: impl Iterator<Item = &TenantShardId>,
+    ) -> Result<Vec<(TenantShardId, Option<Generation>)>, DatabaseError> {
+        match &self.store {
+            Store::Postgres(store) => store.shard_generations(tenant_shard_ids).await,
+            Store::Kubernetes(store) => store.shard_generations_on(node_id, tenant_shard_ids).await,
         }
     }
 

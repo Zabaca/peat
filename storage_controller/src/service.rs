@@ -2541,12 +2541,18 @@ impl Service {
     ) -> Result<ValidateResponse, DatabaseError> {
         // Fast in-memory check: we may reject validation on anything that doesn't match our
         // in-memory generation for a shard
+        // The pageservers the passing shards' generations were issued to: a validation comes from
+        // one pageserver, so normally one, and the records are then read by that pageserver.
+        let mut issued_to = HashSet::new();
         let in_memory_result = {
             let mut in_memory_result = Vec::new();
             let locked = self.inner.read().unwrap();
             for req_tenant in validate_req.tenants {
                 if let Some(tenant_shard) = locked.tenants.get(&req_tenant.id) {
                     let valid = tenant_shard.generation == Some(Generation::new(req_tenant.r#gen));
+                    if valid {
+                        issued_to.insert(*tenant_shard.intent.get_attached());
+                    }
                     tracing::info!(
                         "handle_validate: {}(gen {}): valid={valid} (latest {:?})",
                         req_tenant.id,
@@ -2575,14 +2581,17 @@ impl Service {
 
         // Database calls to confirm validity for anything that passed the in-memory check.  We must do this
         // in case of controller split-brain, where some other controller process might have incremented the generation.
-        let db_generations = self
-            .persistence
-            .shard_generations(
-                in_memory_result
-                    .iter()
-                    .filter_map(|i| if i.2 { Some(&i.0) } else { None }),
-            )
-            .await?;
+        let passing = in_memory_result
+            .iter()
+            .filter_map(|i| if i.2 { Some(&i.0) } else { None });
+        let db_generations = match issued_to.into_iter().collect::<Vec<_>>().as_slice() {
+            [Some(node)] => {
+                self.persistence
+                    .shard_generations_on(*node, passing)
+                    .await?
+            }
+            _ => self.persistence.shard_generations(passing).await?,
+        };
         let db_generations = db_generations.into_iter().collect::<HashMap<_, _>>();
 
         let mut response = ValidateResponse {

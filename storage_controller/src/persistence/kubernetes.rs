@@ -12,6 +12,7 @@ pub(crate) mod objects;
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use kube::api::{Api, DeleteParams, ListParams, PostParams, Preconditions};
@@ -54,6 +55,115 @@ const LIST_PAGE: u32 = 500;
 pub(crate) struct KubernetesStore {
     client: kube::Client,
     namespace: String,
+    guard: Guard,
+    /// One write at a time per object within this controller (`storage_controller/kubernetes/
+    /// README.md`): a tenant with many shards reconciling at once queues here instead of
+    /// spending its retries on conflicts with itself. The compare-and-swap still guards against
+    /// a second controller.
+    locks: Locks,
+}
+
+type Locks = std::sync::Mutex<HashMap<(&'static str, String), Arc<tokio::sync::Mutex<()>>>>;
+
+/// What this controller has seen of each object, so a read that finds one older than that (the
+/// cluster's store taken back under it) is caught before anything is written or answered from it.
+struct Guard {
+    seen: std::sync::Mutex<HashMap<(&'static str, String), Seen>>,
+    /// Exit the process when the records went back (the controller); tests only record it.
+    exit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Seen {
+    revision: u64,
+    /// Deleted by this controller, at `revision`.
+    deleted: bool,
+}
+
+impl Guard {
+    fn went_back(&self, what: String) -> DatabaseError {
+        tracing::error!(
+            "The records went back under this controller ({what}): the cluster's store was \
+             taken back, or lost objects. Writing nothing more and exiting; the next start \
+             checks every record against the copy."
+        );
+        if self.exit {
+            std::process::exit(1);
+        }
+        DatabaseError::Logical(format!("the records went back: {what}"))
+    }
+
+    /// Check an object read from the API server against what this controller has seen of it.
+    fn observe<S: Spec>(&self, obj: &Object<S>) -> DatabaseResult<()> {
+        let revision = obj.revision()?;
+        let mut seen = self.seen.lock().unwrap();
+        let key = (S::KIND, obj.name().to_string());
+        if let Some(s) = seen.get(&key).copied() {
+            if revision < s.revision || (s.deleted && revision == s.revision) {
+                drop(seen);
+                return Err(self.went_back(format!(
+                    "{} {} at revision {revision}, this controller saw {}{}",
+                    S::KIND,
+                    key.1,
+                    s.revision,
+                    if s.deleted { " and deleted it" } else { "" }
+                )));
+            }
+        }
+        seen.insert(
+            key,
+            Seen {
+                revision,
+                deleted: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Check that an object found absent was not one this controller saw and did not delete.
+    fn observe_absent<S: Spec>(&self, name: &str) -> DatabaseResult<()> {
+        let seen = self
+            .seen
+            .lock()
+            .unwrap()
+            .get(&(S::KIND, name.to_string()))
+            .copied();
+        match seen {
+            Some(s) if !s.deleted => Err(self.went_back(format!(
+                "{} {name} is gone, this controller saw it at revision {} and did not delete it",
+                S::KIND,
+                s.revision
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    fn wrote<S: Spec>(&self, name: &str, revision: u64, deleted: bool) {
+        self.seen
+            .lock()
+            .unwrap()
+            .insert((S::KIND, name.to_string()), Seen { revision, deleted });
+    }
+
+    /// The revision a new object of this name starts at: above any this controller has seen.
+    fn next_revision<S: Spec>(&self, name: &str) -> u64 {
+        self.seen
+            .lock()
+            .unwrap()
+            .get(&(S::KIND, name.to_string()))
+            .map_or(1, |s| s.revision + 1)
+    }
+
+    /// Names of one kind this controller saw and did not delete.
+    fn live<S: Spec>(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((kind, _), s)| *kind == S::KIND && !s.deleted)
+            .map(|((_, name), _)| name.clone())
+            .collect()
+    }
 }
 
 /// What a read-modify-write does with the object it read.
@@ -68,7 +178,21 @@ enum Write<S> {
 
 impl KubernetesStore {
     pub(crate) fn new(client: kube::Client, namespace: String) -> Self {
-        KubernetesStore { client, namespace }
+        KubernetesStore {
+            client,
+            namespace,
+            guard: Guard {
+                seen: Default::default(),
+                exit: true,
+            },
+            locks: Default::default(),
+        }
+    }
+
+    /// Return an error when the records went back, instead of exiting (tests).
+    #[cfg(test)]
+    pub(crate) fn do_not_exit(&mut self) {
+        self.guard.exit = false;
     }
 
     /// Another store on the same records, as a second controller would have.
@@ -77,6 +201,11 @@ impl KubernetesStore {
         KubernetesStore {
             client: self.client.clone(),
             namespace: self.namespace.clone(),
+            guard: Guard {
+                seen: Default::default(),
+                exit: false,
+            },
+            locks: Default::default(),
         }
     }
 
@@ -107,7 +236,12 @@ impl KubernetesStore {
     }
 
     async fn get<S: Spec>(&self, name: &str) -> DatabaseResult<Option<Object<S>>> {
-        Ok(self.api::<S>().get_opt(name).await?)
+        let obj = self.api::<S>().get_opt(name).await?;
+        match &obj {
+            Some(o) => self.guard.observe(o)?,
+            None => self.guard.observe_absent::<S>(name)?,
+        }
+        Ok(obj)
     }
 
     /// Every object of a kind (matching `labels`, when given), read page by page.
@@ -126,7 +260,54 @@ impl KubernetesStore {
                 _ => break,
             }
         }
+        for o in &out {
+            self.guard.observe(o)?;
+        }
+        if labels.is_none() {
+            // A list of every object also shows the ones that are gone.
+            let listed: std::collections::HashSet<&str> = out.iter().map(|o| o.name()).collect();
+            for name in self.guard.live::<S>() {
+                if !listed.contains(name.as_str()) {
+                    self.guard.observe_absent::<S>(&name)?;
+                }
+            }
+        }
         Ok(out)
+    }
+
+    /// A create or replace asking the API server for strict field validation, so a field the
+    /// installed kinds do not know is refused rather than dropped.
+    async fn write_strict<S: Spec>(
+        &self,
+        name: Option<&str>,
+        obj: &Object<S>,
+    ) -> Result<Object<S>, kube::Error> {
+        let request = kube::core::Request::new(<Object<S> as kube::Resource>::url_path(
+            &(),
+            Some(&self.namespace),
+        ));
+        let body = serde_json::to_vec(obj).map_err(kube::Error::SerdeError)?;
+        let pp = PostParams::default();
+        let mut req = match name {
+            None => request.create(&pp, body),
+            Some(name) => request.replace(name, &pp, body),
+        }
+        .map_err(kube::Error::BuildRequest)?;
+        let uri = req.uri().to_string();
+        let sep = if uri.contains('?') { '&' } else { '?' };
+        *req.uri_mut() = format!("{uri}{sep}fieldValidation=Strict")
+            .parse()
+            .expect("a valid URI");
+        self.client.request::<Object<S>>(req).await
+    }
+
+    fn lock<S: Spec>(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap()
+            .entry((S::KIND, name.to_string()))
+            .or_default()
+            .clone()
     }
 
     /// The one way an object is written: read it, decide, and write what was decided as a
@@ -138,23 +319,25 @@ impl KubernetesStore {
         mut decide: impl FnMut(Option<&S>) -> DatabaseResult<(Write<S>, R)>,
     ) -> DatabaseResult<R> {
         let api = self.api::<S>();
+        let lock = self.lock::<S>(name);
+        let _held = lock.lock().await;
         for _ in 0..MAX_RETRIES {
-            let current = api.get_opt(name).await?;
+            let current = self.get::<S>(name).await?;
             let (write, result) = decide(current.as_ref().map(|o| &o.spec))?;
             let written = match (write, current) {
                 (Write::Keep, _) | (Write::Delete, None) => return Ok(result),
                 (Write::Put(spec), None) => {
-                    let obj = Object::new(name, spec);
-                    match api.create(&PostParams::default(), &obj).await {
-                        Ok(stored) => check_stored(name, &obj.spec, &stored.spec),
+                    let obj = Object::new(name, spec, self.guard.next_revision::<S>(name));
+                    match self.write_strict(None, &obj).await {
+                        Ok(stored) => self.stored(name, &obj, &stored),
                         Err(e) if is_conflict(&e) => continue,
                         Err(e) => Err(e.into()),
                     }
                 }
                 (Write::Put(spec), Some(current)) => {
-                    let obj = current.with_spec(spec);
-                    match api.replace(name, &PostParams::default(), &obj).await {
-                        Ok(stored) => check_stored(name, &obj.spec, &stored.spec),
+                    let obj = current.with_spec(spec)?;
+                    match self.write_strict(Some(name), &obj).await {
+                        Ok(stored) => self.stored(name, &obj, &stored),
                         Err(e) if is_conflict(&e) || is_not_found(&e) => continue,
                         Err(e) => Err(e.into()),
                     }
@@ -168,7 +351,10 @@ impl KubernetesStore {
                         ..Default::default()
                     };
                     match api.delete(name, &params).await {
-                        Ok(_) => Ok(()),
+                        Ok(_) => {
+                            self.guard.wrote::<S>(name, current.revision()?, true);
+                            Ok(())
+                        }
                         Err(e) if is_conflict(&e) || is_not_found(&e) => continue,
                         Err(e) => Err(e.into()),
                     }
@@ -180,6 +366,26 @@ impl KubernetesStore {
             "{} {name}: still conflicting after {MAX_RETRIES} attempts",
             S::KIND
         )))
+    }
+
+    /// What the API server stored, checked against what was sent, and noted as seen.
+    fn stored<S: Spec>(
+        &self,
+        name: &str,
+        sent: &Object<S>,
+        stored: &Object<S>,
+    ) -> DatabaseResult<()> {
+        check_stored(name, &sent.spec, &stored.spec)?;
+        let revision = stored.revision()?;
+        if revision != sent.revision()? {
+            return Err(DatabaseError::Logical(format!(
+                "{} {name} was stored at revision {revision}, not the {} written",
+                S::KIND,
+                sent.revision()?
+            )));
+        }
+        self.guard.wrote::<S>(name, revision, false);
+        Ok(())
     }
 
     /// The controller's check at start, in place of the Postgres store's migrations: every
@@ -203,6 +409,7 @@ impl KubernetesStore {
         readable::<PageserverSpec>(self).await?;
         readable::<SafekeeperSpec>(self).await?;
         readable::<LeaderSpec>(self).await?;
+        self.sweep_orphaned_health().await?;
         tracing::info!(
             "Records are kept in Kubernetes objects in namespace {}",
             self.namespace
@@ -444,11 +651,11 @@ impl KubernetesStore {
     pub(crate) async fn delete_tenant(&self, del_tenant_id: TenantId) -> DatabaseResult<()> {
         let name = del_tenant_id.to_string();
         self.measured(DatabaseOperation::DeleteTenant, async {
-            // The health records go first (Postgres removes them with the shards), so none is
-            // left without its shard.
-            self.modify::<MetadataHealthSpec, ()>(&name, |_| Ok((Write::Delete, ())))
-                .await?;
+            // The Tenant, then its health entries in a second write (Postgres removes them with
+            // the shards by a cascade); until that lands, readers drop entries whose shard is gone.
             self.modify::<TenantSpec, ()>(&name, |_| Ok((Write::Delete, ())))
+                .await?;
+            self.modify::<MetadataHealthSpec, ()>(&name, |_| Ok((Write::Delete, ())))
                 .await
         })
         .await
@@ -646,6 +853,34 @@ impl KubernetesStore {
                 }
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// A pageserver's generation validation: its shards' generations, read from one list of
+    /// the tenants labelled with that pageserver. A shard of a tenant without the label is left
+    /// out, so it is answered invalid: its latest generation was issued to another pageserver.
+    pub(crate) async fn shard_generations_on(
+        &self,
+        node_id: NodeId,
+        tenant_shard_ids: impl Iterator<Item = &TenantShardId>,
+    ) -> Result<Vec<(TenantShardId, Option<Generation>)>, DatabaseError> {
+        let wanted: Vec<TenantShardId> = tenant_shard_ids.copied().collect();
+        self.measured(DatabaseOperation::ShardGenerations, async {
+            let tenants: HashMap<String, TenantSpec> = self
+                .list::<TenantSpec>(Some(&generation_label(node_id.0 as i64)))
+                .await?
+                .into_iter()
+                .map(|o| (o.spec.tenant_id.clone(), o.spec))
+                .collect();
+            Ok(wanted
+                .into_iter()
+                .filter_map(|id| {
+                    let t = tenants.get(&id.tenant_id.to_string())?;
+                    let s = t.shards.iter().find(|s| s.key() == shard_key(&id))?;
+                    Some((id, s.generation.map(|g| Generation::new(g as u32))))
+                })
+                .collect())
         })
         .await
     }
@@ -988,23 +1223,68 @@ impl KubernetesStore {
         .await
     }
 
+    /// The shards that exist, by tenant: a health entry whose shard is gone (a removal whose
+    /// second write has not landed) is not a record.
+    async fn existing_shards(&self) -> DatabaseResult<HashMap<String, Vec<(i32, i32)>>> {
+        Ok(self
+            .list::<TenantSpec>(None)
+            .await?
+            .into_iter()
+            .map(|o| {
+                let keys = o.spec.shards.iter().map(|s| s.key()).collect();
+                (o.spec.tenant_id, keys)
+            })
+            .collect())
+    }
+
     async fn health_where(
         &self,
         keep: impl Fn(&HealthRecord) -> bool,
     ) -> DatabaseResult<Vec<MetadataHealthPersistence>> {
+        let shards = self.existing_shards().await?;
         Ok(self
             .list::<MetadataHealthSpec>(None)
             .await?
             .into_iter()
             .flat_map(|o| {
+                let have = shards.get(&o.spec.tenant_id).cloned().unwrap_or_default();
                 o.spec
                     .shards
                     .iter()
-                    .filter(|s| keep(s))
+                    .filter(|s| have.contains(&s.key()) && keep(s))
                     .map(|s| s.to_row(&o.spec.tenant_id))
                     .collect::<Vec<_>>()
             })
             .collect())
+    }
+
+    /// Remove the health entries whose shard is gone, left by a removal interrupted between its
+    /// two writes.
+    async fn sweep_orphaned_health(&self) -> DatabaseResult<()> {
+        let shards = self.existing_shards().await?;
+        for o in self.list::<MetadataHealthSpec>(None).await? {
+            let have = shards.get(&o.spec.tenant_id).cloned().unwrap_or_default();
+            if o.spec.shards.iter().all(|s| have.contains(&s.key())) {
+                continue;
+            }
+            self.modify::<MetadataHealthSpec, ()>(o.name(), |cur| {
+                let Some(cur) = cur else {
+                    return Ok((Write::Keep, ()));
+                };
+                let mut spec = cur.clone();
+                spec.shards.retain(|s| have.contains(&s.key()));
+                Ok((
+                    if spec.shards.is_empty() {
+                        Write::Delete
+                    } else {
+                        Write::Put(spec)
+                    },
+                    (),
+                ))
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn list_metadata_health_records(
