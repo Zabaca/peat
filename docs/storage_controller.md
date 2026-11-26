@@ -73,6 +73,8 @@ The resource requirements for the database are very low: a single CPU core and 1
 
 Set the URL to the database using the `--database-url` CLI option.
 
+Peat: on Kubernetes the records can instead be kept in objects of the cluster itself, with no database beside it (`--records kubernetes`); [`storage_controller/kubernetes/README.md`](../storage_controller/kubernetes/README.md) says how.
+
 There is no need to run migrations manually: the storage controller automatically applies migrations
 when it starts up.
 

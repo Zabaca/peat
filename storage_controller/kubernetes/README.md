@@ -4,12 +4,13 @@ The storage controller keeps a small set of durable records: every tenant's shar
 
 This file is the contract between the controller and whatever installs it (Peat's operator, or a person): the settings, the object kinds and their fields, the permissions the controller's account needs, and the command line of the copy tool. A change to anything here is a pull request that changes this file.
 
-**Status:** the contract only. Nothing in this file is implemented yet; until it is, the controller runs on Postgres alone, as Neon's does. Postgres stays the controller's default when no setting names a store.
+**Status:** the store itself is built: `--records kubernetes` keeps every record in these objects (`storage_controller/src/persistence/kubernetes.rs`), held to the Postgres store's behaviour by tests that run every operation on both (`storage_controller/src/persistence/tests.rs`, with [`test-stores.sh`](test-stores.sh)). The copy in the bucket and the copy tool are not built yet, so until they are the controller accepts `--records kubernetes` only with `--dev`, and `--records-copy-storage` does not exist. Postgres stays the controller's default when no setting names a store.
 
 Files beside this one:
 
 - [`crds.yaml`](crds.yaml): the six object kinds (CustomResourceDefinitions), for an install file to apply before the controller starts.
 - [`rbac.yaml`](rbac.yaml): the Role the controller's account needs, and its RoleBinding, with the namespace and account name as placeholders.
+- [`test-stores.sh`](test-stores.sh): starts a Kubernetes API server with these kinds and a Postgres server, for the tests of both stores.
 
 ## Why the records can move
 

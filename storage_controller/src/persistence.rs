@@ -1,5 +1,8 @@
+pub(crate) mod kubernetes;
 mod postgres;
 pub(crate) mod split_state;
+#[cfg(test)]
+mod tests;
 use std::collections::HashMap;
 use std::io::Write;
 use std::str::FromStr;
@@ -59,8 +62,9 @@ use crate::timeline_import::{TimelineImport, TimelineImportUpdateError};
 /// ## Where the records are kept
 ///
 /// This type is the one interface the rest of the controller uses; each operation is passed to
-/// the store the records are kept in. Today that is Postgres alone ([`postgres::PostgresStore`],
-/// Neon's code unchanged); `storage_controller/kubernetes/README.md` describes the second store.
+/// the store the records are kept in: Postgres ([`postgres::PostgresStore`], Neon's code
+/// unchanged, and the default) or Kubernetes objects ([`kubernetes::KubernetesStore`], described
+/// in `storage_controller/kubernetes/README.md`).
 pub struct Persistence {
     store: Store,
 }
@@ -68,6 +72,7 @@ pub struct Persistence {
 /// Where the records are kept.
 enum Store {
     Postgres(postgres::PostgresStore),
+    Kubernetes(kubernetes::KubernetesStore),
 }
 
 /// Legacy format, for use in JSON compat objects in test environment
@@ -90,6 +95,27 @@ pub(crate) enum DatabaseError {
     Migration(String),
     #[error("CAS error: {0}")]
     Cas(String),
+    /// A request to the Kubernetes API server failed (the Kubernetes store only).
+    #[error(transparent)]
+    Kubernetes(#[from] kube::Error),
+    /// A record that must be new already exists: the Kubernetes store's counterpart of a unique
+    /// violation on Postgres.
+    #[error("Already exists: {0}")]
+    Exists(String),
+}
+
+impl DatabaseError {
+    /// The record being inserted already exists: a unique violation on Postgres, or
+    /// [`DatabaseError::Exists`] from the Kubernetes store.
+    pub(crate) fn is_unique_violation(&self) -> bool {
+        matches!(
+            self,
+            DatabaseError::Query(diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _,
+            )) | DatabaseError::Exists(_)
+        )
+    }
 }
 
 #[derive(measured::FixedCardinalityLabel, Copy, Clone)]
@@ -179,6 +205,21 @@ impl Persistence {
         }
     }
 
+    /// Keep the records in Kubernetes objects in `namespace`, or, when none is given, in the
+    /// namespace of the pod's service account (outside a pod, the kubeconfig's current one).
+    pub async fn new_kubernetes(namespace: Option<String>) -> anyhow::Result<Self> {
+        let client = kube::Client::try_default().await?;
+        let namespace = namespace.unwrap_or_else(|| client.default_namespace().to_string());
+        Ok(Self::kubernetes_with_client(client, namespace))
+    }
+
+    /// Keep the records in Kubernetes objects in `namespace`, through `client`.
+    pub(crate) fn kubernetes_with_client(client: kube::Client, namespace: String) -> Self {
+        Self {
+            store: Store::Kubernetes(kubernetes::KubernetesStore::new(client, namespace)),
+        }
+    }
+
     /// A helper for use during startup, where we would like to tolerate concurrent restarts of the
     /// database and the storage controller, therefore the database might not be available right away
     pub async fn await_connection(
@@ -192,6 +233,7 @@ impl Persistence {
     pub(crate) async fn migration_run(&self) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.migration_run().await,
+            Store::Kubernetes(store) => store.migration_run().await,
         }
     }
 
@@ -201,6 +243,7 @@ impl Persistence {
     pub(crate) async fn insert_node(&self, node: &Node) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.insert_node(node).await,
+            Store::Kubernetes(store) => store.insert_node(node).await,
         }
     }
 
@@ -208,12 +251,14 @@ impl Persistence {
     pub(crate) async fn list_nodes(&self) -> DatabaseResult<Vec<NodePersistence>> {
         match &self.store {
             Store::Postgres(store) => store.list_nodes().await,
+            Store::Kubernetes(store) => store.list_nodes().await,
         }
     }
 
     pub(crate) async fn list_tombstones(&self) -> DatabaseResult<Vec<NodePersistence>> {
         match &self.store {
             Store::Postgres(store) => store.list_tombstones().await,
+            Store::Kubernetes(store) => store.list_tombstones().await,
         }
     }
 
@@ -224,6 +269,11 @@ impl Persistence {
     ) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => {
+                store
+                    .update_node_scheduling_policy(input_node_id, input_scheduling)
+                    .await
+            }
+            Store::Kubernetes(store) => {
                 store
                     .update_node_scheduling_policy(input_node_id, input_scheduling)
                     .await
@@ -249,6 +299,16 @@ impl Persistence {
                     )
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .update_node_on_registration(
+                        input_node_id,
+                        input_https_port,
+                        input_grpc_addr,
+                        input_grpc_port,
+                    )
+                    .await
+            }
         }
     }
 
@@ -258,12 +318,14 @@ impl Persistence {
     pub(crate) async fn set_tombstone(&self, del_node_id: NodeId) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.set_tombstone(del_node_id).await,
+            Store::Kubernetes(store) => store.set_tombstone(del_node_id).await,
         }
     }
 
     pub(crate) async fn delete_node(&self, del_node_id: NodeId) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.delete_node(del_node_id).await,
+            Store::Kubernetes(store) => store.delete_node(del_node_id).await,
         }
     }
 
@@ -277,6 +339,7 @@ impl Persistence {
     ) -> DatabaseResult<Vec<TenantShardPersistence>> {
         match &self.store {
             Store::Postgres(store) => store.load_active_tenant_shards().await,
+            Store::Kubernetes(store) => store.load_active_tenant_shards().await,
         }
     }
 
@@ -287,6 +350,7 @@ impl Persistence {
     ) -> DatabaseResult<Vec<TenantShardPersistence>> {
         match &self.store {
             Store::Postgres(store) => store.load_tenant(filter_tenant_id).await,
+            Store::Kubernetes(store) => store.load_tenant(filter_tenant_id).await,
         }
     }
 
@@ -298,6 +362,7 @@ impl Persistence {
     ) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.insert_tenant_shards(shards).await,
+            Store::Kubernetes(store) => store.insert_tenant_shards(shards).await,
         }
     }
 
@@ -306,6 +371,7 @@ impl Persistence {
     pub(crate) async fn delete_tenant(&self, del_tenant_id: TenantId) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.delete_tenant(del_tenant_id).await,
+            Store::Kubernetes(store) => store.delete_tenant(del_tenant_id).await,
         }
     }
 
@@ -319,6 +385,7 @@ impl Persistence {
     ) -> DatabaseResult<HashMap<TenantShardId, Generation>> {
         match &self.store {
             Store::Postgres(store) => store.re_attach(input_node_id).await,
+            Store::Kubernetes(store) => store.re_attach(input_node_id).await,
         }
     }
 
@@ -332,6 +399,7 @@ impl Persistence {
     ) -> anyhow::Result<Generation> {
         match &self.store {
             Store::Postgres(store) => store.increment_generation(tenant_shard_id, node_id).await,
+            Store::Kubernetes(store) => store.increment_generation(tenant_shard_id, node_id).await,
         }
     }
 
@@ -349,6 +417,7 @@ impl Persistence {
     ) -> Result<Vec<ShardGenerationState>, DatabaseError> {
         match &self.store {
             Store::Postgres(store) => store.tenant_generations(filter_tenant_id).await,
+            Store::Kubernetes(store) => store.tenant_generations(filter_tenant_id).await,
         }
     }
 
@@ -361,6 +430,7 @@ impl Persistence {
     ) -> Result<Vec<(TenantShardId, Option<Generation>)>, DatabaseError> {
         match &self.store {
             Store::Postgres(store) => store.shard_generations(tenant_shard_ids).await,
+            Store::Kubernetes(store) => store.shard_generations(tenant_shard_ids).await,
         }
     }
 
@@ -390,6 +460,17 @@ impl Persistence {
                     )
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .update_tenant_shard(
+                        tenant,
+                        input_placement_policy,
+                        input_config,
+                        input_generation,
+                        input_scheduling_policy,
+                    )
+                    .await
+            }
         }
     }
 
@@ -400,12 +481,14 @@ impl Persistence {
     ) -> DatabaseResult<Vec<(TenantShardId, Option<AvailabilityZone>)>> {
         match &self.store {
             Store::Postgres(store) => store.set_tenant_shard_preferred_azs(preferred_azs).await,
+            Store::Kubernetes(store) => store.set_tenant_shard_preferred_azs(preferred_azs).await,
         }
     }
 
     pub(crate) async fn detach(&self, tenant_shard_id: TenantShardId) -> anyhow::Result<()> {
         match &self.store {
             Store::Postgres(store) => store.detach(tenant_shard_id).await,
+            Store::Kubernetes(store) => store.detach(tenant_shard_id).await,
         }
     }
 
@@ -417,6 +500,11 @@ impl Persistence {
     ) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => {
+                store
+                    .begin_shard_split(old_shard_count, split_tenant_id, parent_to_children)
+                    .await
+            }
+            Store::Kubernetes(store) => {
                 store
                     .begin_shard_split(old_shard_count, split_tenant_id, parent_to_children)
                     .await
@@ -436,6 +524,11 @@ impl Persistence {
                     .complete_shard_split(split_tenant_id, old_shard_count, new_shard_count)
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .complete_shard_split(split_tenant_id, old_shard_count, new_shard_count)
+                    .await
+            }
         }
     }
 
@@ -448,6 +541,11 @@ impl Persistence {
     ) -> DatabaseResult<AbortShardSplitStatus> {
         match &self.store {
             Store::Postgres(store) => {
+                store
+                    .abort_shard_split(split_tenant_id, new_shard_count)
+                    .await
+            }
+            Store::Kubernetes(store) => {
                 store
                     .abort_shard_split(split_tenant_id, new_shard_count)
                     .await
@@ -471,6 +569,11 @@ impl Persistence {
                     .update_metadata_health_records(healthy_records, unhealthy_records, now)
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .update_metadata_health_records(healthy_records, unhealthy_records, now)
+                    .await
+            }
         }
     }
 
@@ -481,6 +584,7 @@ impl Persistence {
     ) -> DatabaseResult<Vec<MetadataHealthPersistence>> {
         match &self.store {
             Store::Postgres(store) => store.list_metadata_health_records().await,
+            Store::Kubernetes(store) => store.list_metadata_health_records().await,
         }
     }
 
@@ -491,6 +595,7 @@ impl Persistence {
     ) -> DatabaseResult<Vec<MetadataHealthPersistence>> {
         match &self.store {
             Store::Postgres(store) => store.list_unhealthy_metadata_health_records().await,
+            Store::Kubernetes(store) => store.list_unhealthy_metadata_health_records().await,
         }
     }
 
@@ -502,6 +607,7 @@ impl Persistence {
     ) -> DatabaseResult<Vec<MetadataHealthPersistence>> {
         match &self.store {
             Store::Postgres(store) => store.list_outdated_metadata_health_records(earlier).await,
+            Store::Kubernetes(store) => store.list_outdated_metadata_health_records(earlier).await,
         }
     }
 
@@ -510,6 +616,7 @@ impl Persistence {
     pub(crate) async fn get_leader(&self) -> DatabaseResult<Option<ControllerPersistence>> {
         match &self.store {
             Store::Postgres(store) => store.get_leader().await,
+            Store::Kubernetes(store) => store.get_leader().await,
         }
     }
 
@@ -523,6 +630,7 @@ impl Persistence {
     ) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.update_leader(prev, new).await,
+            Store::Kubernetes(store) => store.update_leader(prev, new).await,
         }
     }
 
@@ -530,6 +638,7 @@ impl Persistence {
     pub(crate) async fn list_safekeepers(&self) -> DatabaseResult<Vec<SafekeeperPersistence>> {
         match &self.store {
             Store::Postgres(store) => store.list_safekeepers().await,
+            Store::Kubernetes(store) => store.list_safekeepers().await,
         }
     }
 
@@ -539,6 +648,7 @@ impl Persistence {
     ) -> Result<(), DatabaseError> {
         match &self.store {
             Store::Postgres(store) => store.safekeeper_upsert(record).await,
+            Store::Kubernetes(store) => store.safekeeper_upsert(record).await,
         }
     }
 
@@ -553,6 +663,11 @@ impl Persistence {
                     .set_safekeeper_scheduling_policy(id_, scheduling_policy_)
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .set_safekeeper_scheduling_policy(id_, scheduling_policy_)
+                    .await
+            }
         }
     }
 
@@ -561,6 +676,7 @@ impl Persistence {
     pub(crate) async fn activate_safekeeper(&self, id_: i64) -> Result<Option<()>, DatabaseError> {
         match &self.store {
             Store::Postgres(store) => store.activate_safekeeper(id_).await,
+            Store::Kubernetes(store) => store.activate_safekeeper(id_).await,
         }
     }
 
@@ -568,6 +684,7 @@ impl Persistence {
     pub(crate) async fn insert_timeline(&self, entry: TimelinePersistence) -> DatabaseResult<bool> {
         match &self.store {
             Store::Postgres(store) => store.insert_timeline(entry).await,
+            Store::Kubernetes(store) => store.insert_timeline(entry).await,
         }
     }
 
@@ -579,6 +696,7 @@ impl Persistence {
     ) -> DatabaseResult<bool> {
         match &self.store {
             Store::Postgres(store) => store.update_timeline_unsafe(entry).await,
+            Store::Kubernetes(store) => store.update_timeline_unsafe(entry).await,
         }
     }
 
@@ -609,6 +727,18 @@ impl Persistence {
                     )
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .update_timeline_membership(
+                        tenant_id,
+                        timeline_id,
+                        new_generation,
+                        sk_set,
+                        new_sk_set,
+                        reconcile_requests,
+                    )
+                    .await
+            }
         }
     }
 
@@ -624,6 +754,11 @@ impl Persistence {
     ) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => {
+                store
+                    .update_cplane_notified_generation(tenant_id, timeline_id, generation)
+                    .await
+            }
+            Store::Kubernetes(store) => {
                 store
                     .update_cplane_notified_generation(tenant_id, timeline_id, generation)
                     .await
@@ -647,6 +782,11 @@ impl Persistence {
                     .update_sk_set_notified_generation(tenant_id, timeline_id, generation)
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .update_sk_set_notified_generation(tenant_id, timeline_id, generation)
+                    .await
+            }
         }
     }
 
@@ -658,6 +798,7 @@ impl Persistence {
     ) -> DatabaseResult<Option<TimelinePersistence>> {
         match &self.store {
             Store::Postgres(store) => store.get_timeline(tenant_id, timeline_id).await,
+            Store::Kubernetes(store) => store.get_timeline(tenant_id, timeline_id).await,
         }
     }
 
@@ -669,6 +810,7 @@ impl Persistence {
     ) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.timeline_set_deleted_at(tenant_id, timeline_id).await,
+            Store::Kubernetes(store) => store.timeline_set_deleted_at(tenant_id, timeline_id).await,
         }
     }
 
@@ -682,6 +824,7 @@ impl Persistence {
     ) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.delete_timeline(tenant_id, timeline_id).await,
+            Store::Kubernetes(store) => store.delete_timeline(tenant_id, timeline_id).await,
         }
     }
 
@@ -692,6 +835,7 @@ impl Persistence {
     ) -> DatabaseResult<Vec<TimelinePersistence>> {
         match &self.store {
             Store::Postgres(store) => store.list_timelines_for_tenant(tenant_id).await,
+            Store::Kubernetes(store) => store.list_timelines_for_tenant(tenant_id).await,
         }
     }
 
@@ -702,6 +846,7 @@ impl Persistence {
     ) -> DatabaseResult<bool> {
         match &self.store {
             Store::Postgres(store) => store.insert_pending_op(entry).await,
+            Store::Kubernetes(store) => store.insert_pending_op(entry).await,
         }
     }
 
@@ -719,6 +864,11 @@ impl Persistence {
                     .remove_pending_op(tenant_id, timeline_id, sk_id, generation)
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .remove_pending_op(tenant_id, timeline_id, sk_id, generation)
+                    .await
+            }
         }
     }
 
@@ -728,6 +878,7 @@ impl Persistence {
     ) -> DatabaseResult<Vec<(TimelinePendingOpPersistence, Option<TimelinePersistence>)>> {
         match &self.store {
             Store::Postgres(store) => store.list_pending_ops_with_timelines().await,
+            Store::Kubernetes(store) => store.list_pending_ops_with_timelines().await,
         }
     }
 
@@ -739,6 +890,11 @@ impl Persistence {
     ) -> DatabaseResult<Vec<TimelinePendingOpPersistence>> {
         match &self.store {
             Store::Postgres(store) => {
+                store
+                    .list_pending_ops_for_timeline(tenant_id, timeline_id)
+                    .await
+            }
+            Store::Kubernetes(store) => {
                 store
                     .list_pending_ops_for_timeline(tenant_id, timeline_id)
                     .await
@@ -760,6 +916,11 @@ impl Persistence {
                     .remove_pending_ops_for_timeline(tenant_id, timeline_id)
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .remove_pending_ops_for_timeline(tenant_id, timeline_id)
+                    .await
+            }
         }
     }
 
@@ -769,12 +930,14 @@ impl Persistence {
     ) -> DatabaseResult<bool> {
         match &self.store {
             Store::Postgres(store) => store.insert_timeline_import(import).await,
+            Store::Kubernetes(store) => store.insert_timeline_import(import).await,
         }
     }
 
     pub(crate) async fn list_timeline_imports(&self) -> DatabaseResult<Vec<TimelineImport>> {
         match &self.store {
             Store::Postgres(store) => store.list_timeline_imports().await,
+            Store::Kubernetes(store) => store.list_timeline_imports().await,
         }
     }
 
@@ -785,6 +948,7 @@ impl Persistence {
     ) -> DatabaseResult<Option<TimelineImport>> {
         match &self.store {
             Store::Postgres(store) => store.get_timeline_import(tenant_id, timeline_id).await,
+            Store::Kubernetes(store) => store.get_timeline_import(tenant_id, timeline_id).await,
         }
     }
 
@@ -795,6 +959,7 @@ impl Persistence {
     ) -> DatabaseResult<()> {
         match &self.store {
             Store::Postgres(store) => store.delete_timeline_import(tenant_id, timeline_id).await,
+            Store::Kubernetes(store) => store.delete_timeline_import(tenant_id, timeline_id).await,
         }
     }
 
@@ -816,6 +981,11 @@ impl Persistence {
                     .update_timeline_import(tenant_shard_id, timeline_id, shard_status)
                     .await
             }
+            Store::Kubernetes(store) => {
+                store
+                    .update_timeline_import(tenant_shard_id, timeline_id, shard_status)
+                    .await
+            }
         }
     }
 
@@ -825,6 +995,7 @@ impl Persistence {
     ) -> DatabaseResult<bool> {
         match &self.store {
             Store::Postgres(store) => store.is_tenant_importing_timeline(tenant_id).await,
+            Store::Kubernetes(store) => store.is_tenant_importing_timeline(tenant_id).await,
         }
     }
 }

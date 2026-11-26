@@ -19,7 +19,6 @@ use anyhow::Context;
 use control_plane::storage_controller::{
     AttachHookRequest, AttachHookResponse, InspectRequest, InspectResponse,
 };
-use diesel::result::DatabaseErrorKind;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use http_utils::error::ApiError;
@@ -504,6 +503,13 @@ impl From<DatabaseError> for ApiError {
                 ApiError::InternalServerError(anyhow::anyhow!(reason))
             }
             DatabaseError::Cas(reason) => ApiError::Conflict(reason),
+            // The API server could not be reached, or answered that it cannot serve now: as a
+            // lost connection to Postgres is.
+            DatabaseError::Kubernetes(kube::Error::Api(status)) if status.code < 500 => {
+                ApiError::InternalServerError(anyhow::anyhow!(status))
+            }
+            DatabaseError::Kubernetes(_) => ApiError::ShuttingDown,
+            DatabaseError::Exists(reason) => ApiError::InternalServerError(anyhow::anyhow!(reason)),
         }
     }
 }
@@ -2079,10 +2085,7 @@ impl Service {
 
             match self.persistence.insert_tenant_shards(vec![tsp]).await {
                 Err(e) => match e {
-                    DatabaseError::Query(diesel::result::Error::DatabaseError(
-                        DatabaseErrorKind::UniqueViolation,
-                        _,
-                    )) => {
+                    e if e.is_unique_violation() => {
                         tracing::info!(
                             "Raced with another request to insert tenant {}",
                             attach_req.tenant_shard_id
@@ -2723,10 +2726,7 @@ impl Service {
             .await
         {
             Ok(_) => {}
-            Err(DatabaseError::Query(diesel::result::Error::DatabaseError(
-                DatabaseErrorKind::UniqueViolation,
-                _,
-            ))) => {
+            Err(e) if e.is_unique_violation() => {
                 // Unique key violation: this is probably a retry.  Because the shard count is part of the unique key,
                 // if we see a unique key violation it means that the creation request's shard count matches the previous
                 // creation's shard count.
@@ -6475,10 +6475,7 @@ impl Service {
             .await
         {
             match e {
-                DatabaseError::Query(diesel::result::Error::DatabaseError(
-                    DatabaseErrorKind::UniqueViolation,
-                    _,
-                )) => {
+                e if e.is_unique_violation() => {
                     // Inserting a child shard violated a unique constraint: we raced with another call to
                     // this function
                     tracing::warn!("Conflicting attempt to split {tenant_id}: {e}");
@@ -7830,15 +7827,7 @@ impl Service {
         match registration_status {
             RegistrationStatus::New => {
                 self.persistence.insert_node(&new_node).await.map_err(|e| {
-                    if matches!(
-                        e,
-                        crate::persistence::DatabaseError::Query(
-                            diesel::result::Error::DatabaseError(
-                                diesel::result::DatabaseErrorKind::UniqueViolation,
-                                _,
-                            )
-                        )
-                    ) {
+                    if e.is_unique_violation() {
                         // The node can be deleted by tombstone API, and not show up in the list of nodes.
                         // If you see this error, check tombstones first.
                         ApiError::Conflict(format!("Node {} is already exists", new_node.get_id()))
