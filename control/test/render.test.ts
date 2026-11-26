@@ -319,7 +319,7 @@ describe('the guards', () => {
   test('the statefulset guard admits the storage images given, and only those; a host path only on the safekeepers\' volume', () => {
     const one = JSON.stringify(named(all, 'ValidatingAdmissionPolicy', STATEFULSET_POLICY))
     expect(one).toContain("c.image in ['ghcr.io/zabaca/peat/storage:release-2026-12-01']")
-    const two = JSON.stringify(named(render(r, KEPT, ['ghcr.io/zabaca/peat/storage:a', 'ghcr.io/zabaca/peat/storage:b']), 'ValidatingAdmissionPolicy', STATEFULSET_POLICY))
+    const two = JSON.stringify(named(render(r, KEPT, undefined, ['ghcr.io/zabaca/peat/storage:a', 'ghcr.io/zabaca/peat/storage:b']), 'ValidatingAdmissionPolicy', STATEFULSET_POLICY))
     expect(two).toContain("c.image in ['ghcr.io/zabaca/peat/storage:a', 'ghcr.io/zabaca/peat/storage:b']")
     expect(two).not.toContain('release-2026-12-01')
     expect(one).toContain("v.hostPath.path == '/var/lib/peat/safekeeper'")

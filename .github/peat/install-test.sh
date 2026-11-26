@@ -10,6 +10,8 @@
 # in the cluster, the storage controller's records a Postgres in the cluster (records postgres: the Kubernetes records come with the
 # controller that keeps them). The platform is a one-machine trial (spread none) on the cluster's one node. Needs kind, kubectl, docker,
 # bun and psql on the PATH (KIND names another kind). KEEP=1 keeps the cluster afterwards; it is deleted otherwise, pass or fail.
+# UPGRADE_FROM=<a release in the registry> installs that release first (its storage and compute images, this control image) and, after
+# the databases' checks, upgrades the platform to the images given, with a writer and a reader running throughout.
 set -euo pipefail
 storage=${1:?storage image}; compute18=${2:?compute 18 image}; compute19=${3:?compute 19 image}; control=${4:?control image}
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../.." && pwd)
@@ -118,8 +120,8 @@ apiVersion: peat.zabaca.com/v1alpha1
 kind: Platform
 metadata: { name: peat }
 spec:
-  release: ci
-  images: { storage: "$storage", control: "$control", compute: { "18": "$compute18", "19": "$compute19" } }
+  release: ${UPGRADE_FROM:-ci}
+  images: $(if [ -n "${UPGRADE_FROM:-}" ]; then echo "{ control: \"$control\" }"; else echo "{ storage: \"$storage\", control: \"$control\", compute: { \"18\": \"$compute18\", \"19\": \"$compute19\" } }"; fi)
   spread: none
   objectStore: { endpoint: "http://minio.store.svc:9000", region: us-east-1, bucket: peat, credentialsSecret: peat-store }
   pageservers: { count: 1, storage: { hostPath: { path: /var/lib/peat/pageserver, create: true } } }
@@ -270,4 +272,37 @@ peatc delete cli-made -n shop --yes || fail 'peat delete failed'
 peatc status | grep -q '^peat: Ready' || fail 'peat status does not say Ready'
 echo "  make, list, url, ca, stop, close, open, delete and status, each through the kubeconfig; the database answered with its published URL's login"
 
-echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s"
+upgrade_s=''; max_gap=''
+if [ -n "${UPGRADE_FROM:-}" ]; then
+  echo "== the upgrade from $UPGRADE_FROM to this run's images, a writer and a reader running throughout"
+  curl -fsS -X POST localhost:18080/db -H 'content-type: application/json' -d '{"name":"upg"}' >/dev/null || fail 'the upgrade test database was not made'
+  upg_password=$(k -n peat get secret db-upg-login -o jsonpath='{.data.password}' | base64 -d)
+  upg() { PGPASSWORD="$upg_password" psql "host=upg.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/ca.crt connect_timeout=5" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+  t0=$(date +%s); until upg 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'upg did not answer'; sleep 3; done
+  upg 'create table w (id int primary key, at timestamptz default now())'
+  : > "$work/acked"; : > "$work/reads"
+  ( i=0; while [ ! -f "$work/stop" ]; do i=$((i + 1)); if upg "insert into w (id) values ($i)" >/dev/null 2>&1; then echo "$i" >> "$work/acked"; fi; sleep 0.1; done ) & pids+=($!)
+  ( while [ ! -f "$work/stop" ]; do if upg 'select count(*) from w' >/dev/null 2>&1; then date +%s >> "$work/reads"; fi; sleep 1; done ) & pids+=($!)
+  sleep 10
+  t0=$(date +%s)
+  k patch platform peat --type merge -p "{\"spec\":{\"release\":\"ci\",\"images\":{\"storage\":\"$storage\",\"control\":\"$control\",\"compute\":{\"18\":\"$compute18\",\"19\":\"$compute19\"}}}}"
+  last=''
+  until [ "$(k get platform peat -o jsonpath='{.status.release}/{.status.phase}')" = 'ci/Ready' ]; do
+    [ "$(since "$t0")" -lt 900 ] || fail "the upgrade did not finish in 15 minutes: $(k get platform peat -o jsonpath='{.status.message}')"
+    msg=$(k get platform peat -o jsonpath='{.status.phase}: {.status.message}' 2>/dev/null | cut -c1-200)
+    [ "$msg" = "$last" ] || echo "  $(since "$t0") s: $msg"; last=$msg
+    case "$msg" in Halted*) fail "the upgrade halted: $msg";; esac
+    sleep 3
+  done
+  upgrade_s=$(since "$t0")
+  sleep 10; touch "$work/stop"; sleep 3
+  acked=$(wc -l < "$work/acked" | tr -d ' ')
+  stored=$(upg 'select count(*) from w')
+  missing=$(upg "select count(*) from unnest(array[$(paste -sd, "$work/acked")]::int[]) a(id) where not exists (select 1 from w where w.id = a.id)")
+  [ "$missing" = 0 ] || fail "$missing acknowledged inserts are missing after the upgrade ($acked acknowledged, $stored stored)"
+  max_gap=$(awk 'NR > 1 && $1 - p > m { m = $1 - p } { p = $1 } END { print m + 0 }' "$work/reads")
+  k get platform peat -o jsonpath='{range .status.pieces[*]}  {.kind} {.name} {.release}{"\n"}{end}'
+  echo "  the upgrade took $upgrade_s s; $acked inserts acknowledged, none missing ($stored stored); the reader's longest gap $max_gap s"
+fi
+
+echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s${upgrade_s:+, an upgrade in $upgrade_s s (the longest gap a reader saw: $max_gap s)}"

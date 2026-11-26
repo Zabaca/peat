@@ -55,6 +55,11 @@ const condition: Schema = obj('A condition, as Kubernetes objects report them.',
 
 // ---- Platform
 
+const imagesSchema = (description: string): Schema => obj(description, {
+  storage: str('The storage image.'), control: str('The control image.'),
+  compute: obj('The compute image of each Postgres version.', { '18': str('Postgres 18.'), '19': str('Postgres 19.') }),
+})
+
 export const DATABASE_NAME = '^[a-z][a-z0-9-]{0,30}$'
 
 export const platformSpec: Schema = obj('One Peat platform: its storage, its control layer, its gateways and how its databases run. One per cluster.', {
@@ -160,6 +165,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
   observedGeneration: int('The generation of the spec this status is about.'),
   phase: str('Installing, Ready, Upgrading, Paused (quiet hours), Halted (a check failed: waiting for a person), Suspended or Failed.', { enum: ['Installing', 'Ready', 'Upgrading', 'Paused', 'Halted', 'Suspended', 'Failed'] }),
   release: str('The release every piece runs, once they all run one.'),
+  images: imagesSchema('The images of that release: what the next upgrade starts from.'),
   message: str('What a person reads first.'),
   survives: str("What the platform survives: one machine's loss, or none (spread none)."),
   pieces: list('Every piece and the release it runs.', obj('A piece.', {
@@ -169,7 +175,11 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
   upgrade: obj('The upgrade under way, or the last one.', {
     from: str('The release it started from.'), to: str('The release it goes to.'),
     direction: str('forward, or back (the earlier release set again: only what had moved goes back, in reverse order).', { enum: ['forward', 'back'] }),
-    step: str('The step it is on.'), steps: list('Every step, in order.', str('A step.')), moved: list('The steps done.', str('A step.')),
+    step: str('The step it is on.'), steps: list('Every step, in order.', str('A step.')), moved: list('The pieces on the release it goes to, in the order they moved.', str('A step.')),
+    phase: str('Where the step is: precheck, draining, applying, restarting, waiting, filling, postcheck.', { enum: ['precheck', 'draining', 'applying', 'restarting', 'waiting', 'filling', 'postcheck'] }),
+    since: str('When the step\'s phase began: its wait is bounded by upgrades.checkSeconds.', { format: 'date-time' }),
+    fromImages: imagesSchema('The images it started from.'), toImages: imagesSchema('The images it goes to.'),
+    complete: bool('Whether it is done.'),
     startedAt: str('When it started.', { format: 'date-time' }),
     lastCheck: obj('The last check between steps.', { at: str('When.', { format: 'date-time' }), passed: bool('Whether it passed.'), message: str('What it found.') }),
     halted: obj('Where and why it halted.', { at: str('When.', { format: 'date-time' }), step: str('The step.'), reason: str('Why.') }),

@@ -126,7 +126,7 @@ describe('the names and settings the program reads', () => {
   test('its program imports nothing but Node\'s own and the folder\'s shared modules', () => {
     for (const f of ['control.ts', 'storage-spec.ts']) {
       const specifiers = [...src(f).matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]!)
-      for (const s of specifiers) expect(s.startsWith('node:') || ['./storage-spec', './names', './operator/keys', './databases'].includes(s), `${f}: ${s}`).toBe(true)
+      for (const s of specifiers) expect(s.startsWith('node:') || ['./storage-spec', './names', './operator/keys', './databases', './quiet-hours'].includes(s), `${f}: ${s}`).toBe(true)
     }
   })
 })

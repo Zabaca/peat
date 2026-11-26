@@ -15,8 +15,25 @@ made a setting, and the operator that installs and keeps a whole platform from o
 | The storage's checks | What an upgrade reads between steps (every node active, every shard attached, every secondary warm) and a pageserver's drain and fill. | `src/storage/` |
 | Shared names | Namespaces, the machine label, the dead taint, the API group: neutral defaults, each a setting. | `src/names.ts` |
 
-Still to come in this folder: the ordered upgrade (today a changed release reaches every piece at once), adoption of a platform installed
-another way, and the move of a database to a newer Postgres major (`peat move` and `pgVersion` raised are refused until then).
+Still to come in this folder: the move of a database to a newer Postgres major (`peat move` and `pgVersion` raised are refused until then).
+
+## Upgrades
+
+Changing the Platform's `release` (and its `images`, for an install that pins them) moves the platform one piece at a time: the storage
+controller and the broker; each pageserver, drained first (its shards moved to the others), restarted and filled again; each safekeeper; the
+gateways; the control layer. The whole platform is checked before and after every step (every piece ready, every pageserver Active, every
+shard attached, nothing reconciling, every secondary copy warm, every safekeeper answering). A check that does not pass within
+`upgrades.checkSeconds` halts the upgrade with the step and the reason in the status (`peat status`); it stays halted until `peat retry`
+(it goes on from that step) or until the earlier release is set back (only what had moved goes back, last first, with the same checks).
+No step starts inside `upgrades.quietHours`: an upgrade under way waits at the next step boundary. A compute takes the new image at its
+next start, or, awake, inside `upgrades.restartHours`, one at a time. The state is in `status.upgrade`, so a restarted operator goes on.
+
+## Adoption
+
+A platform installed another way is taken over by naming its objects in the Platform's `adopt` list (kind, namespace, name). The operator
+compares each with what it would make: one it would not change is taken over as it is; one it would change is left alone and the change
+is listed in `status.pendingChanges`, applied only once the object is taken out of the list. It never deletes what it did not make or
+adopt.
 
 ## Databases
 

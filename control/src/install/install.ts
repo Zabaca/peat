@@ -11,8 +11,10 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { crds } from '../api/crds'
 import { GROUP } from '../names'
+import { OPERATOR_NAMESPACE } from '../operator/render'
 
-export const OPERATOR_NAMESPACE = 'peat-system'
+export { OPERATOR_NAMESPACE }
+
 export const OPERATOR_ACCOUNT = 'peat-operator'
 const RECORDS_CRDS = join(import.meta.dir, '../../../storage_controller/kubernetes/crds.yaml')
 const labels = { 'app.kubernetes.io/name': 'peat', 'app.kubernetes.io/component': 'operator' }

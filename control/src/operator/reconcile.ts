@@ -8,7 +8,10 @@
 import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
 import { ok, pathOf, pluralOf, serverApply, type Kube } from '../kube'
 import { keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
-import { choosePlacements, resolve, specOf, type Placements, type Resolved } from './platform'
+import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type Resolved } from './platform'
+import { storageOf, type Storage } from './storage'
+import { decide, imagesFor, stepsOf, type UpgradeState } from './upgrade'
+import { runStep } from './upgrade-run'
 import { KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, render, type Manifest } from './render'
 
 export const FIELD_MANAGER = OPERATOR
@@ -40,8 +43,12 @@ const madeHere = (o: any, platform: string) => o?.metadata?.labels?.[MANAGED_BY]
 
 export interface PassResult { platform?: string; phase: string; message: string; applied: number; pruned: number; refused: string[] }
 
+/** The upgrade's optional fields: in a merge patch a field left out is kept, so a cleared one is written as null (which removes it). */
+const UPGRADE_CLEARABLE = ['step', 'phase', 'since', 'halted', 'lastCheck', 'retried', 'complete'] as const
 async function writeStatus(k: Kube, p: Platform, status: Record<string, unknown>): Promise<void> {
-  await k.request('PATCH', `${platformsPath}/${p.metadata.name}/status`, { status: { observedGeneration: p.metadata.generation, ...status } }, 'application/merge-patch+json')
+  const u = status['upgrade'] as Record<string, unknown> | undefined
+  const upgrade = u ? { ...Object.fromEntries(UPGRADE_CLEARABLE.map((f) => [f, null])), ...Object.fromEntries(Object.entries(u).filter(([, v]) => v !== undefined)) } : undefined
+  await k.request('PATCH', `${platformsPath}/${p.metadata.name}/status`, { status: { observedGeneration: p.metadata.generation, ...status, ...(upgrade ? { upgrade } : {}) } }, 'application/merge-patch+json')
 }
 
 /** The machines that carry the platform's label. */
@@ -140,8 +147,29 @@ async function published(k: Kube, r: Resolved, keys: Record<string, string>): Pr
   return { manifests: out, dbs }
 }
 
+/** The mark on an object the operator took over from an install made another way. */
+export const ADOPTED = `${GROUP}/adopted`
+/**
+ * How `live` differs from what the operator would make (`want`), as the paths of every field the operator sets whose value is not the live
+ * one; fields the operator does not set (defaults the API server filled in, another tool's fields) are not differences. The operator's own
+ * labels are not either: taking an object over is what adds them.
+ */
+export function differences(want: unknown, live: unknown, path = ''): string[] {
+  if (path === '.metadata.labels' || path === '.metadata.annotations' || path === '.stringData') return []
+  if (want === null || typeof want !== 'object') return JSON.stringify(want) === JSON.stringify(live) ? [] : [`${path || '.'}: ${JSON.stringify(live) ?? 'none'} would be ${JSON.stringify(want)}`.slice(0, 240)]
+  if (Array.isArray(want)) {
+    if (!Array.isArray(live) || live.length !== want.length) return [`${path}: ${Array.isArray(live) ? `${live.length} items` : JSON.stringify(live) ?? 'none'} would be ${want.length} items`]
+    return want.flatMap((w, i) => differences(w, live[i], `${path}[${i}]`))
+  }
+  if (!live || typeof live !== 'object' || Array.isArray(live)) return [`${path}: none would be set`]
+  return Object.entries(want as Record<string, unknown>).flatMap(([k2, v]) => differences(v, (live as Record<string, unknown>)[k2], `${path}.${k2}`))
+}
+
 /** One pass. Returns what it did, for the log and the tests. */
-export async function reconcile(k: Kube): Promise<PassResult> {
+export interface Deps { storage?: (r: Resolved, keys: Record<string, string>) => Storage; now?: () => Date }
+
+export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
+  const now = (deps.now ?? (() => new Date()))()
   const all = (ok(await k.request('GET', platformsPath), 'list the Platforms').json.items ?? []) as Platform[]
   if (all.length === 0) return { phase: 'none', message: 'no Platform object: nothing to do', applied: 0, pruned: 0, refused: [] }
   const ordered = [...all].sort((a, b) => String(a.metadata.creationTimestamp).localeCompare(String(b.metadata.creationTimestamp)) || a.metadata.name.localeCompare(b.metadata.name))
@@ -164,8 +192,23 @@ export async function reconcile(k: Kube): Promise<PassResult> {
   // the namespaces first: the keys and the placements are kept in the platform namespace
   const applied: string[] = []
   const refused: string[] = []
+  const adoptList = new Set((spec.adopt ?? []).map((a) => `${a.kind}/${a.namespace ?? ''}/${a.name}`))
+  const pending: { kind: string; namespace?: string; name: string; change: string }[] = []
   const applyOne = async (m: Manifest) => {
     const live = await k.request('GET', pathOf(m))
+    // an object listed in adopt is taken over only when what the operator would make changes nothing of it; else the difference is
+    // reported as a pending change and nothing is applied, until the object is taken out of the list (then it is applied as rendered)
+    if (live.status === 200 && adoptList.has(key(m))) {
+      const diff = differences(m, live.json)
+      if (diff.length) {
+        pending.push({ kind: m.kind, ...(m.metadata.namespace ? { namespace: m.metadata.namespace } : {}), name: m.metadata.name, change: diff.slice(0, 8).join('; ') + (diff.length > 8 ? `; and ${diff.length - 8} more` : '') })
+        if (!madeHere(live.json, r.name)) ok(await k.request('PATCH', pathOf(m), { metadata: { labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name, [ADOPTED]: 'true' } } }, 'application/merge-patch+json'), `adopt ${key(m)}`)
+        return
+      }
+      ok(await serverApply(k, { ...m, metadata: { ...m.metadata, labels: { ...m.metadata.labels, [ADOPTED]: 'true' } } } as Manifest, FIELD_MANAGER), `adopt ${key(m)}`)
+      applied.push(key(m))
+      return
+    }
     // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret): its labels are applied either way
     if (live.status === 200 && !madeHere(live.json, r.name) && m.kind !== 'Namespace') {
       refused.push(`${key(m)} exists and was not made by the operator: left alone (list it in adopt to take it over)`)
@@ -190,8 +233,25 @@ export async function reconcile(k: Kube): Promise<PassResult> {
     ok(await serverApply(k, cm, FIELD_MANAGER), 'keep the placements')
   }
 
+  // the upgrade: decided before anything is applied, so each piece is rendered at the release its step has reached
+  const status = (p.status ?? {}) as any
+  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? imagesOf(spec, String(status.release)) } : undefined
+  const sks = await k.request('GET', `/apis/apps/v1/namespaces/${r.names.namespace}/statefulsets?labelSelector=${sel({ 'peat-sk': 'true' })}`)
+  const skNames = sks.status === 200 ? (sks.json.items as any[]).map((x) => String(x.metadata.name)) : []
+  const decision = decide({ release: spec.release, images: r.images, running, state: status.upgrade as UpgradeState | undefined, steps: stepsOf(r.placements.pageservers.map((x) => x.id), skNames), retry: spec.requests?.retry, quietHours: spec.upgrades.quietHours, now })
+  let upgrade: UpgradeState | undefined = decision.kind === 'none' ? undefined : decision.state
+  let stepMessage = ''
+  if (decision.kind === 'continue') {
+    const before = await pieces(k, r, render(r, keys, imagesFor(upgrade, r.images)))
+    const storage = (deps.storage ?? ((res, kk) => storageOf(res, kk['auth_private_key.pem']!)))(r, keys)
+    const work = await runStep(k, r, storage, upgrade!, now, before.filter((x) => !x.ready).map((x) => x.name))
+    upgrade = work.state
+    stepMessage = work.message
+  }
+  const live = upgrade && !upgrade.complete ? upgrade : undefined
+  const at = imagesFor(live, r.images)
   const pub = await published(k, r, keys)
-  const rendered = [...render(r, keys), ...pub.manifests]
+  const rendered = [...render(r, keys, at, live ? [live.fromImages.storage, live.toImages.storage] : [r.images.storage]), ...pub.manifests]
   for (const m of rendered.filter((x) => x.kind !== 'Namespace')) await applyOne(m)
   for (const d of pub.dbs) {
     if (!d.status?.tenant || d.metadata.deletionTimestamp || (d.status.loginSecret && d.status.caConfigMap)) continue
@@ -215,10 +275,16 @@ export async function reconcile(k: Kube): Promise<PassResult> {
 
   const ps = await pieces(k, r, rendered)
   const notReady = ps.filter((x) => !x.ready)
-  const releases = [...new Set(ps.map((x) => x.release))]
+  const counts = { applied: applied.length, pruned, refused }
+  const more = { pieces: ps, survives: r.survives, pendingChanges: pending, ...(upgrade ? { upgrade } : {}) }
+  if (live?.halted) return done('Halted', `the upgrade to ${live.direction === 'forward' ? live.to : live.from} halted at ${live.halted.step}: ${live.halted.reason}. peat retry goes on from there; setting ${live.direction === 'forward' ? live.from : live.to} takes back what moved`, more, counts)
+  if (decision.kind === 'pause') return done('Paused', `the upgrade to ${live!.direction === 'forward' ? live!.to : live!.from} waits for the quiet hours (${decision.window}) to end: ${live!.moved.length} of ${live!.steps.length} steps moved`, more, counts)
+  if (live) return done('Upgrading', `${live.direction === 'forward' ? `${live.from} to ${live.to}` : `back from ${live.to} to ${live.from}`}: ${stepMessage}`, more, counts)
+  if (decision.kind === 'finish') return done(notReady.length ? 'Installing' : 'Ready', `the upgrade ${decision.state.direction === 'forward' ? 'to' : 'back to'} ${decision.release} is done: every piece runs it`, { ...more, release: decision.release, images: decision.images }, counts)
   const phase = notReady.length || refused.length ? 'Installing' : 'Ready'
   const message = refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`
-  return done(phase, message, { pieces: ps, survives: r.survives, ...(releases.length === 1 && !notReady.length ? { release: releases[0] } : {}) }, { applied: applied.length, pruned, refused })
+  // the release every piece runs, recorded once all are ready on it: what the next upgrade starts from
+  return done(phase, message, { ...more, ...(phase === 'Ready' && !running ? { release: spec.release, images: r.images } : {}) }, counts)
 }
 
 export { GROUP }
