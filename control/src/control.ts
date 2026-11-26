@@ -434,7 +434,7 @@ async function ensureCertificate(name: string): Promise<void> {
 /** Every database's own certificate renewed in time (this layer signs them when no issuer does): the acting layer, once an hour. */
 async function renewOwnCerts() {
   if (!isLeader || CERT_ISSUER) return
-  for (const d of await listDbs()) if (d.mode === 'primary') await ensureCertificate(d.name).catch((e) => console.log(`cert ${d.name}: ${e}`))
+  for (const d of await listDbs()) await ensureCertificate(d.name).catch((e) => console.log(`cert ${d.name}: ${e}`)) // a replica's compute has a certificate of its own too
 }
 const nameService = (name: string) => ({
   apiVersion: 'v1', kind: 'Service',
@@ -835,8 +835,10 @@ interface SkJob { lost: number; newId?: number; node?: string; phase: string; st
 let skJob: SkJob | null = null
 let skJobHistory: SkJob[] = []
 // The safekeeper's pod is `storage-spec.ts`'s (one definition for the three the platform starts with and for a replacement): built here from the environment the Deployment gives this pod.
-const skStatefulSet = (id: number, node: string) =>
-  safekeeperStatefulSet({
+// stamped with the release of the storage image it runs (RELEASE, from the operator), which the Platform's status reports
+const RELEASE = process.env['RELEASE'] ?? ''
+const skStatefulSet = (id: number, node: string) => {
+  const o = safekeeperStatefulSet({
     id, node, namespace: NS, image: STORAGE_IMAGE, controlUrl: CONTROL_URL,
     remote: { endpoint: process.env['S3_ENDPOINT'] ?? '', bucket: process.env['S3_BUCKET'] ?? '', region: process.env['S3_REGION'] ?? 'auto', prefix: S3_PREFIX },
     secrets: SK_SECRETS,
@@ -844,6 +846,9 @@ const skStatefulSet = (id: number, node: string) =>
     resources: SK_RESOURCES,
     labels: { 'peat-sk': 'true' },
   })
+  if (RELEASE) o.metadata.annotations = { ...(o.metadata.annotations ?? {}), [`${GROUP}/release`]: RELEASE }
+  return o
+}
 /** The machine a safekeeper's pod is on (or pinned to while it waits), or null when it has no pod. */
 async function skMachine(id: number): Promise<string | null> {
   const p = await kube('GET', `/api/v1/namespaces/${NS}/pods/safekeeper-w${id}-0`)

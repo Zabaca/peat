@@ -96,7 +96,7 @@ describe('the hold', () => {
     expect(deleteAfter('7d', now)?.toISOString()).toBe('2026-12-08T00:00:00.000Z')
     expect(deleteAfter('36h', now)?.toISOString()).toBe('2026-12-02T12:00:00.000Z')
     expect(deleteAfter('never', now)).toBeNull()
-    expect(() => deleteAfter('a week', now)).toThrow('never')
+    expect(() => deleteAfter('a week', now)).toThrow('duration')
   })
   test('the data goes when its time has come, a root\'s only once nothing uses its tenant, and never when the hold is never', () => {
     expect(purgeDue({ deleteAfter: '2026-11-30T00:00:00Z', tenant: 't', root: false }, now, true)).toBe(true)

@@ -5,6 +5,7 @@
 // The clients are pods named `drill-*` in the computes' namespace, on the platform's machines, with a policy of their own (`drill-client`:
 // DNS and the gateways' 5432 only). They connect to `<database>.<databases' namespace>.svc` with `sslmode=verify-full` against the platform
 // CA's certificate (a ConfigMap `drill-ca` holding the PUBLIC half, read from the CA's Secret), as any client of the platform would.
+import { durationMs } from '../api/schema'
 import { DRILL_BASE_DATABASE, Guard, egressReachesStore, namespacesOf } from './guard'
 import { placement, type Names } from '../names'
 
@@ -227,14 +228,14 @@ export class LiveCtx implements Ctx {
     })
     return Buffer.from(j.data.password, 'base64').toString()
   }
-  /** The public half of the platform CA, as a ConfigMap the clients mount (never the key: the CA's Secret holds both and is read here only for its `tls.crt`). */
+  /** The public half of the platform CA, as a ConfigMap the clients mount, copied from the one the platform publishes in the database namespace (which holds no key). */
   private async ensureCa() {
     const cns = this.n.computeNamespace
     // looked for each time, not remembered: the undo log deletes it at the end of a drill, and the check that follows a drill needs a client again (found 2026-11-19: a remembered flag left a pod waiting for a deleted ConfigMap)
     const have = await this.g.kread(['-n', cns, 'get', 'configmap', 'drill-ca', '-o', 'name']).then(() => true).catch(() => false)
     if (have && (await this.g.kread(['-n', cns, 'get', 'networkpolicy', 'drill-client', '-o', 'name']).then(() => true).catch(() => false))) return
-    const j = await this.g.kjson<any>(['-n', cns, 'get', 'secret', this.g.settings.caSecret])
-    await this.g.apply(cns, { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'drill-ca', namespace: cns }, data: { 'ca.crt': Buffer.from(j.data['tls.crt'], 'base64').toString() } })
+    const j = await this.g.kjson<any>(['-n', this.n.dbNamespace, 'get', 'configmap', this.g.settings.caConfigMap])
+    await this.g.apply(cns, { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'drill-ca', namespace: cns }, data: { 'ca.crt': String(j.data['ca.crt']) } })
     await this.g.apply(cns, clientPolicy(this.n))
   }
   async startClientPod(pod: string, node: string, db: string, command: string, env: Record<string, string> = {}) {
@@ -308,7 +309,7 @@ export class LiveCtx implements Ctx {
       }
     }
     const env = async (n: string, name: string, key: string) => (await this.g.kjson<any>(['-n', n, 'get', 'deployment', name]).catch(() => null))?.spec?.template?.spec?.containers?.[0]?.env?.find((e: any) => e.name === key)
-    const want = this.g.settings.idleMinutes
+    const want = String(Math.max(1, Math.round(durationMs(this.g.settings.idleAfter) / 60_000)))
     const idle = [await env(ns, 'peat-control', 'IDLE_MINUTES'), await env(this.n.gatewayNamespace, 'peat-gateway', 'IDLE_MINUTES')]
     if (idle.some((e) => e !== undefined && e?.value !== want)) { lines.push(`IDLE_MINUTES is not ${want} on the control layer and the gateways (a sleep drill's leftover: recover)`); ok = false }
     if (cdb) {

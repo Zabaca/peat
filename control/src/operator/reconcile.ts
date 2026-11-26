@@ -9,7 +9,7 @@ import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
 import { ok, pathOf, pluralOf, serverApply, type Kube } from '../kube'
 import { keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
 import { choosePlacements, resolve, specOf, type Placements, type Resolved } from './platform'
-import { KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, render, type Manifest } from './render'
+import { KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, render, type Manifest } from './render'
 
 export const FIELD_MANAGER = OPERATOR
 /** The operator's record of where each pinned piece runs, in the platform namespace. */
@@ -36,11 +36,32 @@ export const RENDERED_KINDS: { apiVersion: string; kind: string; namespaced: boo
 const platformsPath = `/apis/${API_VERSION}/platforms`
 const key = (o: { kind: string; metadata: { namespace?: string; name: string } }) => `${o.kind}/${o.metadata.namespace ?? ''}/${o.metadata.name}`
 const sel = (labels: Record<string, string>) => encodeURIComponent(Object.entries(labels).map(([k, v]) => `${k}=${v}`).join(','))
-const madeHere = (o: any, platform: string) => o?.metadata?.labels?.[MANAGED_BY] === OPERATOR && o?.metadata?.labels?.[PLATFORM_LABEL] === platform
+/**
+ * The operator's record of what it made: every object's kind, namespace and name with the UID the API server gave it, in a ConfigMap of
+ * the platform namespace. An object is the operator's only when the record holds its UID: a label proves nothing (anyone can copy one, and a
+ * copy of the authority's certificate with its labels kept must not be deleted), and an object of a piece's name that the operator did not
+ * make is never applied over.
+ */
+export const OWNED_CONFIG_MAP = 'peat-owned'
+type Owned = Record<string, string>
+async function readOwned(k: Kube, ns: string): Promise<Owned> {
+  const r = await k.request('GET', `/api/v1/namespaces/${ns}/configmaps/${OWNED_CONFIG_MAP}`)
+  if (r.status !== 200) return {}
+  try { return JSON.parse(r.json.data?.['owned.json'] ?? '{}') } catch { return {} }
+}
+async function writeOwned(k: Kube, ns: string, owned: Owned): Promise<void> {
+  const cm = { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: OWNED_CONFIG_MAP, namespace: ns, labels: { [MANAGED_BY]: OPERATOR } }, data: { 'owned.json': JSON.stringify(owned, Object.keys(owned).sort()) } }
+  ok(await serverApply(k, cm, FIELD_MANAGER), 'keep the record of what the operator made')
+}
+const kindOf = (key: string) => RENDERED_KINDS.find((x) => x.kind === key.split('/')[0])
 
 export interface PassResult { platform?: string; phase: string; message: string; applied: number; pruned: number; refused: string[] }
 
+/** Writes the status, unless it would change nothing (a pass every few seconds over a settled platform writes nothing). */
 async function writeStatus(k: Kube, p: Platform, status: Record<string, unknown>): Promise<void> {
+  const next = { observedGeneration: p.metadata.generation, ...status }
+  const now = (p.status ?? {}) as Record<string, unknown>
+  if (Object.entries(next).every(([key2, v]) => JSON.stringify(v) === JSON.stringify(now[key2]))) return
   await k.request('PATCH', `${platformsPath}/${p.metadata.name}/status`, { status: { observedGeneration: p.metadata.generation, ...status } }, 'application/merge-patch+json')
 }
 
@@ -91,7 +112,8 @@ async function writeKeys(k: Kube, r: Resolved, kept: Record<string, string>): Pr
 /** The pieces and whether each is ready, for the status: the Deployments and StatefulSets the operator made, and the safekeepers the control layer made. */
 async function pieces(k: Kube, r: Resolved, rendered: Manifest[]): Promise<{ kind: string; namespace: string; name: string; release: string; ready: boolean; message?: string }[]> {
   const out: { kind: string; namespace: string; name: string; release: string; ready: boolean; message?: string }[] = []
-  const releaseOf = (image: string) => image.replace(/^.*[:@]/, '')
+  // the release a workload was rendered at, as stamped on it; one made before stamps by its image's tag
+  const releaseOf = (o: any) => String(o?.metadata?.annotations?.[RELEASE_ANNOTATION] ?? String(o?.spec?.template?.spec?.containers?.[0]?.image ?? '').replace(/^.*[:@]/, ''))
   const judge = (o: any) => {
     const want = o.spec?.replicas ?? 1
     const ready = (o.status?.readyReplicas ?? 0) >= want && (o.status?.updatedReplicas ?? o.status?.currentReplicas ?? want) >= want
@@ -100,12 +122,12 @@ async function pieces(k: Kube, r: Resolved, rendered: Manifest[]): Promise<{ kin
   for (const m of rendered.filter((x) => x.kind === 'Deployment' || x.kind === 'StatefulSet')) {
     const live = await k.request('GET', pathOf(m))
     const image = String(m.spec.template.spec.containers[0].image)
-    if (live.status !== 200) { out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(image), ready: false, message: 'not made yet' }); continue }
-    out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(String(live.json.spec.template.spec.containers[0].image)), ...judge(live.json) })
+    if (live.status !== 200) { out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(m), ready: false, message: 'not made yet' }); continue }
+    out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(live.json), ...judge(live.json) })
   }
   const sks = await k.request('GET', `/apis/apps/v1/namespaces/${r.names.namespace}/statefulsets?labelSelector=${sel({ 'peat-sk': 'true' })}`)
-  for (const s of (sks.status === 200 ? sks.json.items : []) as any[]) out.push({ kind: 'StatefulSet', namespace: r.names.namespace, name: s.metadata.name, release: releaseOf(String(s.spec.template.spec.containers[0].image)), ...judge(s) })
-  if (sks.status === 200 && (sks.json.items as any[]).length < r.spec.safekeepers.count) out.push({ kind: 'StatefulSet', namespace: r.names.namespace, name: 'safekeepers', release: releaseOf(r.images.storage), ready: false, message: `${(sks.json.items as any[]).length} of ${r.spec.safekeepers.count} safekeepers made (the control layer makes them once it runs)` })
+  for (const s of (sks.status === 200 ? sks.json.items : []) as any[]) out.push({ kind: 'StatefulSet', namespace: r.names.namespace, name: s.metadata.name, release: releaseOf(s), ...judge(s) })
+  if (sks.status === 200 && (sks.json.items as any[]).length < r.spec.safekeepers.count) out.push({ kind: 'StatefulSet', namespace: r.names.namespace, name: 'safekeepers', release: r.images.release, ready: false, message: `${(sks.json.items as any[]).length} of ${r.spec.safekeepers.count} safekeepers made (the control layer makes them once it runs)` })
   return out
 }
 
@@ -114,15 +136,19 @@ export const CA_CONFIG_MAP = 'peat-ca'
  * What a client of each database needs, in the database's own namespace: the authority's public certificate (a ConfigMap `peat-ca`,
  * ca.crt, for sslmode=verify-full) in every namespace that holds a Database, and each made database's login (a Secret `<name>-login`:
  * username, password, the names to connect to and a URL). A branch and a replica use their root's login. The control layer keeps the
- * passwords in the platform namespace; these are copies, made and removed by the operator.
+ * passwords in the platform namespace; these are copies the operator makes. Outside the platform's namespaces it deletes nothing: each copy
+ * is owned by its Database (a login by its database, the certificate by every Database of its namespace), so Kubernetes removes it with the
+ * last of them, and a person's own object of the same name is never the operator's to remove.
  */
 async function published(k: Kube, r: Resolved, keys: Record<string, string>): Promise<{ manifests: Manifest[]; dbs: any[] }> {
   const list = await k.request('GET', `/apis/${API_VERSION}/databases`)
   if (list.status !== 200) return { manifests: [], dbs: [] }
   const dbs = list.json.items as any[]
-  const meta = (name: string, namespace: string) => ({ name, namespace, labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name } })
+  const owner = (d: any) => ({ apiVersion: API_VERSION, kind: 'Database', name: String(d.metadata.name), uid: String(d.metadata.uid) })
+  const meta = (name: string, namespace: string, owners: any[]) => ({ name, namespace, labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name }, ...(owners.length ? { ownerReferences: owners.map(owner) } : {}) })
   const out: Manifest[] = []
-  for (const ns of [...new Set(dbs.map((d) => d.metadata.namespace as string))].sort()) out.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(CA_CONFIG_MAP, ns), data: { 'ca.crt': keys['ca.crt'] ?? '' } })
+  // the database namespace has its own (render.ts), owned by the platform, not by its Databases
+  for (const ns of [...new Set(dbs.map((d) => d.metadata.namespace as string))].filter((x) => x !== r.names.dbNamespace).sort()) out.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(CA_CONFIG_MAP, ns, dbs.filter((d) => d.metadata.namespace === ns && d.metadata.uid)), data: { 'ca.crt': keys['ca.crt'] ?? '' } })
   for (const d of dbs) {
     const rec = d.status?.record
     if (!d.status?.tenant || !rec || d.metadata.deletionTimestamp) continue
@@ -132,7 +158,7 @@ async function published(k: Kube, r: Resolved, keys: Record<string, string>): Pr
     const password = Buffer.from(String(login.json.data?.password ?? ''), 'base64').toString()
     const serviceHost = `${d.metadata.name}.${r.names.dbNamespace}.svc`
     const host = r.spec.gateways.domain ? `${d.metadata.name}.${r.spec.gateways.domain}` : serviceHost
-    out.push({ apiVersion: 'v1', kind: 'Secret', metadata: meta(`${d.metadata.name}-login`, d.metadata.namespace), type: 'Opaque', stringData: {
+    out.push({ apiVersion: 'v1', kind: 'Secret', metadata: meta(`${d.metadata.name}-login`, d.metadata.namespace, d.metadata.uid ? [d] : []), type: 'Opaque', stringData: {
       username: 'app', password, dbname: 'app', host, serviceHost, port: '5432',
       url: `postgresql://app:${encodeURIComponent(password)}@${host}:5432/app?sslmode=verify-full`,
     } })
@@ -155,27 +181,42 @@ export async function reconcile(k: Kube): Promise<PassResult> {
   const checked = specOf(p)
   if ('errors' in checked) return done('Failed', `the Platform is not valid: ${checked.errors.join('; ')}`)
   const spec = checked.spec
+  // the namespaces are where the platform's pieces and data are: once recorded they never change (the kind's rule says so too, on a cluster that judges it)
+  const recordedNs = (p.status as any)?.namespaces
+  if (recordedNs && JSON.stringify(recordedNs) !== JSON.stringify(spec.namespaces)) return done('Failed', `the namespaces cannot change: the platform runs in ${JSON.stringify(recordedNs)}; set them back`)
+  // records kubernetes needs the storage controller's record kinds, which come with the storage image that keeps them
+  if (spec.controller.records === 'kubernetes') {
+    const served = await k.request('GET', `/apis/${RECORDS_GROUP}/v1alpha1`)
+    if (served.status !== 200) return done('Failed', `controller.records kubernetes needs the storage controller's record kinds (${RECORDS_GROUP}), which this cluster does not serve: apply an install file and storage images of a release that has them, or set records postgres`)
+  }
   const machines = await labelledMachines(k, spec.machines.label)
   const kept = await readPlacements(k, spec.namespaces.platform)
-  const chosen = choosePlacements(spec, machines.names, kept)
+  const zones = Object.fromEntries(machines.nodes.map((n) => [String(n.metadata.name), String(n.metadata?.labels?.[spec.safekeepers.zoneLabel] ?? n.metadata.name)]))
+  const chosen = choosePlacements(spec, machines.names, kept, zones)
   if ('errors' in chosen) return done('Failed', chosen.errors.join('; '))
   const r = resolve(p, spec, chosen.placements)
 
-  // the namespaces first: the keys and the placements are kept in the platform namespace
+  // the namespaces first: the keys, the placements and the record of what the operator made are kept in the platform namespace
   const applied: string[] = []
   const refused: string[] = []
+  const owned: Owned = {}
+  let ownedRead = false
   const applyOne = async (m: Manifest) => {
     const live = await k.request('GET', pathOf(m))
-    // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret): its labels are applied either way
-    if (live.status === 200 && !madeHere(live.json, r.name) && m.kind !== 'Namespace') {
-      refused.push(`${key(m)} exists and was not made by the operator: left alone (list it in adopt to take it over)`)
+    // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret)
+    if (live.status === 200 && owned[key(m)] !== live.json.metadata?.uid && m.kind !== 'Namespace') {
+      refused.push(`${key(m)} exists and was not made by the operator: left alone`)
       return
     }
-    ok(await serverApply(k, m, FIELD_MANAGER), `apply ${key(m)}`)
+    const a = ok(await serverApply(k, m, FIELD_MANAGER), `apply ${key(m)}`)
+    if (a.json?.metadata?.uid) owned[key(m)] = String(a.json.metadata.uid)
     applied.push(key(m))
   }
   const rendered0 = render(r, {})
   for (const m of rendered0.filter((x) => x.kind === 'Namespace')) await applyOne(m)
+  // the record as kept, with what this pass has just made (a UID just given wins)
+  for (const [k2, uid] of Object.entries(await readOwned(k, r.names.namespace))) if (!(k2 in owned)) owned[k2] = uid
+  ownedRead = true
 
   let keys = await readKeys(k, r)
   const missing = makeMissing(keys)
@@ -198,27 +239,31 @@ export async function reconcile(k: Kube): Promise<PassResult> {
     await k.request('PATCH', `/apis/${API_VERSION}/namespaces/${d.metadata.namespace}/databases/${d.metadata.name}/status`, { status: { loginSecret: `${d.metadata.name}-login`, caConfigMap: CA_CONFIG_MAP } }, 'application/merge-patch+json')
   }
 
-  // what the operator made for this platform and no longer renders: removed (the namespaces never are: what is in them may not be its own)
+  // what the operator made and no longer renders, by its record: removed only inside the platform's namespaces or cluster-scoped, and only the
+  // very object it made (the delete carries the recorded UID as a precondition). A namespace is never removed: what is in it may not be its own.
   const wanted = new Set(rendered.map(key))
+  const platformNamespaces = new Set([r.names.namespace, r.names.computeNamespace, r.names.gatewayNamespace, r.names.dbNamespace])
   let pruned = 0
-  for (const kind of RENDERED_KINDS.filter((x) => x.kind !== 'Namespace')) {
-    const root = kind.apiVersion.includes('/') ? `/apis/${kind.apiVersion}` : `/api/${kind.apiVersion}`
-    const list = await k.request('GET', `${root}/${pluralOf(kind.kind)}?labelSelector=${sel({ [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name })}`)
-    if (list.status !== 200) continue
-    for (const o of list.json.items as any[]) {
-      const m = { apiVersion: kind.apiVersion, kind: kind.kind, metadata: { name: o.metadata.name, ...(kind.namespaced ? { namespace: o.metadata.namespace } : {}) } }
-      if (wanted.has(key(m)) || !madeHere(o, r.name)) continue
-      ok(await k.request('DELETE', pathOf(m)), `remove ${key(m)}`, [404])
-      pruned++
-    }
+  for (const [k2, uid] of Object.entries(owned)) {
+    if (wanted.has(k2)) continue
+    const [kind, ns, name] = k2.split('/') as [string, string, string]
+    const known = kindOf(k2)
+    if (!known || kind === 'Namespace') continue
+    // outside the platform's namespaces the operator deletes nothing: what it published there goes with its Database (an owner reference)
+    if (known.namespaced && !platformNamespaces.has(ns)) { delete owned[k2]; continue }
+    const m = { apiVersion: known.apiVersion, kind, metadata: { name, ...(known.namespaced ? { namespace: ns } : {}) } }
+    ok(await k.request('DELETE', pathOf(m), { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid } }), `remove ${k2}`, [404, 409])
+    delete owned[k2]
+    pruned++
   }
+  if (ownedRead) await writeOwned(k, r.names.namespace, owned)
 
   const ps = await pieces(k, r, rendered)
   const notReady = ps.filter((x) => !x.ready)
   const releases = [...new Set(ps.map((x) => x.release))]
   const phase = notReady.length || refused.length ? 'Installing' : 'Ready'
   const message = refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`
-  return done(phase, message, { pieces: ps, survives: r.survives, ...(releases.length === 1 && !notReady.length ? { release: releases[0] } : {}) }, { applied: applied.length, pruned, refused })
+  return done(phase, message, { pieces: ps, survives: r.survives, namespaces: spec.namespaces, ...(releases.length === 1 && !notReady.length ? { release: releases[0] } : {}) }, { applied: applied.length, pruned, refused })
 }
 
 export { GROUP }

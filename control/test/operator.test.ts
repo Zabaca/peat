@@ -66,7 +66,10 @@ describe('a first install from one Platform', () => {
     const pub = decode(rec, 'auth_public_key.pem')
     expect(decode(k.get('v1', 'secrets', 'peat', 'peat-auth-public'), 'auth_public_key.pem')).toBe(pub)
     expect(verifiedScope(decode(k.get('v1', 'secrets', 'peat', 'peat-storcon-tokens'), 'storcon_to_pageservers.jwt'), pub)).toBe('pageserverapi')
-    expect(new X509Certificate(decode(k.get('v1', 'secrets', 'peat-compute', 'peat-ca'), 'tls.crt')).ca).toBe(true)
+    // clients get the authority's certificate and nothing else: no Secret of it outside the platform namespace, and its key only in peat-ca-key
+    expect(new X509Certificate(k.get('v1', 'configmaps', 'peat-db', 'peat-ca').data['ca.crt']).ca).toBe(true)
+    expect([...k.objects.values()].filter((o) => o.kind === 'Secret' && o.metadata.namespace !== 'peat')).toEqual([])
+    expect([...k.objects.values()].filter((o) => o.kind === 'Secret' && Object.keys(o.data ?? {}).some((x) => x === 'tls.key' || x === 'ca.key')).map((o) => o.metadata.name).sort()).toEqual(['peat-ca-key', KEYS_SECRET])
     // the control layer signs databases' certificates: the authority's key reaches it in its own namespace
     expect(decode(k.get('v1', 'secrets', 'peat', 'peat-ca-key'), 'tls.key')).toContain('PRIVATE KEY')
     const before = JSON.stringify(rec.data)
@@ -153,6 +156,72 @@ describe('what the operator refuses or leaves alone', () => {
   })
 })
 
+describe('the review\'s rules', () => {
+  test('spread none: one pageserver by default, two refused', async () => {
+    for (const n of ['machine-2', 'machine-3']) k.objects.delete([...k.objects.keys()].find((x) => x.endsWith(`|${n}`))!)
+    k.put(platform({ spread: 'none' }))
+    await reconcile(k)
+    expect(k.all('statefulsets').filter((x) => x.metadata.name.startsWith('pageserver')).map((x) => x.metadata.name)).toEqual(['pageserver-w1'])
+    k.put(platform({ spread: 'none', pageservers: { count: 2 } }, 'peat'))
+    expect((await reconcile(k)).message).toContain('spread none runs one pageserver, not 2')
+  })
+  test('the first safekeepers go to machines of distinct zones; too few zones are refused with the rule', async () => {
+    const zone = (n: string, z: string) => { const o = k.get('v1', 'nodes', null, n); o.metadata.labels['topology.kubernetes.io/zone'] = z }
+    zone('machine-1', 'a'); zone('machine-2', 'a'); zone('machine-3', 'b')
+    k.put(platform({ safekeepers: { zoneLabel: 'topology.kubernetes.io/zone' } }))
+    const r = await reconcile(k)
+    expect(r.phase).toBe('Failed')
+    expect(r.message).toContain('3 safekeepers need 3 zones of topology.kubernetes.io/zone, and their machines are in 2')
+  })
+  test('a release is reported as stamped on each piece, also when its images are pinned by digest', async () => {
+    k.put(platform({ images: { storage: 'ghcr.io/zabaca/peat/storage@sha256:' + 'a'.repeat(64), control: 'ghcr.io/zabaca/peat/control@sha256:' + 'b'.repeat(64) } }))
+    await reconcile(k)
+    expect((statusOf().pieces as any[]).find((x) => x.name === 'storage-controller').release).toBe('release-2026-12-01')
+    expect(k.get('apps/v1', 'deployments', 'peat', 'peat-control').metadata.annotations['peat.zabaca.com/release']).toBe('release-2026-12-01')
+  })
+  test('records kubernetes on a cluster that does not serve the record kinds: refused with why', async () => {
+    k.forced.set('GET /apis/storagecontroller.peat.zabaca.com/v1alpha1', { status: 404, json: {} })
+    k.put(platform())
+    const r = await reconcile(k)
+    expect(r.phase).toBe('Failed')
+    expect(r.message).toContain("needs the storage controller's record kinds")
+    expect(k.all('deployments')).toEqual([])
+  })
+  test('the namespaces: one of the cluster\'s own refused; once recorded, a change refused', async () => {
+    k.put(platform({ namespaces: { platform: 'kube-system' } }))
+    expect((await reconcile(k)).message).toContain("namespaces.platform: kube-system is the cluster's own")
+    k.put(platform())
+    await reconcile(k)
+    const o = k.get('peat.zabaca.com/v1alpha1', 'platforms', null, 'peat')
+    o.spec = { ...o.spec, namespaces: { platform: 'elsewhere' } }
+    expect((await reconcile(k)).message).toContain('the namespaces cannot change')
+  })
+})
+
+describe('what is the operator\'s: its record of the objects it made, never a label', () => {
+  test('an object with the operator\'s labels that it did not make is neither applied over nor deleted, here or in another namespace', async () => {
+    const labels = { [MANAGED_BY]: 'peat-operator', 'peat.zabaca.com/platform': 'peat' }
+    k.put({ apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name: 'storage-broker', namespace: 'peat', labels }, spec: { replicas: 1, template: { spec: { containers: [{ image: 'someone-else' }] } } } })
+    k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'peat-ca', namespace: 'shop', labels }, data: { 'ca.crt': 'a copy' } })
+    k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'stale', namespace: 'peat', labels }, data: {} })
+    k.put(platform())
+    const r = await reconcile(k)
+    expect(k.get('apps/v1', 'deployments', 'peat', 'storage-broker').spec.template.spec.containers[0].image).toBe('someone-else')
+    expect(r.refused[0]).toContain('Deployment/peat/storage-broker exists and was not made by the operator')
+    expect(k.get('v1', 'configmaps', 'shop', 'peat-ca').data['ca.crt']).toBe('a copy')
+    expect(k.get('v1', 'configmaps', 'peat', 'stale')).toBeDefined()
+    expect(r.pruned).toBe(0)
+  })
+  test('the record names each object made, by its UID', async () => {
+    k.put(platform())
+    await reconcile(k)
+    const owned = JSON.parse(k.get('v1', 'configmaps', 'peat', 'peat-owned').data['owned.json'])
+    const ctl = k.get('apps/v1', 'deployments', 'peat', 'storage-controller')
+    expect(owned['Deployment/peat/storage-controller']).toBe(ctl.metadata.uid)
+    expect(Object.keys(owned).length).toBeGreaterThan(30)
+  })
+})
+
 describe('keeping it as declared', () => {
   test('what the operator made and no longer renders is removed; what it did not make never is', async () => {
     k.put(platform({ safekeepers: { outside: { machines: ['outside-1'] } } }))
@@ -194,9 +263,14 @@ describe('what a client of a database needs, in its own namespace', () => {
     expect(decode(k.get('v1', 'secrets', 'shop', 'orders-dev-login'), 'password')).toBe('s3cret word')
     expect(k.get('v1', 'secrets', 'other', 'pending-login')).toBeUndefined()
     expect(k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status).toMatchObject({ loginSecret: 'orders-login', caConfigMap: 'peat-ca' })
+    // outside the platform's namespaces the operator deletes nothing: each copy is owned by its Database, which Kubernetes removes it with
+    const dev = k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders-dev')
+    expect(k.get('v1', 'secrets', 'shop', 'orders-dev-login').metadata.ownerReferences).toEqual([{ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', name: 'orders-dev', uid: dev.metadata.uid }])
+    expect(k.get('v1', 'configmaps', 'shop', 'peat-ca').metadata.ownerReferences.map((o: any) => o.name).sort()).toEqual(['orders', 'orders-dev'])
     k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|databases|orders-dev'))!)
-    await reconcile(k)
-    expect(k.get('v1', 'secrets', 'shop', 'orders-dev-login')).toBeUndefined()
+    const r = await reconcile(k)
+    expect(r.pruned).toBe(0)
+    expect(k.get('v1', 'secrets', 'shop', 'orders-dev-login')).toBeDefined() // the API server's garbage collector removes it, not the operator
   })
 })
 
@@ -224,6 +298,8 @@ describe('the install file', () => {
     expect(dep.metadata.namespace).toBe('peat-system')
     expect(dep.spec.template.spec.containers[0]).toMatchObject({ image: 'ghcr.io/zabaca/peat/control:release-2026-12-01', args: ['operator'] })
     const role = m.find((x) => x.kind === 'ClusterRole')
-    expect(role.rules.find((r: any) => r.apiGroups.includes('rbac.authorization.k8s.io')).verbs).toContain('escalate')
+    // it grants nothing it does not hold: no bind, no escalate; and it makes no pod
+    for (const r of role.rules as any[]) { expect(r.verbs).not.toContain('bind'); expect(r.verbs).not.toContain('escalate') }
+    expect(role.rules.find((r: any) => r.resources.includes('pods')).verbs).not.toContain('create')
   })
 })
