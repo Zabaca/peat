@@ -1,8 +1,9 @@
 pub(crate) mod kubernetes;
 mod postgres;
+pub(crate) mod records;
 pub(crate) mod split_state;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 use std::collections::HashMap;
 use std::io::Write;
 use std::str::FromStr;
@@ -206,17 +207,65 @@ impl Persistence {
     }
 
     /// Keep the records in Kubernetes objects in `namespace`, or, when none is given, in the
-    /// namespace of the pod's service account (outside a pod, the kubeconfig's current one).
-    pub async fn new_kubernetes(namespace: Option<String>) -> anyhow::Result<Self> {
-        let client = kube::Client::try_default().await?;
-        let namespace = namespace.unwrap_or_else(|| client.default_namespace().to_string());
-        Ok(Self::kubernetes_with_client(client, namespace))
+    /// namespace of the pod's service account (outside a pod, the kubeconfig's current one);
+    /// and, when `copy` names a bucket, a copy of them there. The API server is reached through
+    /// `kubeconfig` when given, and otherwise as any client reaches it (in a pod, its service
+    /// account; outside one, `KUBECONFIG` or `~/.kube/config`).
+    pub async fn new_kubernetes(
+        kubeconfig: Option<&std::path::Path>,
+        namespace: Option<String>,
+        copy: Option<remote_storage::RemoteStorageConfig>,
+    ) -> anyhow::Result<Self> {
+        let mut config = match kubeconfig {
+            Some(path) => {
+                kube::Config::from_custom_kubeconfig(
+                    kube::config::Kubeconfig::read_from(path)?,
+                    &Default::default(),
+                )
+                .await?
+            }
+            None => kube::Config::infer().await?,
+        };
+        kubernetes::skip_proxy_where_excluded(&mut config);
+        let namespace = namespace.unwrap_or_else(|| config.default_namespace.clone());
+        let client = kube::Client::try_from(config)?;
+        let copy = match copy {
+            Some(config) => Some(std::sync::Arc::new(
+                kubernetes::copy::BucketCopy::new(&config).await?,
+            )),
+            None => None,
+        };
+        Ok(Self {
+            store: Store::Kubernetes(kubernetes::KubernetesStore::new(client, namespace, copy)),
+        })
     }
 
-    /// Keep the records in Kubernetes objects in `namespace`, through `client`.
-    pub(crate) fn kubernetes_with_client(client: kube::Client, namespace: String) -> Self {
-        Self {
-            store: Store::Kubernetes(kubernetes::KubernetesStore::new(client, namespace)),
+    /// Stop writing the copy in the bucket, as a controller lost with its cluster stops.
+    #[cfg(test)]
+    pub(crate) fn stop_copy(&self) {
+        if let Store::Kubernetes(store) = &self.store {
+            store.stop_copy();
+        }
+    }
+
+    /// Every record at once, in either store (for the copy tool, with the controller stopped).
+    pub(crate) async fn read_all_records(&self) -> DatabaseResult<records::Records> {
+        match &self.store {
+            Store::Postgres(store) => records::Records::from_rows(store.read_all().await?),
+            Store::Kubernetes(store) => store.read_all().await,
+        }
+    }
+
+    /// Write every record, first removing what the store holds when `replace` (for the copy
+    /// tool, with the controller stopped).
+    pub(crate) async fn write_all_records(
+        &self,
+        records: &records::Records,
+        replace: bool,
+    ) -> DatabaseResult<()> {
+        match &self.store {
+            Store::Postgres(store) => store.write_all(&records.to_rows()?, replace).await,
+            Store::Kubernetes(store) => store.write_all(records, replace).await,
         }
     }
 

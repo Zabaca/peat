@@ -2143,3 +2143,151 @@ fn log_postgres_connstr_info(config_str: &str) -> anyhow::Result<()> {
     tracing::info!("database connection config: {config:?}");
     Ok(())
 }
+
+/// Peat: every record at once, for the copy tool (`storcon_records`), which moves the records
+/// between this store and the Kubernetes store with the controller stopped.
+impl PostgresStore {
+    /// Every row, read in one serializable transaction.
+    pub(crate) async fn read_all(&self) -> DatabaseResult<super::records::Rows> {
+        use crate::schema;
+        self.with_conn(move |conn| {
+            Box::pin(async move {
+                let timelines: Vec<TimelineFromDb> = schema::timelines::table.load(conn).await?;
+                Ok(super::records::Rows {
+                    tenant_shards: schema::tenant_shards::table.load(conn).await?,
+                    metadata_health: schema::metadata_health::table.load(conn).await?,
+                    timelines: timelines
+                        .into_iter()
+                        .map(TimelineFromDb::into_persistence)
+                        .collect(),
+                    pending_ops: schema::safekeeper_timeline_pending_ops::table
+                        .load(conn)
+                        .await?,
+                    imports: schema::timeline_imports::table.load(conn).await?,
+                    nodes: schema::nodes::table.load(conn).await?,
+                    safekeepers: schema::safekeepers::table.load(conn).await?,
+                    controllers: schema::controllers::table.load(conn).await?,
+                })
+            })
+        })
+        .await
+    }
+
+    /// Write every row in one transaction, first removing every row there is when `replace`.
+    /// Neon's two hadron tables, which the controller does not use, are left as they are.
+    pub(crate) async fn write_all(
+        &self,
+        rows: &super::records::Rows,
+        replace: bool,
+    ) -> DatabaseResult<()> {
+        use crate::schema;
+
+        #[derive(Insertable)]
+        #[diesel(table_name = crate::schema::safekeepers)]
+        struct SafekeeperRow<'a> {
+            id: i64,
+            region_id: &'a str,
+            version: i64,
+            host: &'a str,
+            port: i32,
+            http_port: i32,
+            availability_zone_id: &'a str,
+            scheduling_policy: String,
+            https_port: Option<i32>,
+        }
+        let safekeepers: Vec<SafekeeperRow> = rows
+            .safekeepers
+            .iter()
+            .map(|s| SafekeeperRow {
+                id: s.id,
+                region_id: &s.region_id,
+                version: s.version,
+                host: &s.host,
+                port: s.port,
+                http_port: s.http_port,
+                availability_zone_id: &s.availability_zone_id,
+                scheduling_policy: String::from(s.scheduling_policy.0),
+                https_port: s.https_port,
+            })
+            .collect();
+        let safekeepers = &safekeepers;
+        // Inserted in chunks, so no statement passes Postgres's limit of bound parameters.
+        const CHUNK: usize = 500;
+        self.with_conn(move |conn| {
+            Box::pin(async move {
+                if replace {
+                    diesel::delete(schema::metadata_health::table)
+                        .execute(conn)
+                        .await?;
+                    diesel::delete(schema::tenant_shards::table)
+                        .execute(conn)
+                        .await?;
+                    diesel::delete(schema::safekeeper_timeline_pending_ops::table)
+                        .execute(conn)
+                        .await?;
+                    diesel::delete(schema::timelines::table)
+                        .execute(conn)
+                        .await?;
+                    diesel::delete(schema::timeline_imports::table)
+                        .execute(conn)
+                        .await?;
+                    diesel::delete(schema::nodes::table).execute(conn).await?;
+                    diesel::delete(schema::safekeepers::table)
+                        .execute(conn)
+                        .await?;
+                    diesel::delete(schema::controllers::table)
+                        .execute(conn)
+                        .await?;
+                }
+                for c in rows.tenant_shards.chunks(CHUNK) {
+                    diesel::insert_into(schema::tenant_shards::table)
+                        .values(c)
+                        .execute(conn)
+                        .await?;
+                }
+                for c in rows.metadata_health.chunks(CHUNK) {
+                    diesel::insert_into(schema::metadata_health::table)
+                        .values(c)
+                        .execute(conn)
+                        .await?;
+                }
+                for c in rows.timelines.chunks(CHUNK) {
+                    diesel::insert_into(schema::timelines::table)
+                        .values(c)
+                        .execute(conn)
+                        .await?;
+                }
+                for c in rows.pending_ops.chunks(CHUNK) {
+                    diesel::insert_into(schema::safekeeper_timeline_pending_ops::table)
+                        .values(c)
+                        .execute(conn)
+                        .await?;
+                }
+                for c in rows.imports.chunks(CHUNK) {
+                    diesel::insert_into(schema::timeline_imports::table)
+                        .values(c)
+                        .execute(conn)
+                        .await?;
+                }
+                for c in rows.nodes.chunks(CHUNK) {
+                    diesel::insert_into(schema::nodes::table)
+                        .values(c)
+                        .execute(conn)
+                        .await?;
+                }
+                for c in safekeepers.chunks(CHUNK) {
+                    diesel::insert_into(schema::safekeepers::table)
+                        .values(c)
+                        .execute(conn)
+                        .await?;
+                }
+                diesel::insert_into(schema::controllers::table)
+                    .values(&rows.controllers)
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+}

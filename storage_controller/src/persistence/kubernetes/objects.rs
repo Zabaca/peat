@@ -611,6 +611,20 @@ pub(crate) fn safekeeper_object_name(id: i64) -> String {
 }
 
 impl SafekeeperSpec {
+    pub(crate) fn from_row(row: &SafekeeperPersistence) -> Self {
+        SafekeeperSpec {
+            id: row.id,
+            region_id: row.region_id.clone(),
+            version: row.version,
+            host: row.host.clone(),
+            port: row.port,
+            http_port: row.http_port,
+            https_port: row.https_port,
+            availability_zone_id: row.availability_zone_id.clone(),
+            scheduling_policy: String::from(row.scheduling_policy.0),
+        }
+    }
+
     pub(crate) fn to_row(&self) -> DatabaseResult<SafekeeperPersistence> {
         let policy =
             pageserver_api::controller_api::SkSchedulingPolicy::from_str(&self.scheduling_policy)

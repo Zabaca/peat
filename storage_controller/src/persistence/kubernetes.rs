@@ -8,10 +8,12 @@
 //! controller relies on for generations (an increment, a split's begin, completion and abort,
 //! one tenant's part of a re-attach) is one write of one object.
 
+pub(crate) mod copy;
 pub(crate) mod objects;
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use kube::api::{Api, DeleteParams, ListParams, PostParams, Preconditions};
@@ -22,6 +24,7 @@ use pageserver_api::controller_api::{
 use pageserver_api::models::{ShardImportStatus, TenantConfig};
 use pageserver_api::shard::{ShardCount, ShardNumber, TenantShardId};
 use safekeeper_api::membership::SafekeeperGeneration;
+use tokio_util::sync::CancellationToken;
 use utils::generation::Generation;
 use utils::id::{NodeId, TenantId, TimelineId};
 
@@ -54,6 +57,10 @@ const LIST_PAGE: u32 = 500;
 pub(crate) struct KubernetesStore {
     client: kube::Client,
     namespace: String,
+    /// The copy in the bucket, when one is configured; written from the start check on.
+    copy: Option<Arc<copy::BucketCopy>>,
+    /// Stops the copy's writing.
+    copy_cancel: CancellationToken,
 }
 
 /// What a read-modify-write does with the object it read.
@@ -67,8 +74,17 @@ enum Write<S> {
 }
 
 impl KubernetesStore {
-    pub(crate) fn new(client: kube::Client, namespace: String) -> Self {
-        KubernetesStore { client, namespace }
+    pub(crate) fn new(
+        client: kube::Client,
+        namespace: String,
+        copy: Option<Arc<copy::BucketCopy>>,
+    ) -> Self {
+        KubernetesStore {
+            client,
+            namespace,
+            copy,
+            copy_cancel: CancellationToken::new(),
+        }
     }
 
     /// Another store on the same records, as a second controller would have.
@@ -77,7 +93,15 @@ impl KubernetesStore {
         KubernetesStore {
             client: self.client.clone(),
             namespace: self.namespace.clone(),
+            copy: None,
+            copy_cancel: CancellationToken::new(),
         }
+    }
+
+    /// Stop writing the copy, as a controller lost with its cluster stops.
+    #[cfg(test)]
+    pub(crate) fn stop_copy(&self) {
+        self.copy_cancel.cancel();
     }
 
     fn api<S: Spec>(&self) -> Api<Object<S>> {
@@ -207,6 +231,40 @@ impl KubernetesStore {
             "Records are kept in Kubernetes objects in namespace {}",
             self.namespace
         );
+
+        if let Some(copy) = &self.copy {
+            // Records lost with their cluster would otherwise start again from nothing: every
+            // pageserver told to drop its tenants, and generations the store has seen handed
+            // out again. Only a restore from the copy goes on from here.
+            let empty = self.list::<TenantSpec>(None).await?.is_empty()
+                && self.list::<PageserverSpec>(None).await?.is_empty()
+                && self.list::<SafekeeperSpec>(None).await?.is_empty();
+            if empty {
+                let held = copy.read().await.map_err(|e| {
+                    DatabaseError::Logical(format!(
+                        "the records are empty, and the copy in the bucket cannot be read to \
+                         check that it is too: {e:#}"
+                    ))
+                })?;
+                if let Some(doc) = held.filter(|d| !d.records.is_empty()) {
+                    return Err(DatabaseError::Logical(format!(
+                        "the records in namespace {} are empty but the copy in the bucket \
+                         (written {}) holds {:?}: restore them with `storcon_records restore` \
+                         before starting the controller",
+                        self.namespace,
+                        doc.written_at,
+                        doc.records.counts()
+                    )));
+                }
+            }
+            copy::spawn(
+                self.client.clone(),
+                self.namespace.clone(),
+                copy.clone(),
+                self.copy_cancel.child_token(),
+            );
+            tracing::info!("Records are copied to the bucket within a second of each change");
+        }
         Ok(())
     }
 
@@ -1630,6 +1688,113 @@ impl KubernetesStore {
                 .any(|t| t.import.is_some()))
         })
         .await
+    }
+}
+
+/// Every record at once, for the copy tool and the copy in the bucket.
+impl KubernetesStore {
+    async fn all<S: Spec>(&self) -> DatabaseResult<BTreeMap<String, S>> {
+        Ok(self
+            .list::<S>(None)
+            .await?
+            .into_iter()
+            .map(|o| (o.metadata.name.unwrap_or_default(), o.spec))
+            .collect())
+    }
+
+    pub(crate) async fn read_all(&self) -> DatabaseResult<super::records::Records> {
+        let mut r = super::records::Records::empty();
+        r.tenants = self.all().await?;
+        r.metadata_health = self.all().await?;
+        r.timelines = self.all().await?;
+        r.pageservers = self.all().await?;
+        r.safekeepers = self.all().await?;
+        r.leader = self.all::<LeaderSpec>().await?.remove(LEADER_OBJECT_NAME);
+        r.sort();
+        Ok(r)
+    }
+
+    /// Write every record as a new object, first deleting every record object there is when
+    /// `replace`.
+    pub(crate) async fn write_all(
+        &self,
+        records: &super::records::Records,
+        replace: bool,
+    ) -> DatabaseResult<()> {
+        async fn put<S: Spec>(
+            store: &KubernetesStore,
+            objects: impl Iterator<Item = (String, S)>,
+            replace: bool,
+        ) -> DatabaseResult<()> {
+            let api = store.api::<S>();
+            if replace {
+                for name in store.all::<S>().await?.into_keys() {
+                    match api.delete(&name, &DeleteParams::default()).await {
+                        Ok(_) => {}
+                        Err(e) if is_not_found(&e) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            futures::stream::iter(objects.map(|(name, spec)| {
+                let api = api.clone();
+                async move {
+                    let obj = Object::new(&name, spec);
+                    let stored = api.create(&PostParams::default(), &obj).await?;
+                    check_stored(&name, &obj.spec, &stored.spec)
+                }
+            }))
+            .buffer_unordered(RE_ATTACH_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await?;
+            Ok(())
+        }
+        put(self, records.tenants.clone().into_iter(), replace).await?;
+        put(self, records.metadata_health.clone().into_iter(), replace).await?;
+        put(self, records.timelines.clone().into_iter(), replace).await?;
+        put(self, records.pageservers.clone().into_iter(), replace).await?;
+        put(self, records.safekeepers.clone().into_iter(), replace).await?;
+        put(
+            self,
+            records
+                .leader
+                .clone()
+                .map(|l| (LEADER_OBJECT_NAME.to_string(), l))
+                .into_iter(),
+            replace,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// A proxy from the environment (`HTTPS_PROXY`) is not used for an API server on this machine
+/// or one that `NO_PROXY` names, as other clients treat it; this client has no proxy support, so
+/// it would otherwise refuse to start.
+pub(crate) fn skip_proxy_where_excluded(config: &mut kube::Config) {
+    if config.proxy_url.is_none() {
+        return;
+    }
+    let host = config.cluster_url.host().unwrap_or_default().to_string();
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let excluded = ["NO_PROXY", "no_proxy"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .flat_map(|list| {
+            list.split(',')
+                .map(|s| s.trim().trim_start_matches('.').to_string())
+                .collect::<Vec<_>>()
+        })
+        .any(|entry| {
+            !entry.is_empty()
+                && (entry == "*" || host == entry || host.ends_with(&format!(".{entry}")))
+        });
+    if loopback || excluded {
+        config.proxy_url = None;
     }
 }
 

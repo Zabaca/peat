@@ -8,6 +8,10 @@ license.workspace = true
 name = "storage_controller"
 path = "src/main.rs"
 
+[[bin]]
+name = "storcon_records"
+path = "src/bin/storcon_records.rs"
+
 [features]
 default = []
 # Enables test-only APIs and behaviors
@@ -46,6 +50,7 @@ safekeeper_api.workspace = true
 safekeeper_client.workspace = true
 tikv-jemallocator.workspace = true
 regex.workspace = true
+remote_storage.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -77,3 +82,6 @@ utils = { path = "../libs/utils/" }
 metrics = { path = "../libs/metrics/" }
 control_plane = { path = "../control_plane" }
 workspace_hack = { version = "0.1", path = "../workspace_hack" }
+
+[dev-dependencies]
+camino-tempfile.workspace = true

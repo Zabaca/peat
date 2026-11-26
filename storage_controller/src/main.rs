@@ -108,6 +108,14 @@ struct Cli {
     #[arg(long)]
     records_namespace: Option<String>,
 
+    /// With `--records kubernetes`: where the copy of the records goes, in the syntax of the
+    /// pageserver's `remote_storage` setting, like
+    /// `{ bucket_name = "records", bucket_region = "auto", endpoint = "https://store.example.com" }`.
+    /// Credentials as for the pageserver (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+    /// Required outside `--dev`.
+    #[arg(long)]
+    records_copy_storage: Option<String>,
+
     /// Flag to enable dev mode, which permits running without auth
     #[arg(long, default_value = "false")]
     dev: bool,
@@ -392,9 +400,19 @@ async fn async_main() -> anyhow::Result<()> {
 
     let secrets = Secrets::load(&args).await?;
 
-    if args.records_namespace.is_some() && args.records == Records::Postgres {
-        anyhow::bail!("`--records-namespace` is only meaningful with `--records kubernetes`");
+    if args.records == Records::Postgres
+        && (args.records_namespace.is_some() || args.records_copy_storage.is_some())
+    {
+        anyhow::bail!(
+            "`--records-namespace` and `--records-copy-storage` are only meaningful with `--records kubernetes`"
+        );
     }
+    let records_copy = args
+        .records_copy_storage
+        .as_deref()
+        .map(remote_storage::RemoteStorageConfig::from_toml_str)
+        .transpose()
+        .context("reading `--records-copy-storage`")?;
 
     // Validate required secrets and arguments are provided in strict mode
     match strict_mode {
@@ -420,10 +438,13 @@ async fn async_main() -> anyhow::Result<()> {
         StrictMode::Strict if args.use_local_compute_notifications => {
             anyhow::bail!("`--use-local-compute-notifications` is only permitted in `--dev` mode");
         }
-        // The Kubernetes store's copy in a bucket, its way back from a lost cluster, is not
-        // built yet (storage_controller/kubernetes/README.md); until it is, it is for testing.
-        StrictMode::Strict if args.records == Records::Kubernetes => {
-            anyhow::bail!("`--records kubernetes` is only permitted in `--dev` mode for now");
+        // The copy in the bucket is the Kubernetes store's way back from a lost cluster.
+        StrictMode::Strict
+            if args.records == Records::Kubernetes && args.records_copy_storage.is_none() =>
+        {
+            anyhow::bail!(
+                "`--records kubernetes` without `--records-copy-storage` is only permitted in `--dev` mode"
+            );
         }
         StrictMode::Strict if args.timeline_safekeeper_count < 3 => {
             anyhow::bail!(
@@ -520,9 +541,11 @@ async fn async_main() -> anyhow::Result<()> {
             Persistence::await_connection(&database_url, args.db_connect_timeout.into()).await?;
             Persistence::new(database_url).await
         }
-        (Records::Kubernetes, None) => Persistence::new_kubernetes(args.records_namespace)
-            .await
-            .context("connecting to the Kubernetes API server")?,
+        (Records::Kubernetes, None) => {
+            Persistence::new_kubernetes(None, args.records_namespace, records_copy)
+                .await
+                .context("connecting to the Kubernetes API server")?
+        }
         _ => unreachable!("checked when the secrets were loaded"),
     };
     let persistence = Arc::new(persistence);
