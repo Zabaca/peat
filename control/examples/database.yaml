@@ -1,0 +1,27 @@
+# Databases as objects: the command (peat make, peat branch, peat restore) writes these same objects.
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Database
+metadata:
+  name: orders
+  namespace: shop
+spec:
+  pgVersion: 19
+---
+# A copy-on-write branch of orders, as it is now.
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Database
+metadata:
+  name: orders-dev
+  namespace: shop
+spec:
+  parent: orders
+---
+# orders as it was at a moment: a new database; orders is untouched.
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Database
+metadata:
+  name: orders-tuesday
+  namespace: shop
+spec:
+  parent: orders
+  at: "2026-12-01T09:30:00Z"
