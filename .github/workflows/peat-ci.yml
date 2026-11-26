@@ -3,9 +3,11 @@ name: Peat CI
 # Every change (pull requests, pushes to main): the release build and Neon's Rust tests,
 # on arm64 and on amd64, each on its own native runner.
 # Merges to main, release tags and manual runs: also Neon's Python regression suite on
-# Postgres 18 on both, split into shards that each fit one standard GitHub-hosted runner
-# (4 vCPU, 16 GB of memory, free and unlimited for public repositories), and the images,
-# one per architecture, which the publish job joins into one multi-arch image per tag.
+# Postgres 18 on both, and on Postgres 19 on arm64, split into shards that each fit one
+# standard GitHub-hosted runner (4 vCPU, 16 GB of memory, free and unlimited for public
+# repositories), and the images, one per architecture, which the publish job joins into one
+# multi-arch image per tag. Postgres 18 is Peat's default and what every database runs on;
+# Postgres 19 (peat-postgres's REL_19_STABLE_peat) is built and tested beside it.
 # No job needs a machine of ours. See README.md, "Continuous integration".
 
 on:
@@ -84,10 +86,11 @@ jobs:
       - name: Install build dependencies
         run: .github/peat/install-deps.sh
 
-      # Peat builds and tests Postgres 18 only (James, 2026-11-18). The walproposer library
-      # the safekeeper's simulation tests link is built against 18 too (Makefile,
-      # libs/walproposer/build.rs; Neon builds it against 17). What else the tree needs to
-      # compile: the headers of 14 to 17, from which postgres_ffi generates its bindings.
+      # Peat builds and tests Postgres 18 (James, 2026-11-18) and, since the port, 19. The
+      # walproposer library the safekeeper's simulation tests link is built against 18
+      # (Makefile, libs/walproposer/build.rs; Neon builds it against 17). What else the tree
+      # needs to compile: the headers of 14 to 17, from which postgres_ffi generates its
+      # bindings.
       # Postgres is cached by the commits of its five trees, the build rules and what else
       # decides the build (runner image, compiler, build type); the cache is only
       # written from pushes to main, so nothing a pull request builds is restored elsewhere
@@ -95,12 +98,12 @@ jobs:
       - name: Postgres cache key
         id: pg
         run: |
-          trees=$(git submodule status vendor/postgres-v14 vendor/postgres-v15 vendor/postgres-v16 vendor/postgres-v17 vendor/postgres-v18 | sha256sum | cut -c1-16)
+          trees=$(git submodule status vendor/postgres-v14 vendor/postgres-v15 vendor/postgres-v16 vendor/postgres-v17 vendor/postgres-v18 vendor/postgres-v19 | sha256sum | cut -c1-16)
           rules=$(cat Makefile postgres.mk .github/peat/install-deps.sh | sha256sum | cut -c1-16)
           # The runner image (its system libraries), the C compiler and the build type also
           # decide what the cached Postgres is, and it feeds the published images.
           compiler=$( (cc --version | head -1; mold --version) | sha256sum | cut -c1-12)
-          echo "key=postgres-18full-hdr14to17-$BUILD_TYPE-${ImageOS:-unknown}-${ImageVersion:-unknown}-$(uname -m)-$compiler-$trees-$rules" >> "$GITHUB_OUTPUT"
+          echo "key=postgres-18and19full-hdr14to17-$BUILD_TYPE-${ImageOS:-unknown}-${ImageVersion:-unknown}-$(uname -m)-$compiler-$trees-$rules" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: pg-cache
@@ -109,11 +112,13 @@ jobs:
             pg_install
             build/v18/src/test/regress
             build/v18/src/test/isolation
+            build/v19/src/test/regress
+            build/v19/src/test/isolation
           key: ${{ steps.pg.outputs.key }}
 
-      - name: Build Postgres (18 in full, headers of 14 to 17)
+      - name: Build Postgres (18 and 19 in full, headers of 14 to 17)
         if: steps.pg-cache.outputs.cache-hit != 'true'
-        run: mold -run make -j"$(nproc)" postgres-install-v18 postgres-headers-install
+        run: mold -run make -j"$(nproc)" postgres-install-v18 postgres-install-v19 postgres-headers-install
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.pg-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -122,17 +127,19 @@ jobs:
             pg_install
             build/v18/src/test/regress
             build/v18/src/test/isolation
+            build/v19/src/test/regress
+            build/v19/src/test/isolation
           key: ${{ steps.pg.outputs.key }}
 
-      - name: Build (Neon, Neon's extension for 18, walproposer, Rust test binaries)
+      - name: Build (Neon, Neon's extension for 18 and 19, walproposer, Rust test binaries)
         run: |
-          mold -run make -j"$(nproc)" PG_INSTALL_CACHED=1 neon neon-pg-ext-v18 CARGO_BUILD_FLAGS="$CARGO_FLAGS"
+          mold -run make -j"$(nproc)" PG_INSTALL_CACHED=1 neon neon-pg-ext-v18 neon-pg-ext-v19 CARGO_BUILD_FLAGS="$CARGO_FLAGS"
           read -ra flags <<< "$CARGO_FLAGS"
           mold -run cargo build "${flags[@]}" --release --tests
           df -h /
 
       # Fourteen Rust tests run programs of Postgres 14 to 17, which Peat does not build:
-      # wal_craft's WAL crafting for 14 to 17 (twelve; 18's run) and the pageserver's two
+      # wal_craft's WAL crafting for 14 to 17 (twelve; 18's and 19's run) and the pageserver's two
       # short walredo tests, whose WAL records and expected page were made on 14 (18 rejects
       # those records). They are left out here, not removed. walredo's ping and stderr tests
       # run on 18.
@@ -268,6 +275,103 @@ jobs:
           path: ${{ runner.temp }}/results
           retention-days: 7
 
+  # The same suite on Postgres 19 (peat-postgres's REL_19_STABLE_peat), built beside 18 by the
+  # build job above; arm64 only, where 18 is tested on both. 19 is not what any database
+  # runs on: its result is judged, not gated, by the rule of the stage 3 record (a failure, or
+  # a measure off by 2x or more, is flagged); the publish job waits for it all the same, so
+  # that no image carrying 19 goes out untested. The tests Neon marks as default-version only
+  # (`run_only_on_default_postgres`, Postgres 18 here) are skipped, as they are on 17 in
+  # Neon's own CI.
+  regress-pg19:
+    # No expression in the name: GitHub does not evaluate a skipped job's name (pull requests
+    # skip this job), and appends the matrix (architecture, then shard 1 to 8 or solo) to a
+    # plain one. Waits for both architectures' builds (a matrix job's needs cannot name one
+    # leg), so a failed build of either skips every shard.
+    name: regression suite, Postgres 19
+    needs: [ build ]
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ arm64 ]
+        # 'solo': the tests of .github/peat/solo-tests.txt, one at a time on a larger
+        # filesystem (each peaks at about 12 GB of test output).
+        shard: [ '1', '2', '3', '4', '5', '6', '7', '8', 'solo' ]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # The suite runs the upstream pg_regress and isolation tests from the Postgres source.
+      - name: Postgres 19 source
+        run: git submodule update --init --depth 1 vendor/postgres-v19
+
+      - name: Free disk space
+        run: .github/peat/free-disk.sh
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+
+      - name: Install the test suite's dependencies
+        run: |
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+            libreadline8 libicu74 libseccomp2 libpq5 zstd lsof
+          python -m pip install --quiet --require-hashes --no-deps -r .github/peat/poetry-requirements.txt
+          ./scripts/pysync
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: peat-release-${{ matrix.arch }}
+          path: ${{ runner.temp }}
+
+      - name: Unpack the binaries
+        run: |
+          zstd -dc "$RUNNER_TEMP/peat-release-${{ matrix.arch }}.tar.zst" | tar -xf -
+          rm "$RUNNER_TEMP/peat-release-${{ matrix.arch }}.tar.zst"
+
+      # Sizes from measurements of each shard on 4 CPUs and 16 GiB: a shard's test output
+      # peaked at 6.7 GB (11 GB keeps it under the pageserver's 80%); each solo test
+      # alone peaked at about 12 GB (16 GB).
+      - name: A filesystem of its own for the test output
+        run: .github/peat/test-filesystem.sh "${{ matrix.shard == 'solo' && '16G' || '11G' }}" /mnt/test-output
+
+      - name: Run the shard
+        env:
+          TEST_OUTPUT: /mnt/test-output/out
+        run: .github/peat/run-shard.sh "${{ matrix.shard }}" "$REGRESS_SHARDS" 19 "${{ matrix.shard == 'solo' && '1' || '4' }}" "$RUNNER_TEMP/junit.xml"
+
+      # Every rerun as a warning annotation and in the job's summary, its first attempt's
+      # logs kept, even when the rerun passed and the job is green.
+      - name: Report reruns
+        if: ${{ !cancelled() }}
+        run: python3 -I .github/peat/report_reruns.py "$RUNNER_TEMP/reruns.jsonl" /mnt/test-output/out "$RUNNER_TEMP/results"
+
+      - name: Keep the shard's results
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          cp "$RUNNER_TEMP/junit.xml" "$RUNNER_TEMP/results/" 2>/dev/null || true
+          df -h /mnt/test-output / > "$RUNNER_TEMP/results/disk.txt" || true
+
+      - name: Keep the logs of a failed shard
+        if: failure()
+        run: |
+          find /mnt/test-output/out -name '*.log' -size -20M -print0 \
+            | tar --null -T - -czf "$RUNNER_TEMP/results/logs.tar.gz" || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: regress-pg19-${{ matrix.arch }}-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/results
+          retention-days: 7
+
   # The publish script, tried against a throwaway registry on the runner with stand-in
   # images: the cases are listed in .github/peat/test-push-images.sh. Every run, and the
   # publish job needs it.
@@ -307,8 +411,10 @@ jobs:
     outputs:
       storage-id-arm64: ${{ steps.ids.outputs.storage-id-arm64 }}
       compute-id-arm64: ${{ steps.ids.outputs.compute-id-arm64 }}
+      compute19-id-arm64: ${{ steps.ids.outputs.compute19-id-arm64 }}
       storage-id-amd64: ${{ steps.ids.outputs.storage-id-amd64 }}
       compute-id-amd64: ${{ steps.ids.outputs.compute-id-amd64 }}
+      compute19-id-amd64: ${{ steps.ids.outputs.compute19-id-amd64 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -332,18 +438,24 @@ jobs:
             docker build --build-arg REVISION="$GITHUB_SHA" \
               -f ".github/peat/$image.Dockerfile" -t "peat-$image:ci-${{ matrix.arch }}" "$RUNNER_TEMP/ctx"
           done
+          docker build --build-arg REVISION="$GITHUB_SHA" --build-arg PG_MAJOR=19 \
+            -f .github/peat/compute.Dockerfile -t "peat-compute-pg19:ci-${{ matrix.arch }}" "$RUNNER_TEMP/ctx"
           docker image ls 'peat-*'
 
       - name: Check the images
-        run: .github/peat/check-images.sh peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }}
+        run: .github/peat/check-images.sh peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }} peat-compute-pg19:ci-${{ matrix.arch }}
 
       - name: Record the checked images' IDs
         id: ids
         run: |
           storage=$(docker image inspect --format '{{.Id}}' peat-storage:ci-${{ matrix.arch }})
           compute=$(docker image inspect --format '{{.Id}}' peat-compute:ci-${{ matrix.arch }})
-          echo "storage-id-${{ matrix.arch }}=$storage" >> "$GITHUB_OUTPUT"
-          echo "compute-id-${{ matrix.arch }}=$compute" >> "$GITHUB_OUTPUT"
+          compute19=$(docker image inspect --format '{{.Id}}' peat-compute-pg19:ci-${{ matrix.arch }})
+          {
+            echo "storage-id-${{ matrix.arch }}=$storage"
+            echo "compute-id-${{ matrix.arch }}=$compute"
+            echo "compute19-id-${{ matrix.arch }}=$compute19"
+          } >> "$GITHUB_OUTPUT"
           {
             echo "### Checked images (${{ matrix.arch }})"
             echo
@@ -351,12 +463,13 @@ jobs:
             echo "|---|---|"
             echo "| storage | $storage |"
             echo "| compute-pg18 | $compute |"
+            echo "| compute-pg19 | $compute19 |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save the images
         run: |
           mkdir -p "$RUNNER_TEMP/images"
-          docker save peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }} | zstd -T0 -3 -q -o "$RUNNER_TEMP/images/peat-images.tar.zst"
+          docker save peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }} peat-compute-pg19:ci-${{ matrix.arch }} | zstd -T0 -3 -q -o "$RUNNER_TEMP/images/peat-images.tar.zst"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -377,7 +490,7 @@ jobs:
   # only, never moved); the job also refuses a commit that is not on main.
   publish-images:
     name: publish the images (arm64 and amd64)
-    needs: [ images, regress, test-push-images ]
+    needs: [ images, regress, regress-pg19, test-push-images ]
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release-')) &&
@@ -409,23 +522,28 @@ jobs:
         env:
           STORAGE_ID_ARM64: ${{ needs.images.outputs.storage-id-arm64 }}
           COMPUTE_ID_ARM64: ${{ needs.images.outputs.compute-id-arm64 }}
+          COMPUTE19_ID_ARM64: ${{ needs.images.outputs.compute19-id-arm64 }}
           STORAGE_ID_AMD64: ${{ needs.images.outputs.storage-id-amd64 }}
           COMPUTE_ID_AMD64: ${{ needs.images.outputs.compute-id-amd64 }}
+          COMPUTE19_ID_AMD64: ${{ needs.images.outputs.compute19-id-amd64 }}
         run: |
           for arch in arm64 amd64; do
             zstd -dc "$RUNNER_TEMP/archives/peat-images-docker-$arch/peat-images.tar.zst" | docker load
           done
           for arch in arm64 amd64; do
             up=$(echo "$arch" | tr '[:lower:]' '[:upper:]')
-            want_s=STORAGE_ID_$up; want_c=COMPUTE_ID_$up
+            want_s=STORAGE_ID_$up; want_c=COMPUTE_ID_$up; want_c19=COMPUTE19_ID_$up
             loaded_s=$(docker image inspect --format '{{.Id}}' "peat-storage:ci-$arch")
             loaded_c=$(docker image inspect --format '{{.Id}}' "peat-compute:ci-$arch")
+            loaded_c19=$(docker image inspect --format '{{.Id}}' "peat-compute-pg19:ci-$arch")
             # Not "test -n a && test -n b": a failed && list does not stop a bash -e script.
             [ -n "${!want_s}" ] || { echo "::error::no checked storage image ID ($arch)"; exit 1; }
             [ -n "${!want_c}" ] || { echo "::error::no checked compute image ID ($arch)"; exit 1; }
+            [ -n "${!want_c19}" ] || { echo "::error::no checked compute 19 image ID ($arch)"; exit 1; }
             [ "$loaded_s" = "${!want_s}" ] || { echo "::error::storage image ($arch) $loaded_s is not the checked ${!want_s}"; exit 1; }
             [ "$loaded_c" = "${!want_c}" ] || { echo "::error::compute image ($arch) $loaded_c is not the checked ${!want_c}"; exit 1; }
-            echo "$arch: both loaded images are the checked ones"
+            [ "$loaded_c19" = "${!want_c19}" ] || { echo "::error::compute 19 image ($arch) $loaded_c19 is not the checked ${!want_c19}"; exit 1; }
+            echo "$arch: the loaded images are the checked ones"
           done
 
       - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
@@ -434,11 +552,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ghcr.io/zabaca/peat/storage and ghcr.io/zabaca/peat/compute-pg18, tagged with the
-      # full commit hash on a merge to main, or with the release tag's name: each tag one
-      # multi-arch image (arm64 and amd64), made by .github/peat/push-images.sh.
+      # ghcr.io/zabaca/peat/storage, ghcr.io/zabaca/peat/compute-pg18 and
+      # ghcr.io/zabaca/peat/compute-pg19, tagged with the full commit hash on a merge to main,
+      # or with the release tag's name: each tag one multi-arch image (arm64 and amd64), made
+      # by .github/peat/push-images.sh (a second call for compute-pg19, so the first two are
+      # published exactly as before).
       - name: Push
         env:
           REPO: ghcr.io/${{ github.repository }}
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
-        run: .github/peat/push-images.sh "$(echo "$REPO" | tr '[:upper:]' '[:lower:]')" "$TAG"
+        run: |
+          repo=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          .github/peat/push-images.sh "$repo" "$TAG"
+          PEAT_IMAGE_NAMES=compute-pg19 .github/peat/push-images.sh "$repo" "$TAG"
