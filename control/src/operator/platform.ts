@@ -56,7 +56,7 @@ export function specOf(p: Platform): { spec: PlatformSpec } | { errors: string[]
   for (const piece of ['pageservers', 'safekeepers', 'records'] as const) if (!store[piece] && !(store.bucket && store.credentialsSecret)) missing.push(piece)
   if (missing.length) errors.push(`objectStore: no bucket and credentialsSecret for ${missing.join(', ')} (give the one bucket and its Secret, or one for each piece)`)
   if (spec.controller.records === 'postgres' && !spec.controller.postgres) errors.push('controller.postgres: is required when records is postgres')
-  for (const [field, ns] of Object.entries(spec.namespaces)) if (['default', 'kube-system', 'kube-public', 'kube-node-lease'].includes(ns)) errors.push(`namespaces.${field}: ${ns} is the cluster's own; the platform needs namespaces of its own`)
+  for (const [field, ns] of Object.entries(spec.namespaces)) if (ns === 'default' || ns.startsWith('kube-')) errors.push(`namespaces.${field}: ${ns} is the cluster's own; the platform needs namespaces of its own`)
   if (spec.safekeepers.machines && spec.safekeepers.machines.length !== spec.safekeepers.count) errors.push(`safekeepers.machines: names ${spec.safekeepers.machines.length} machines for ${spec.safekeepers.count} safekeepers`)
   if (spec.pageservers.machines && spec.pageservers.machines.length !== spec.pageservers.count) errors.push(`pageservers.machines: names ${spec.pageservers.machines.length} machines for ${spec.pageservers.count} pageservers`)
   if (spec.pageservers.storage.storageClass || spec.safekeepers.storage.storageClass) errors.push('storage.storageClass: not supported yet; use hostPath')
@@ -100,7 +100,7 @@ export function choosePlacements(spec: PlatformSpec, machines: string[], kept: P
     for (let i = out.length, f = 0; i < count; i++) out.push({ id: Math.max(0, ...out.map((x) => x.id)) + 1, node: spec.spread === 'none' ? sorted[0]! : (free[f++] ?? '') })
     return out
   }
-  const pageservers = pick('pageservers', spec.pageservers.count, spec.pageservers.machines, kept.pageservers)
+  const pageservers = pick('pageservers', spec.pageservers.count!, spec.pageservers.machines, kept.pageservers)
   const psNodes = pageservers.map((p) => p.node)
   const controller = kept.controller ?? spec.controller.machine ?? (spec.spread === 'none' ? sorted[0]! : (sorted.find((m) => !psNodes.includes(m)) ?? ''))
   // the safekeepers' first members on machines of distinct zones (the controller picks each timeline's members from distinct zones, so a set

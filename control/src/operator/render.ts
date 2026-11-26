@@ -303,7 +303,7 @@ export function controlEnv(r: Resolved, images = r.images): { name: string; valu
     // the release the safekeepers it makes are stamped with
     { name: 'RELEASE', value: images.release },
     { name: 'DEFAULT_PG_VERSION', value: String(s.computes.defaultPgVersion) },
-    { name: 'PAGESERVER_SECONDARIES', value: s.pageservers.count > 1 ? '1' : '0' },
+    { name: 'PAGESERVER_SECONDARIES', value: s.pageservers.count! > 1 ? '1' : '0' },
     { name: 'IDLE_MINUTES', value: String(idleMinutesOf(s.computes.idleAfter)) },
     { name: 'COMPUTE_MEMORY_REQUEST', value: s.computes.memory.request },
     { name: 'COMPUTE_MEMORY_LIMIT', value: s.computes.memory.limit },
