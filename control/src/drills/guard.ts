@@ -61,7 +61,8 @@ export interface DrillSettings {
   /** The ConfigMap, in the database namespace, holding the authority's public certificate (ca.crt): what a client verifies the databases with. */
   caConfigMap: string
   /** The full-sleep time the control layer and the gateways run with (the sleep drills shorten it and the check after a drill wants it back). */
-  idleMinutes: string
+  /** The platform's computes.idleAfter (a duration): the pieces' IDLE_MINUTES must match it after a drill. */
+  idleAfter: string
   controllerDatabase: ControllerDatabase | null
   /** Names of databases that may be lost by the drills that lose every safekeeper's copy, beside the drills' own (`drill*`). */
   recreatable: RegExp
@@ -113,7 +114,7 @@ export function drillSettings(env: Record<string, string | undefined> = process.
     rulesFile: env['PEAT_DRILL_RULES'] || null,
     volumes,
     caConfigMap: env['PEAT_CA_CONFIGMAP'] || 'peat-ca',
-    idleMinutes: env['IDLE_MINUTES'] || '30',
+    idleAfter: env['PEAT_IDLE_AFTER'] || '30m',
     controllerDatabase: cdb ? { cluster: 'storcon-db', image: '', storageClass: '', objectStore: '', archive: cdb.cluster ?? 'storcon-db', database: 'storage_controller', machine: '', ...cdb } as ControllerDatabase : null,
     recreatable: new RegExp(env['PEAT_DRILL_RECREATABLE'] ? `^drill|${env['PEAT_DRILL_RECREATABLE']}` : '^drill'),
     watched: env['PEAT_DRILL_WATCHED'] ? env['PEAT_DRILL_WATCHED'].split(',').map((s) => s.trim()).filter(Boolean) : null,

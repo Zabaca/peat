@@ -2,31 +2,35 @@
 // know who is real); it finds the shapes a real name takes and allows only what is plainly not one:
 //
 //  - dash: an em dash or an en dash (the folder's prose uses commas, colons, semicolons and parentheses);
-//  - address: an IPv4 address outside the documentation ranges (RFC 5737), loopback and the unspecified address;
+//  - address: an IPv4 address outside the documentation ranges (RFC 5737), loopback and the unspecified address; an IPv6 address outside
+//    the documentation prefix 2001:db8::/32 (RFC 3849), loopback and the unspecified address;
 //  - host: a host name under a real top-level domain that is not a reserved example (RFC 2606) or a third party listed below with its
-//    reason, and a bucket named in an Amazon S3 host or path;
+//    reason, and a bucket named in an Amazon S3 host or path or an s3:// address;
 //  - email: an address at any domain but a reserved example;
 //  - maintainer: the maintainer's name anywhere but its public addresses (this repository, its images, the API group of Peat's object kinds)
 //    and a credit or licence line;
 //  - record: a path of a document this repository does not hold (a reference a reader cannot follow).
 //
 // In TypeScript and JavaScript, hosts and addresses of mail are looked for in comments and in the text of strings only: code is property
-// chains (`o.metadata.name`), which read like host names. Text quoted in backticks inside a comment is code too. A host may begin after a
-// `.`, `*.` or `${...}.`, so a name put together in a template is found. A two-letter top-level domain that is also a file's extension (md,
-// sh, rs, py, pl, so) is not read as one: `README.md` is a file.
+// chains (`o.metadata.name`), which read like host names. A host may begin after a `.`, `*.`, `${...}.` or `@`, so a name put together in
+// a template, or the domain of an address, is found. Every top-level domain IANA lists counts (src/tlds.txt), less: those that are also a
+// file's extension (md, sh, rs, py, pl, so, ps, mk: `README.md` is a file); a name with a label of one letter (`d.name`, `o.metadata.at`:
+// property chains); and a few last labels that are property names of this code (CODE_PROPERTIES, each with its reason).
 //
 // A pure function over one file's path and text, so its rules are tested on made-up lines (test/public-names.test.ts); the same test runs
 // it over the whole folder and fails on any finding. A second layer, with a private list of names, is run by the maintainer before a change
 // to this folder merges.
 
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 export interface Hit { path: string; line: number; kind: string; detail: string }
 
-/** The country-code top-level domains (ISO 3166-1 alpha-2, as delegated), and the generic ones a host here could plausibly end in. */
-const CC = 'ac ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg er es et eu fi fj fk fm fo fr ga gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc me mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pm pn pr ps pt pw qa re ro ru rw sb sc sd se sg si sk sl sm sn sr ss st su sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug uk us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw'
-const GENERIC = 'com net org edu gov mil int info biz app dev ai cloud tech xyz site online store shop live blog page link pro tv io co me ly gg global group team company agency studio digital network systems solutions services software email website space world today news zone club works one top icu art bot inc llc ltd'
+/** The top-level domains, as IANA lists them (src/tlds.txt). */
+const IANA = readFileSync(join(import.meta.dir, 'tlds.txt'), 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
 /** Two-letter domains that are also files' extensions: read as files. */
 const EXTENSIONS = new Set(['md', 'sh', 'rs', 'py', 'pl', 'so', 'ps', 'mk'])
-const TLDS = new Set([...CC.split(' '), ...GENERIC.split(' ')].filter((t) => !EXTENSIONS.has(t)))
+const TLDS = new Set(IANA.filter((t) => !EXTENSIONS.has(t)))
 
 /** Third parties' domains the code or its documentation names, each with why; a domain listed allows everything under it. */
 export const THIRD_PARTY_DOMAINS: Record<string, string> = {
@@ -47,6 +51,7 @@ export const THIRD_PARTY_DOMAINS: Record<string, string> = {
   'bun.sh': 'Bun: the runtime and its documentation',
   'min.io': 'MinIO: the S3-compatible store the install test starts',
   'ietf.org': 'IETF: RFCs',
+  'iana.org': 'IANA: the list of top-level domains this check reads (src/tlds.txt)',
   'rfc-editor.org': 'RFCs',
 }
 
@@ -82,7 +87,7 @@ export function proseOf(text: string): string {
   const out: string[] = text.split('').map((c) => (c === '\n' ? '\n' : ' '))
   const keep = (i: number) => { out[i] = text[i]! }
   const stack: ('code' | 'template')[] = ['code']
-  let braces: number[] = [0]
+  const braces: number[] = [0]
   let i = 0
   let prev = '' // the last significant code character, to tell a regular expression from a division
   while (i < text.length) {
@@ -94,16 +99,14 @@ export function proseOf(text: string): string {
       if (c === '$' && n === '{') { stack.push('code'); braces.push(0); i += 2; prev = '{'; continue }
       keep(i); i++; continue
     }
-    if (c === '/' && n === '/') { // a line comment: prose, less its backtick spans
+    if (c === '/' && n === '/') { // a line comment: prose, its backtick-quoted text included (a host quoted there is still a host)
       let j = i + 2
-      let tick = false
-      while (j < text.length && text[j] !== '\n') { if (text[j] === '`') tick = !tick; else if (!tick) keep(j); j++ }
+      while (j < text.length && text[j] !== '\n') { keep(j); j++ }
       i = j; continue
     }
     if (c === '/' && n === '*') {
       let j = i + 2
-      let tick = false
-      while (j < text.length && !(text[j] === '*' && text[j + 1] === '/')) { if (text[j] === '`') tick = !tick; else if (!tick) keep(j); j++ }
+      while (j < text.length && !(text[j] === '*' && text[j + 1] === '/')) { keep(j); j++ }
       i = j + 2; continue
     }
     if (c === '"' || c === "'") {
@@ -112,7 +115,9 @@ export function proseOf(text: string): string {
       i = j + 1; prev = c; continue
     }
     if (c === '`') { stack.push('template'); i++; continue }
-    if (c === '/' && (prev === '' || /[(,=:[!&|?{};+\-*%<>~^]/.test(prev) || /\b(?:return|typeof|case|in|of)\s*$/.test(text.slice(Math.max(0, i - 8), i)))) {
+    // a slash after `x++` or `x--` is a division, not the start of a regular expression
+    const afterStep = (prev === '+' || prev === '-') && /(\+\+|--)\s*$/.test(text.slice(Math.max(0, i - 6), i))
+    if (c === '/' && !afterStep && (prev === '' || /[(,=:[!&|?{};+\-*%<>~^]/.test(prev) || /\b(?:return|typeof|case|in|of)\s*$/.test(text.slice(Math.max(0, i - 8), i)))) {
       // a regular-expression literal: code, read to its end (a slash in a character class does not end it)
       let j = i + 1, cls = false
       while (j < text.length && text[j] !== '\n') { if (text[j] === '\\') { j += 2; continue } if (text[j] === '[') cls = true; else if (text[j] === ']') cls = false; else if (text[j] === '/' && !cls) break; j++ }
@@ -126,13 +131,25 @@ export function proseOf(text: string): string {
     if (!/\s/.test(c)) prev = c
     i++
   }
-  braces = []
   return out.join('')
 }
 
 const CODE_FILE = /\.(?:[cm]?[jt]sx?)$/
-/** Last labels that are top-level domains and also property names this code reads, quoted in its tests' strings; each with its reason. */
-const CODE_PROPERTIES = new Set(['pg' /* a database's Postgres version */, 'id' /* every record's id */, 'at' /* a Database's moment, in the kinds' rules */])
+/**
+ * Last labels that are top-level domains and also property names this code reads (quoted in its comments, its tests' strings and its
+ * kinds' rules), each with its reason: a host under one of these is not found.
+ */
+const CODE_PROPERTIES = new Set([
+  'pg', // a database's Postgres version (d.pg)
+  'id', // every record's id (sk.id)
+  'at', // a Database's moment (self.at)
+  'name', // every object's name (metadata.name)
+  'now', // the clock (Date.now)
+  'host', // a database's host (status.host)
+  'storage', // the storage image (images.storage)
+  'direct', // a wake's direct dial (wake.direct)
+  'data', // a ConfigMap's or Secret's data (json.data)
+])
 
 /** The findings of one file. `path` is relative to the folder scanned; `exists` says whether a path relative to the repository's root is in it. */
 export function publicNameHits(path: string, text: string, exists: (repoPath: string) => boolean = () => true): Hit[] {
@@ -157,21 +174,20 @@ export function publicNameHits(path: string, text: string, exists: (repoPath: st
       if (m[1] === 'git' && domain === 'github.com') continue
       if (!reservedHost(domain) && realDomain(domain)) add('email', m[0])
     }
-    for (const m of said.matchAll(/(?<![A-Za-z0-9_@-])((?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,})(?![A-Za-z0-9_-])/g)) {
+    for (const m of said.matchAll(/(?<![A-Za-z0-9_-])((?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9])(?![A-Za-z0-9_-])/g)) {
       const host = m[1]!.toLowerCase()
       if (!realDomain(host) || reservedHost(host)) continue
-      // under a two-letter domain, a name with a label of one letter or a second-level label of two (`d.pg`, `sk.id`, `i.data.pg`) is a
-      // property chain quoted in a string, not a host
+      // a name with a label of one letter (`d.name`, `i.data.pg`) is a property chain, not a host; so is one ending in a property name of this code
       const labels = host.split('.')
-      if (labels.at(-1)!.length === 2 && (labels.some((l) => l.length === 1) || labels.at(-2)!.length < 3)) continue
-      // in code's strings, a last label that this code uses as a property name: `pg` (a database's Postgres version)
-      if (CODE_FILE.test(path) && CODE_PROPERTIES.has(labels.at(-1)!)) continue
+      if (labels.some((l) => l.length === 1)) continue
+      if (CODE_PROPERTIES.has(labels.at(-1)!)) continue
       if (host === 'peat.zabaca.com' || host.endsWith('.peat.zabaca.com')) continue
       const third = Object.keys(THIRD_PARTY_DOMAINS).find((d) => endsWithDomain(host, d))
       if (!third) { add('host', host); continue }
       const rest = said.slice((m.index ?? 0) + m[0].length)
       if (third === 'github.com' || third === 'ghcr.io' || third === 'githubusercontent.com') {
-        const owner = /^\/([A-Za-z0-9_.-]+)/.exec(rest)?.[1]?.toLowerCase()
+        // the owner after the host: `/owner` in an address, `:owner` in git's own (git@github.com:owner/repository.git)
+        const owner = /^[/:]([A-Za-z0-9_.-]+)/.exec(rest)?.[1]?.toLowerCase()
         if (owner && !(owner in GITHUB_OWNERS)) add('host', `${host}/${owner}`)
       }
       if (third === 'amazonaws.com') {
@@ -181,6 +197,16 @@ export function publicNameHits(path: string, text: string, exists: (repoPath: st
         const bucket = inHost ?? inPath
         if (bucket && !/^(?:example|my-bucket|bucket|your-bucket)(?:[.-]|$)/.test(bucket)) add('host', `${host}${inPath ? `/${inPath}` : ''}: a bucket`)
       }
+    }
+    // a bucket in an s3:// address
+    for (const m of said.matchAll(/\bs3:\/\/([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])/g)) if (!/^(?:example|my-bucket|bucket|your-bucket)(?:[.-]|$)/.test(m[1]!)) add('host', `s3://${m[1]}: a bucket`)
+    // an IPv6 address: two or more groups of hex digits, with a :: or eight groups, and a letter or a :: (so a time of day is none)
+    for (const m of line.matchAll(/(?<![\w:.])((?:[0-9a-fA-F]{1,4})?(?::[0-9a-fA-F]{0,4}){2,7})(?![\w:.])/g)) {
+      const a = m[1]!.toLowerCase()
+      const groups = a.split(':')
+      if (!(a.includes('::') || groups.length === 8) || !(/[a-f]/.test(a) || a.includes('::')) || groups.filter(Boolean).length === 0) continue
+      if (/^2001:0?db8(?::|$)/.test(a) || a === '::1' || a === '::' || /^::ffff:/.test(a) || /^fe80:/.test(a)) continue
+      add('address', a)
     }
     if (!licence && !CREDIT.test(line)) {
       let rest = line

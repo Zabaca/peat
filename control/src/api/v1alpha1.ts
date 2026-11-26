@@ -69,10 +69,10 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     platform: str('The storage, the control layer and its records.', { default: 'peat' }),
     computes: str("The databases' computes.", { default: 'peat-compute' }),
     gateways: str('The gateways and the front door.', { default: 'peat-gateway' }),
-    databases: str("Each database's name inside the cluster (an ExternalName Service per database).", { default: 'peat-db' }),
+    databases: str("Each database's name inside the cluster (an ExternalName Service per database), and the ConfigMap peat-ca: the authority's public certificate (ca.crt), which every namespace that holds a Database also gets.", { default: 'peat-db' }),
   }, { default: { platform: 'peat', computes: 'peat-compute', gateways: 'peat-gateway', databases: 'peat-db' }, ...rules(
     ['self == oldSelf', 'the namespaces cannot change: the platform\'s pieces and its data live in them'],
-    ["[self.platform, self.computes, self.gateways, self.databases].all(n, !(n in ['default', 'kube-system', 'kube-public', 'kube-node-lease']))", 'a namespace of the platform may not be default or one of the cluster\'s own (kube-system, kube-public, kube-node-lease)'],
+    ["[self.platform, self.computes, self.gateways, self.databases].all(n, n != 'default' && !n.startsWith('kube-'))", 'a namespace of the platform may not be default or one of the kube- namespaces'],
   ) }),
   machines: obj('The machines the platform runs on.', {
     label: label('The label that marks them: the operator places every piece on these and the control layer probes and taints these and no other.', { key: `${GROUP}/machine`, value: 'true' }),
@@ -182,7 +182,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
     halted: obj('Where and why it halted.', { at: str('When.', { format: 'date-time' }), step: str('The step.'), reason: str('Why.') }),
     retried: str('The last retry request answered.'),
   }),
-  answered: obj('The requests answered, by the value that was asked.', { retry: str('The retry answered.'), applyPending: str('The applyPending answered.') }),
+  answered: obj('The requests answered, by the value that was asked (the retry an upgrade answered is upgrade.retried).', { applyPending: str('The applyPending answered.') }),
   pendingChanges: list('Differences between an adopted object and what the operator would make, not applied (requests.applyPending applies them).', obj('A difference.', { kind: str('Kind.'), namespace: str('Namespace.'), name: str('Name.'), change: str('What would change.') })),
   conditions: list('Conditions.', condition),
 })
@@ -190,7 +190,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
 // ---- Database
 
 export const databaseSpec: Schema = obj('A database on the platform. Its name is the object\'s name (1 to 31 lowercase letters, digits or hyphens, starting with a letter), unique across the platform; it is reached at <name>.<the platform\'s domain> through the front door, and inside the cluster at <name>.<database namespace>.svc.', {
-  pgVersion: int("Its Postgres version; default the platform's. Raising it moves the database to the newer version under its own name, address and login (the door is shut for the copy, every table is compared, the old copy is kept stopped); lowering it is refused.", { enum: [...PG_VERSIONS] }),
+  pgVersion: int("Its Postgres version; default the platform's. Raising it moves the database to the newer version under its own name, address and login (the door is shut for the copy, every table is compared, the old copy is kept stopped); lowering it is refused, and so is any version below the one it runs (status.pgVersion), as for a database made without one and later given an older one.", { enum: [...PG_VERSIONS] }),
   parent: str('A database (in the same namespace) this one is made from: a copy-on-write branch of it, or, with at, a restore of it to a moment. The parent is untouched.', { pattern: DATABASE_NAME }),
   at: str('With parent: the moment (an RFC 3339 time) or the log position (X/Y) the copy is made at; none: now.'),
   replicaOf: str("A database this one is a read replica of: a second compute on its parent's data, read only.", { pattern: DATABASE_NAME }),
@@ -248,7 +248,7 @@ export interface PlatformSpec {
   machines: { label: { key: string; value: string }; taint?: { key: string; value?: string; effect: string }; deadTaint?: { key: string; value?: string; effect: string } }
   spread: 'machines' | 'none'
   objectStore: { endpoint: string; region: string; bucket?: string; credentialsSecret?: string; pageservers?: Store; safekeepers?: Store; records?: Store; walTrim?: { credentialsSecret: string } }
-  pageservers: { count: number; machines?: string[]; memory: Memory; storage: Storage }
+  pageservers: { count?: number; machines?: string[]; memory: Memory; storage: Storage }
   safekeepers: { count: 3 | 5; zoneLabel: string; machines?: string[]; outside?: { machines?: string[]; label: { key: string; value: string }; tolerations?: Record<string, unknown>[] }; memory: Memory; storage: Storage }
   controller: { records: 'kubernetes' | 'postgres'; postgres?: { urlSecret: string; key: string }; machine?: string; memory: Memory }
   gateways: { count: number; domain?: string; service: { type: 'ClusterIP' | 'LoadBalancer' | 'NodePort'; annotations?: Record<string, string> }; memory: Memory }

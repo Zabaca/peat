@@ -40,7 +40,7 @@ describe('the rules', () => {
   test('an email: only at a reserved example domain', () => {
     expect(kinds('owner: ops@example.com')).toEqual([])
     expect(kinds('git@github.com:Zabaca/peat.git')).toEqual([])
-    expect(kinds('owner: someone@acme-corp.com')).toEqual(['email'])
+    expect(kinds('owner: someone@acme-corp.com')).toEqual(['email', 'host'])
     expect(kinds('image ghcr.io/zabaca/peat/storage@sha256:abc')).toEqual([])
   })
 
@@ -64,7 +64,7 @@ describe('the rules', () => {
     expect(kinds("const s = '.acme-corp.com'", 'src/a.ts')).toEqual(['host'])
     expect(kinds("const a = 'acme.co'", 'src/a.ts')).toEqual(['host'])
     expect(kinds("const a = 'acme.app'", 'src/a.ts')).toEqual(['host'])
-    expect(kinds("const m = 'ops@acme.co'", 'src/a.ts')).toEqual(['email'])
+    expect(kinds("const m = 'ops@acme.co'", 'src/a.ts')).toEqual(['email', 'host'])
     expect(kinds('// the backups live at acme-backups.s3.us-west-2.amazonaws.com', 'src/a.ts')).toEqual(['host'])
     expect(kinds('// path style: s3.us-west-2.amazonaws.com/acme-backups/x', 'src/a.ts')).toEqual(['host'])
     expect(kinds('// the API is at s3.us-west-2.amazonaws.com', 'src/a.ts')).toEqual([])
@@ -75,6 +75,52 @@ describe('the rules', () => {
     expect(kinds("// see README.md, control.ts and `o.spec.co` for why; a file x.sh", 'src/a.ts')).toEqual([])
     expect(kinds("const re = /'acme.co'/; const p = '.spec.template.containers'", 'src/a.ts')).toEqual([])
     expect(kinds('acme.co in a document', 'README.md')).toEqual(['host'])
+  })
+})
+
+describe('the second review\'s holes, and attempts to break the check', () => {
+  const code = (line: string) => kinds(line, 'src/a.ts')
+  test('a host quoted in backticks inside a comment', () => {
+    expect(code('// see `db.acme-corp.com`')).toEqual(['host'])
+    expect(code('/* the store: `store.acme-corp.com` */')).toEqual(['host'])
+  })
+  test('a host right after @ with no local part', () => {
+    expect(code('const a = `${user}@acme-corp.com`')).toEqual(['host'])
+    expect(kinds('<user>@acme-corp.com')).toEqual(['host'])
+    expect(code('const o = { domain: "@acme-corp.com" }')).toEqual(['host'])
+  })
+  test('second-level domains of two letters under a country', () => {
+    for (const h of ['acme-corp.co.uk', 'acme.co.jp', 'acme.co.nz', 'acme.co.za', 'acme.co.in', 'acme.ac.uk', 'acme.or.jp', 'hp.de', 'qm.io']) expect([h, kinds(`at ${h}`)]).toEqual([h, ['host']])
+  })
+  test('the newer generic domains, from IANA\'s list', () => {
+    for (const t of ['health', 'clinic', 'law', 'dental', 'media', 'design', 'consulting', 'church', 'nyc', 'vip', 'fun']) expect([t, kinds(`at acme.${t}`)]).toEqual([t, ['host']])
+  })
+  test('git\'s own address names its owner after a colon; an s3:// address names its bucket', () => {
+    expect(kinds('git@github.com:acme-corp/private.git')).toEqual(['host'])
+    expect(kinds('git@github.com:Zabaca/peat.git')).toEqual([])
+    expect(kinds('the copy at s3://acme-backups/path')).toEqual(['host'])
+    expect(kinds('for example s3://example-bucket/path')).toEqual([])
+  })
+  test('IPv6: only the documentation prefix, loopback and the unspecified address', () => {
+    expect(kinds('listen on [::1] and :: and 2001:db8::5')).toEqual([])
+    expect(kinds('the node at 2a01:4f8:c17:1234::1')).toEqual(['address'])
+    expect(kinds('at 05:00:30 and 12:30')).toEqual([])
+  })
+  test('a slash after x++ is a division, and the string after it is still read', () => {
+    expect(code("let x = i++ / 2; const h = 'db.acme-corp.com'")).toEqual(['host'])
+  })
+  test('attempts to break it: a host split by a template, in a URL, uppercase, with a port, in YAML, in a shell line', () => {
+    expect(code('const u = `https://${sub}.acme-corp.com:8443/x`')).toEqual(['host'])
+    expect(code("const u = 'HTTPS://DB.ACME-CORP.COM'")).toEqual(['host'])
+    expect(kinds('endpoint: https://store.acme-corp.io:9000', 'x.yaml')).toEqual(['host'])
+    expect(kinds('curl -fsS https://api.acme-corp.dev/v1', 'x.sh')).toEqual(['host'])
+    expect(code("const m = { 'ops+alerts@acme-corp.com': 1 }")).toEqual(['email', 'host'])
+    expect(code('// mail goes to "Ops" <ops@acme.health>')).toEqual(['email', 'host'])
+  })
+  test('what it lets through on purpose, with why: property chains, files, the listed third parties and the examples', () => {
+    expect(code('// o.metadata.name, Date.now(), status.host, images.storage, json.data')).toEqual([])
+    expect(code("const f = 'README.md', g = 'run.sh', h = 'control.ts'")).toEqual([])
+    expect(code("const a = 'db.example.com', b = 'x.test', c = 'kubernetes.io/hostname'")).toEqual([])
   })
 })
 
