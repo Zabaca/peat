@@ -515,19 +515,36 @@ echo "  moved in $move_s s, under its own name, address and login: 500 rows in a
 echo "  $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: the old version stopped [0-9]* ms after the last look at it' | tail -1)"
 echo "  the grants of its exec: $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: exec on [^ ]* *[^ ]* granted in [0-9]* ms' | sed 's/.*granted in //' | tr '\n' ' ')"
 
-step "the way back from the move, while nothing was written since"
+step "the way back: a return to the frozen copy, what was written since kept in the version it leaves"
+# a row written on 19 after the move
+mvsql 'insert into items values (501, $$written on 19$$)'
+execs() { k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -c 'move shop/mv18: exec on' || true; }
+execs_before=$(execs)
+t0=$(date +%s)
 k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
-t0=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = back ]; do
-  [ "$(since "$t0")" -lt 600 ] || fail "the way back did not end in 600 s: $(k -n shop get database mv18 -o jsonpath='{.status.phase}: {.status.message}')"
-  sleep 3
+t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = back ]; do
+  [ "$(since "$t1")" -lt 300 ] || fail "the way back did not end in 300 s: $(k -n shop get database mv18 -o jsonpath='{.status.phase}: {.status.message}')"
+  sleep 1
 done
+back_s=$(since "$t0")
 [ "$(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}')" = '18/Ready' ] || fail "mv18 is not back on 18: $(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}: {.status.message}')"
 if k -n shop get database mv18-pg18 >/dev/null 2>&1; then fail 'the old copy is still there after the way back'; fi
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.move.newerDatabase}')" = mv18-pg19 ] || fail 'the way back did not name the version it left as kept'
+case "$(k -n shop get database mv18 -o jsonpath='{.status.message}')" in 'back on Postgres 18 as of the move ('*'); what was written since is in mv18-pg19 until '*) ;; *) fail "the way back does not say where what was written since is: $(k -n shop get database mv18 -o jsonpath='{.status.message}')";; esac
+# it reads nothing (no exec asked of either compute) and takes seconds, not a read of the data
+[ "$(execs)" = "$execs_before" ] || fail 'the way back asked for exec into a compute'
+[ "$back_s" -lt 120 ] || fail "the way back took $back_s s"
 t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'mv18 did not answer after the way back'; sleep 3; done
 case "$(mvsql 'show server_version_num')" in 18*) ;; *) fail 'mv18 answers, but not on Postgres 18';; esac
-[ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all there after the way back'
+[ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'mv18 is not the copy frozen at the move'
+[ "$(mvsql 'select count(*) from items where id = 501')" = 0 ] || fail 'a row written after the move is on mv18 after the way back'
 [ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'reporter or its database did not come back'
-echo "  back on 18 under its own name and login: the old copy's data is the database's again"
+# what was written since, in the version it left, kept as a database of its own (the root's login)
+newsql() { PGPASSWORD="$mv_password" psql "host=mv18-pg19.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+t0=$(date +%s); until newsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'the kept newer copy mv18-pg19 did not answer'; sleep 3; done
+case "$(newsql 'show server_version_num')" in 19*) ;; *) fail 'mv18-pg19 is not on Postgres 19';; esac
+[ "$(newsql 'select note from items where id = 501')" = 'written on 19' ] || fail 'the row written after the move is not in the kept newer copy mv18-pg19'
+echo "  back on 18 in $back_s s, as frozen at the move (500 rows); the row written on 19 since is in the kept copy mv18-pg19"
 
 step "a move resumed after the control layer restarts mid-move, then its old copy deleted when keepOldFor ends"
 # asked again (the move to 19 ended in a way back), with a keepOldFor of seconds

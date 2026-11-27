@@ -26,7 +26,7 @@ export const MOVE_SCRIPT_PATH = '/move/copy.sh'
 export const MOVE_SCRIPT_CONFIG_MAP = 'peat-move-script'
 /** The Role (in the compute namespace) by which the operator lets the control layer exec into a move's own pods, one per moving Database. */
 export const moveExecRole = (database: string) => `peat-move-${database}`
-/** The move states in which the control layer execs into the move's pods (and a way back, which shuts the door: phase Moving). */
+/** The move states in which the control layer execs into the move's pods (a way back reads nothing, and asks for none). */
 export const MOVE_EXEC_STATES = ['preparing', 'copying', 'comparing', 'switching'] as const
 /** The label on the move's target compute pod: the network rule that lets it reach the source on 5432 selects it. */
 export const MOVE_TARGET_LABEL = 'peat-move'
@@ -260,30 +260,29 @@ export const MOVE_SCRIPT = [
 
 // ---- what the database loop does about a move
 
-export interface MoveStatus { verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
+export interface MoveStatus { newerDatabase?: string; deleteNewerAfter?: string; verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
 
 /** A pod of the compute namespace as the grant reads it. */
 export interface ComputePod { name: string; labels: Record<string, string>; deleting: boolean }
 /**
  * The pods the operator lets the control layer exec into for one Database: of the pods its status.move.pods names (the control layer
- * writes them), those that exist, are not on their way out, are computes, and are this database's own (its compute, its move's target,
- * which carries the target label, or the old copy its last move left, by the name that move gives it); and only while the database is in
- * a step that execs (a move's MOVE_EXEC_STATES, or a way back's shut door). Anything else named is never granted.
+ * writes them), those that exist, are not on their way out, are computes, and are this database's own (its compute, or its move's target,
+ * which carries the target label); and only while its move is in a step that execs (MOVE_EXEC_STATES). Anything else named is never
+ * granted.
  */
 export function moveExecPods(db: { metadata: { name: string; deletionTimestamp?: string }; status?: { phase?: string; move?: MoveStatus } }, pods: ComputePod[]): string[] {
   const mv = db.status?.move
   const named = Array.isArray(mv?.pods) ? mv!.pods! : []
   if (!mv || named.length === 0 || db.metadata.deletionTimestamp) return []
-  if (!(MOVE_EXEC_STATES as readonly string[]).includes(String(mv.state)) && db.status?.phase !== 'Moving') return []
+  if (!(MOVE_EXEC_STATES as readonly string[]).includes(String(mv.state))) return []
   const name = db.metadata.name
   const target = typeof mv.target === 'string' && /^mv-[0-9a-f]{12}$/.test(mv.target) ? mv.target : undefined
-  const old = mv.from && mv.oldDatabase === oldNameOf(name, mv.from) ? mv.oldDatabase : undefined
   const byName = new Map(pods.map((p) => [p.name, p]))
   return [...new Set(named)].filter((n) => {
     const p = byName.get(n)
     if (!p || p.deleting || p.labels['app'] !== 'peat-compute') return false
     const c = p.labels['compute']
-    return c === name || (c === old && old !== undefined) || (c === target && target !== undefined && p.labels[MOVE_TARGET_LABEL] === 'target')
+    return c === name || (c === target && target !== undefined && p.labels[MOVE_TARGET_LABEL] === 'target')
   }).sort().slice(0, 4)
 }
 export type MoveAction =

@@ -249,6 +249,13 @@ describe('who may call which route', () => {
     expect(asking).toContain('if (Date.now() - t0 > GRANT_WAIT_MS) throw new Error(')
     expect(asking).not.toMatch(/roles|rolebindings/)
     // a Database being deleted (or gone) asks for no exec in its cleanup: it would only wait out the grant in the loop that serves the others
+    // the way back reads nothing: no exec, no comparison, no count of rows or writes; it keeps the version it leaves as a database of its own
+    const back = control.slice(control.indexOf('async function runMoveBack'), control.indexOf('async function deleteOldCopies'))
+    for (const reads of ['grantExecs', 'localPsql', 'fingerprintSql', 'compareSides', 'WRITES_SQL', 'ROLES_SQL', 'readyPod', 'startCompute']) expect(back, reads).not.toContain(reads)
+    expect(back).toContain('const newer = oldNameOf(name, ')
+    expect(back).toContain('await stopCompute(name, true)')
+    expect(back).toContain("newerDatabase: newer, deleteNewerAfter: until")
+    expect(back).toContain('what was written since is in ${newer} until ${until}')
     const cleanup = control.slice(control.indexOf('async function cleanupMove'), control.indexOf('async function runMove'))
     expect(cleanup).toContain("const going = obj.status === 404 || Boolean(obj.json?.metadata?.deletionTimestamp)")
     expect(cleanup).toContain('const src = going ? null : await livePod(name)')

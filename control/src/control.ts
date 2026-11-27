@@ -1679,56 +1679,42 @@ async function finishSwitch(ns: string, name: string): Promise<void> {
 }
 
 /**
- * The way back from the last move, while its old copy is kept: the door shut, the database compared with its old copy, and only if they
- * are the same (nothing written since the move) the record pointed back at the old timeline and version, the old copy's object taken away
- * without its data, and the new timeline held as a deleted database's is. A database written since is refused: copying it down to the older
- * version is not done here (a newer dump need not load on an older server); the message says what to do by hand.
+ * The way back from the last move, while its old copy is kept: a return to the frozen copy the move left. The door is shut and the
+ * database's compute stopped (its sessions ended); the version being left is kept as a database of its own, `<name>-pg<newer>`, for
+ * keepOldFor, as the move kept the old one, so nothing written since the move is destroyed; and the name is pointed at the old copy's
+ * timeline and version, as they were at the move. Nothing is read or compared, and writes since the move never stop it: it costs what was
+ * written since, which stays in the kept newer copy. It is refused only when it cannot be done: no move to go back from, its old copy or
+ * the old copy's timeline gone, or the name for the newer copy taken.
  */
 async function runMoveBack(ns: string, name: string, request: string): Promise<void> {
-  const key = `${ns}.${name}`
   const o = ok(await kube('GET', dbObjectPath(ns, name)), `read ${name}`).json
   const mv: MoveStatus = o.status?.move ?? {}
   const answered = { ...(o.status?.answered ?? {}), moveBack: request }
   const refuse = (why: string) => patchDbStatus(ns, name, { answered, message: `the way back was refused: ${why}` })
-  if (mv.state !== 'done' || mv.rehearsal || !mv.oldDatabase) return refuse('there is no move to go back from')
+  if (mv.state !== 'done' || mv.rehearsal || !mv.oldDatabase || !mv.from || !mv.to) return refuse(mv.state && !MOVE_STATES_DONE.includes(mv.state) ? 'a move is under way' : 'there is no move to go back from')
   const oldDb = (await dbObjects()).find((x) => x.metadata.name === mv.oldDatabase && x.metadata.namespace === ns)
   const oldRec = oldDb ? recordOf(oldDb) : null
   if (!oldRec) return refuse(`its old copy ${mv.oldDatabase} is gone`)
   const d = recordOf(o)!
+  if (ok(await storcon('GET', `/v1/tenant/${oldRec.tenant}/timeline/${oldRec.timeline}`), 'read the old copy\'s timeline', [404]).status === 404) return refuse(`the old copy's timeline is gone`)
+  const newer = oldNameOf(name, mv.to)
+  if ((await getDb(newer)) || (await readRecords(RECORDS)).has(newer)) return refuse(`the name for the version being left, ${newer}, is taken: delete that database, then ask again`)
   const doorBack = o.spec?.closed ? { phase: 'Closed' } : { phase: 'Ready' }
+  const t0 = Date.now()
   try {
-    await patchDbStatus(ns, name, { answered, phase: 'Moving', message: `going back to Postgres ${mv.from}: every connection is refused until it is compared` })
-    await new Promise((res) => setTimeout(res, MOVE_SETTLE_MS))
+    // the door shut (starts and routes read Moving as closed) and the compute stopped: no session goes on on the version being left
+    await patchDbStatus(ns, name, { answered, phase: 'Moving', message: `going back to Postgres ${mv.from}: every connection is refused until it is back` })
     await stopCompute(name, true)
-    await startCompute(d, { evenClosed: true })
-    await startCompute(oldRec, { evenClosed: true })
-    const cur = (await readyPod(name)).metadata.name, old = (await readyPod(oldRec.name)).metadata.name
-    await grantExecs(ns, name, [cur, old])
-    // as for the move: a session on the database that got in after the door shut is ended before the comparison, and one there again
-    // before the switch back fails it (what it wrote would be on the timeline that is given up)
-    const ended = Number(lines(await localPsql(cur, 'postgres', endOutsideSessionsSql(''), 'end the sessions that got in after the door shut'))[0] ?? 0)
-    if (ended) console.log(`move back ${ns}/${name}: ${ended} session(s) that got in after the door shut ended before the comparison`)
-    const writes = await localPsql(cur, 'postgres', WRITES_SQL, 'count the writes')
-    const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(old, db, sql, `read ${db} on the old copy`), await localPsql(cur, db, sql, `read ${db}`)]
-    const sides: Sides = { databases: await both('postgres', DATABASES_SQL), roles: await both('postgres', ROLES_SQL), fingerprints: {} }
-    // every row, whatever the move checked: the way back drops what the database holds now for its old copy, so a row updated since the
-    // move (which no count shows) must stop it
-    for (const db of lines(sides.databases[1])) sides.fingerprints[db] = await both(db, fingerprintSql(db, 'full'))
-    const c = compareSides(sides)
-    if (c.same) {
-      const again = lines(await localPsql(cur, 'postgres', outsideSessionsSql(''), 'look for sessions'))
-      if (again.length) throw new Error(`a session got in after the door shut (${again.slice(0, 3).join(', ')}): what it wrote would not go back`)
-      const written = writtenSince(writes, await localPsql(cur, 'postgres', WRITES_SQL, 'count the writes'))
-      if (written.length) throw new Error(`the database was written during the comparison (${written.slice(0, 3).join(', ')}), by a client that got in after the door shut: what it wrote would not go back`)
-    }
-    await stopCompute(name, true)
-    await grantExecs(ns, name, null)
     await stopCompute(oldRec.name, true)
-    if (!c.same) {
-      await patchDbStatus(ns, name, { ...doorBack, message: `the way back was refused: the database was written since the move (${c.why}). To go back by hand: copy it into ${mv.oldDatabase} with pg_dump, then ask again` })
-      return
-    }
-    // the switch back: the old timeline is the database's again, and its old copy's object goes without its data
+    // the version being left, kept as a database of its own, as the move kept the old one
+    const keep = durationMs(String(o.spec?.keepOldFor ?? '30d'))
+    const until = new Date(Date.now() + keep).toISOString()
+    const newerRec: Db = { name: newer, namespace: ns, tenant: d.tenant, timeline: d.timeline, parent: d.root ? d.name : d.parent, from: name, root: false, mode: 'primary', port: await claimPort(RECORDS, newer, d.timeline, PORT_BASE, await usedPorts()), created: new Date().toISOString(), pg: d.pg, closed: false }
+    ok(await kube('POST', `${DB_API}/namespaces/${ns}/databases`, { apiVersion: `${GROUP}/v1alpha1`, kind: 'Database', metadata: { name: newer, namespace: ns, finalizers: [FINALIZER], annotations: { [COPYING]: 'true' } }, spec: { pgVersion: d.pg, parent: name } }), `keep ${newer}`, [409])
+    await saveDb(newerRec, { phase: 'Ready', message: `what ${name} held on Postgres ${d.pg} when it went back to ${mv.from}, asleep: deleted after keepOldFor` })
+    ok(await kube('PATCH', dbObjectPath(ns, newer), { metadata: { annotations: { [COPYING]: null } } }, 'application/merge-patch+json'), `release ${newer}`)
+    await apply(`/api/v1/namespaces/${DB_NS}/services`, newer, nameService(newer))
+    // the name to the old copy's timeline and version; the old copy's object goes without its data (its timeline is the database's again)
     await saveDb({ ...d, timeline: oldRec.timeline, pg: oldRec.pg })
     await kube('DELETE', `/api/v1/namespaces/${NS}/configmaps/db-${oldRec.name}`)
     ok(await kube('PATCH', dbObjectPath(ns, oldRec.name), { metadata: { finalizers: null } }, 'application/merge-patch+json'), `release ${oldRec.name}`, [404])
@@ -1736,23 +1722,26 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
     await del(`/api/v1/namespaces/${DB_NS}/services/${oldRec.name}`)
     if (oldRec.port) await del(`/api/v1/namespaces/${NS}/configmaps/port-${oldRec.port}`)
     for (const path of [depPath(oldRec.name), `/api/v1/namespaces/${CNS}/secrets/compute-${oldRec.name}`]) await del(path)
-    // the new version's timeline is held as a deleted database's data is, then removed
-    await hold(RECORDS, { ...d, name: `${name}`, timeline: d.timeline, root: false, port: 0 }, deleteAfter(DELETE_HOLD))
-    await saveDb({ ...d, timeline: oldRec.timeline, pg: oldRec.pg })
+    // the next start makes the compute again on the old version's image, its spec written afresh
     await del(depPath(name))
-    await patchDbStatus(ns, name, { ...doorBack, move: { ...withoutPods(mv), state: 'back', message: `back on Postgres ${mv.from}: the database equalled its old copy; the Postgres ${mv.to} timeline is held` }, message: `back on Postgres ${mv.from}` })
+    const message = `back on Postgres ${mv.from} as of the move (${mv.switchedAt ?? 'its switch'}); what was written since is in ${newer} until ${until}`
+    await patchDbStatus(ns, name, { ...doorBack, move: { ...withoutPods(mv), state: 'back', newerDatabase: newer, deleteNewerAfter: until, seconds: Math.round((Date.now() - t0) / 1000), message }, message })
+    console.log(`move back ${ns}/${name}: ${message}`)
   } catch (e) {
-    await grantExecs(ns, name, null).catch(() => {})
-    await patchDbStatus(ns, name, { ...doorBack, message: `the way back failed, nothing was switched: ${moveFailure(e).slice(0, 400)}` }).catch(() => {})
+    await patchDbStatus(ns, name, { ...doorBack, message: `the way back failed: ${moveFailure(e).slice(0, 400)}` }).catch(() => {})
   }
 }
 /** Old copies whose keepOldFor is over are deleted (their data then held, as any deleted database's). */
 async function deleteOldCopies(all: any[]): Promise<void> {
   for (const o of all) {
     const mv: MoveStatus | undefined = o.status?.move
-    if (mv?.state !== 'done' || !mv.oldDatabase || !mv.deleteOldAfter || Date.parse(mv.deleteOldAfter) > Date.now()) continue
-    const old = all.find((x) => x.metadata.name === mv.oldDatabase && x.metadata.namespace === o.metadata.namespace && !x.metadata.deletionTimestamp)
-    if (old) { console.log(`move: ${old.metadata.namespace}/${old.metadata.name}: kept for ${o.spec?.keepOldFor ?? '30d'}, deleted`); await kube('DELETE', dbObjectPath(old.metadata.namespace, old.metadata.name)) }
+    // after a move its old copy; after a way back the version it left (kept through a later move too, until its own time)
+    const kept: [string | undefined, string | undefined][] = [mv?.state === 'done' ? [mv.oldDatabase, mv.deleteOldAfter] : [undefined, undefined], [mv?.newerDatabase, mv?.deleteNewerAfter]]
+    for (const [copy, after] of kept) {
+      if (!copy || !after || Date.parse(after) > Date.now()) continue
+      const old = all.find((x) => x.metadata.name === copy && x.metadata.namespace === o.metadata.namespace && !x.metadata.deletionTimestamp)
+      if (old) { console.log(`move: ${old.metadata.namespace}/${old.metadata.name}: kept for ${o.spec?.keepOldFor ?? '30d'}, deleted`); await kube('DELETE', dbObjectPath(old.metadata.namespace, old.metadata.name)) }
+    }
   }
 }
 

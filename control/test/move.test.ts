@@ -123,15 +123,15 @@ describe('the exec a move is granted', () => {
     expect(moveExecPods(db({ state: 'switching', pods: ['src-1'] }), pods)).toEqual(['src-1'])
     // a rehearsal keeps the door open: its state is what asks
     expect(moveExecPods(db({ state: 'comparing', rehearsal: true, pods: ['src-1', 'tgt-1'] }, 'Ready'), pods)).toEqual(['src-1', 'tgt-1'])
-    // the way back: the door shut, the database and its old copy
-    expect(moveExecPods(db({ state: 'done', pods: ['src-1', 'old-1'] }), pods)).toEqual(['old-1', 'src-1'])
+    // a way back reads nothing: a done move's ask, with the door shut, grants nothing, its old copy neither
+    expect(moveExecPods(db({ state: 'done', pods: ['src-1', 'old-1'] }), pods)).toEqual([])
   })
   test('a pod of another database, a pod on its way out, one not there, a target without its label: never granted', () => {
     expect(moveExecPods(db({ state: 'copying', pods: ['src-1', 'other-1', 'gone-1', 'nowhere', 'fake-tgt'] }), pods)).toEqual(['src-1'])
     // a target that is not a move's name (it could name another database's compute) grants nothing for it
     expect(moveExecPods(db({ state: 'copying', target: 'shop', pods: ['other-1'] }), pods)).toEqual([])
-    // an old copy named otherwise than the move names it
-    expect(moveExecPods(db({ state: 'done', oldDatabase: 'shop', pods: ['other-1'] }), pods)).toEqual([])
+    // the old copy is never the move's to exec into
+    expect(moveExecPods(db({ state: 'copying', pods: ['old-1'] }), pods)).toEqual([])
   })
   test('nothing outside a step that execs, for a database on its way out, or with nothing asked', () => {
     expect(moveExecPods(db({ state: 'failed', pods: ['src-1'] }, 'Ready'), pods)).toEqual([])
