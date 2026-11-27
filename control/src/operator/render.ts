@@ -167,10 +167,13 @@ export function controller(r: Resolved, image = r.images.storage): Manifest[] {
   const t = SECRETS.controllerTokens
   const kubernetes = r.spec.controller.records === 'kubernetes'
   const records = kubernetes
-    // its address in the Leader record, by which a second controller asks it to step down and the records' copy tool finds it to see that it is stopped
-    ? ['--records', 'kubernetes', '--records-namespace', n.namespace, '--records-copy-storage', remoteStorage(r, r.store.records), '--address-for-peers', `http://storage-controller.${n.namespace}.svc:${PORTS.controller}`]
+    // `--records-copy-storage` is read as a TOML document (RemoteStorageConfig::from_toml_str): `remote_storage = { ... }`, not a bare
+    // inline table, which it refuses ("invalid key"). `--address-for-peers` is this pod's own address, named in the Leader record: the
+    // copy's writer waits until the record names this controller and stops when it names another, a new controller asks the one the
+    // record names to step down, and the records' copy tool finds it there. The Service's address would be every pod's at once.
+    ? ['--records', 'kubernetes', '--records-namespace', n.namespace, '--records-copy-storage', `remote_storage=${remoteStorage(r, r.store.records)}`, '--address-for-peers', `http://$(POD_IP):${PORTS.controller}`]
     : ['--database-url', '$(DATABASE_URL)']
-  const recordsEnv = kubernetes ? storeEnv(r.store.records.credentialsSecret) : [secretEnv('DATABASE_URL', r.spec.controller.postgres!.urlSecret, r.spec.controller.postgres!.key)]
+  const recordsEnv = kubernetes ? [...storeEnv(r.store.records.credentialsSecret), { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } }] : [secretEnv('DATABASE_URL', r.spec.controller.postgres!.urlSecret, r.spec.controller.postgres!.key)]
   return [
     service(r, 'storage-controller', 'storage-controller', [{ name: 'http', port: PORTS.controller }]),
     { apiVersion: 'v1', kind: 'ServiceAccount', metadata: meta(r, CONTROLLER_ACCOUNT, n.namespace) },

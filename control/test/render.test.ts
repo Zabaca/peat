@@ -287,7 +287,14 @@ describe('the storage pieces', () => {
   test('the controller: its records in Kubernetes by default, with a copy in the store; or a Postgres named', () => {
     const cmd = podOf(named(all, 'Deployment', 'storage-controller')).containers[0].command as string[]
     expect(cmd.slice(cmd.indexOf('--records'), cmd.indexOf('--records') + 4)).toEqual(['--records', 'kubernetes', '--records-namespace', 'peat'])
-    expect(cmd[cmd.indexOf('--records-copy-storage') + 1]).toContain("bucket_name='peat-data'")
+    // a TOML document, as the controller reads it (a bare inline table it refuses: "invalid key")
+    const copy = cmd[cmd.indexOf('--records-copy-storage') + 1]!
+    expect(copy).toStartWith('remote_storage={ ')
+    expect(copy).toContain("bucket_name='peat-data'")
+    expect(Bun.TOML.parse(copy)).toMatchObject({ remote_storage: { bucket_name: 'peat-data', prefix_in_bucket: 'storage-controller' } })
+    // the pod's own address in the Leader record, never the Service's (which every controller pod would share)
+    expect(cmd[cmd.indexOf('--address-for-peers') + 1]).toBe('http://$(POD_IP):1234')
+    expect(podOf(named(all, 'Deployment', 'storage-controller')).containers[0].env).toContainEqual({ name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } })
     expect(cmd).toContain('--timelines-onto-safekeepers')
     expect(cmd).toContain('--timeline-safekeeper-count=3')
     const pg = podOf(named(render(resolved({ controller: { records: 'postgres', postgres: { urlSecret: 'records-db' } } }), KEPT), 'Deployment', 'storage-controller')).containers[0]
