@@ -17,7 +17,7 @@ use crate::persistence::tests::{
     test_database, test_namespace_and_client, timeline, timeline_row,
 };
 use crate::persistence::{
-    ControllerPersistence, NodePersistence, SafekeeperTimelineOpKind, TenantFilter,
+    ControllerPersistence, DatabaseResult, NodePersistence, SafekeeperTimelineOpKind, TenantFilter,
     TenantShardPersistence, TimelineImportPersistence,
 };
 
@@ -1098,4 +1098,296 @@ async fn a_restore_raises_every_generation_and_refuses_what_it_must() {
         .await
         .unwrap()
         .stop_copy();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Crash tests: the controller killed at every write of an operation (after 0, 1, 2 ... of its
+// writes to the API server landed), started again on the same records and copy, recovering as
+// Neon's controller does, then checked.
+
+/// What the crash tests kill the controller in the middle of.
+#[derive(Clone, Copy, Debug)]
+enum Killed {
+    /// A storage server's restart: its re-attach, one write per tenant attached to it.
+    ReAttach,
+    /// A split: its start and its completion.
+    Split,
+    /// A tenant's deletion: the tenant, then its health records.
+    TenantDeletion,
+    /// A timeline's safekeepers changed (its membership and the requests to reconcile it).
+    KeeperChange,
+}
+
+/// The records a crash test starts from: two tenants attached to pageserver 1 (one with a
+/// shard, one with two), each with a health record, and a timeline on three safekeepers.
+async fn crash_records(p: &Persistence) {
+    p.insert_node(&node(1)).await.unwrap();
+    p.insert_tenant_shards(vec![shard_row(TENANT, 0, 0)])
+        .await
+        .unwrap();
+    p.insert_tenant_shards(vec![shard_row(TENANT_B, 0, 2), shard_row(TENANT_B, 1, 2)])
+        .await
+        .unwrap();
+    for id in [
+        shard_id(TENANT, 0, 0),
+        shard_id(TENANT_B, 0, 2),
+        shard_id(TENANT_B, 1, 2),
+    ] {
+        p.increment_generation(id, NodeId(1)).await.unwrap();
+    }
+    let health = |t: &str, n, c| crate::persistence::MetadataHealthPersistence {
+        tenant_id: t.to_string(),
+        shard_number: n,
+        shard_count: c,
+        healthy: true,
+        last_scrubbed_at: chrono::Utc::now(),
+    };
+    p.update_metadata_health_records(
+        vec![health(TENANT, 0, 0), health(TENANT_B, 0, 2)],
+        vec![],
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    for id in 1..=3 {
+        p.safekeeper_upsert(safekeeper_upsert(id, 1)).await.unwrap();
+    }
+    p.insert_timeline(timeline_row(TENANT, TIMELINE))
+        .await
+        .unwrap();
+}
+
+/// Each shard's generation, by shard.
+async fn generations(p: &Persistence) -> BTreeMap<String, u32> {
+    let mut out = BTreeMap::new();
+    for t in [TENANT, TENANT_B] {
+        for g in p.tenant_generations(tenant(t)).await.unwrap() {
+            if let Some(gen_) = g.generation {
+                out.insert(g.tenant_shard_id.to_string(), gen_.into().unwrap());
+            }
+        }
+    }
+    out
+}
+
+fn split_children() -> Vec<TenantShardPersistence> {
+    (0..2)
+        .map(|n| TenantShardPersistence {
+            splitting: SplitState::Splitting,
+            generation: Some(1),
+            generation_pageserver: Some(1),
+            ..shard_row(TENANT, n, 2)
+        })
+        .collect()
+}
+
+/// The operation, on a controller that may be killed in it.
+async fn killed_in(p: &Persistence, what: Killed) -> DatabaseResult<()> {
+    match what {
+        Killed::ReAttach => p.re_attach(NodeId(1)).await.map(|_| ()),
+        Killed::Split => {
+            p.begin_shard_split(
+                ShardCount::new(0),
+                tenant(TENANT),
+                vec![(shard_id(TENANT, 0, 0), split_children())],
+            )
+            .await?;
+            p.complete_shard_split(tenant(TENANT), ShardCount::new(0), ShardCount::new(2))
+                .await
+        }
+        Killed::TenantDeletion => p.delete_tenant(tenant(TENANT)).await,
+        Killed::KeeperChange => keeper_change(p).await,
+    }
+}
+
+async fn keeper_change(p: &Persistence) -> DatabaseResult<()> {
+    p.update_timeline_membership(
+        tenant(TENANT),
+        timeline(TIMELINE),
+        SafekeeperGeneration::new(2),
+        &[NodeId(1), NodeId(2)],
+        Some(&[NodeId(2), NodeId(3)]),
+        &[
+            op(TENANT, TIMELINE, 1, 2, SafekeeperTimelineOpKind::Exclude),
+            op(TENANT, TIMELINE, 3, 2, SafekeeperTimelineOpKind::Pull),
+        ],
+    )
+    .await
+}
+
+/// Kill the controller after every count of writes of `what` until it finishes unkilled; each
+/// time start a controller again on the same records and copy, recover as Neon's controller
+/// does, and check.
+async fn kill_at_every_write(what: Killed) {
+    for writes in 0.. {
+        let Some(c) = controller(KubernetesRecords::default()).await else {
+            return;
+        };
+        let copy = c.reader().await;
+        crash_records(&c.p).await;
+        let expected = c.p.read_all_records().await.unwrap();
+        wait_for_copy(&copy, |d| d.records.diff(&expected).unwrap().is_empty()).await;
+        let before = generations(&c.p).await;
+        c.p.stop_copy();
+
+        let doomed = c
+            .again(KubernetesRecords::default())
+            .await
+            .unwrap()
+            .crash_after_writes(writes);
+        let done = killed_in(&doomed, what).await;
+        doomed.stop_copy();
+        let finished = match done {
+            Ok(()) => true,
+            Err(e) if e.to_string().contains("killed here") => false,
+            Err(e) => panic!("{what:?} after {writes} writes: {e}"),
+        };
+
+        // Started again on the same records and copy
+        let p = c
+            .again(KubernetesRecords::default())
+            .await
+            .unwrap_or_else(|e| panic!("{what:?} after {writes} writes: no start: {e:#}"));
+        let at_restart = generations(&p).await;
+        let context = format!("{what:?}, killed after {writes} writes");
+        match what {
+            Killed::ReAttach => {
+                // The pageserver re-attaches to the new controller: every generation it is given
+                // is above any the store held, killed or not, so none is issued twice
+                let given = p.re_attach(NodeId(1)).await.unwrap();
+                assert_eq!(given.len(), 3, "{context}: every shard re-attached");
+                for (id, g) in given {
+                    let g = g.into().unwrap();
+                    let key = id.to_string();
+                    assert!(g > before[&key], "{context}: {key} given {g}");
+                    assert!(g > at_restart[&key], "{context}: {key} given {g}");
+                }
+            }
+            Killed::Split => {
+                // Neon's start aborts a split it finds unfinished (Service::spawn)
+                let shards: Vec<_> = p
+                    .load_active_tenant_shards()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|s| s.tenant_id == TENANT)
+                    .collect();
+                let counts: BTreeSet<i32> = shards.iter().map(|s| s.shard_count).collect();
+                if counts.len() > 1 {
+                    let status = p
+                        .abort_shard_split(tenant(TENANT), ShardCount::new(2))
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(status, crate::persistence::AbortShardSplitStatus::Aborted),
+                        "{context}"
+                    );
+                }
+                let shards: Vec<_> = p
+                    .load_active_tenant_shards()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|s| s.tenant_id == TENANT)
+                    .collect();
+                let keys: Vec<(i32, i32)> = shards
+                    .iter()
+                    .map(|s| (s.shard_number, s.shard_count))
+                    .collect();
+                assert!(
+                    keys == vec![(0, 0)] || keys == vec![(0, 2), (1, 2)],
+                    "{context}: neither rolled back nor finished: {keys:?}"
+                );
+                assert!(
+                    shards.iter().all(|s| s.splitting == SplitState::Idle),
+                    "{context}: still splitting"
+                );
+                if finished {
+                    assert_eq!(keys.len(), 2, "{context}: a finished split rolled back");
+                }
+                // No health record of a shard that is gone
+                for h in p.list_metadata_health_records().await.unwrap() {
+                    if h.tenant_id == TENANT {
+                        assert!(
+                            keys.contains(&(h.shard_number, h.shard_count)),
+                            "{context}: health of a shard that is gone"
+                        );
+                    }
+                }
+            }
+            Killed::TenantDeletion => {
+                // The deletion is retried until it is done
+                p.delete_tenant(tenant(TENANT)).await.unwrap();
+                let left = p.load_active_tenant_shards().await.unwrap();
+                assert!(left.iter().all(|s| s.tenant_id != TENANT), "{context}");
+                assert_eq!(left.len(), 2, "{context}: the other tenant's shards");
+                let health = p.list_metadata_health_records().await.unwrap();
+                assert!(health.iter().all(|h| h.tenant_id != TENANT), "{context}");
+                assert_eq!(
+                    generations(&p).await[&shard_id(TENANT_B, 1, 2).to_string()],
+                    before[&shard_id(TENANT_B, 1, 2).to_string()],
+                    "{context}: the other tenant's generation"
+                );
+            }
+            Killed::KeeperChange => {
+                // The change is made again; one that landed is refused, as on Postgres, its
+                // generation already taken
+                match keeper_change(&p).await {
+                    Ok(()) => {}
+                    Err(crate::persistence::DatabaseError::Cas(_)) => {}
+                    Err(e) => panic!("{context}: {e}"),
+                }
+                let tl = p
+                    .get_timeline(tenant(TENANT), timeline(TIMELINE))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(tl.generation, 2, "{context}");
+                assert_eq!(tl.sk_set, vec![1, 2], "{context}");
+                assert_eq!(tl.new_sk_set, Some(vec![2, 3]), "{context}");
+                let mut ops: Vec<(i64, i32)> = p
+                    .list_pending_ops_for_timeline(tenant(TENANT), timeline(TIMELINE))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|o| (o.sk_id, o.generation))
+                    .collect();
+                ops.sort();
+                assert_eq!(ops, vec![(1, 2), (3, 2)], "{context}: each request once");
+            }
+        }
+        p.stop_copy();
+        if finished {
+            // The writes it makes: one per tenant re-attached (2); the split's start and its
+            // completion's two (3); the tenant and its health (2); the timeline (1)
+            let made = match what {
+                Killed::ReAttach => 2,
+                Killed::Split => 3,
+                Killed::TenantDeletion => 2,
+                Killed::KeeperChange => 1,
+            };
+            assert!(writes > made - 1, "{what:?} finished after {writes} writes");
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn killed_at_every_write_of_a_re_attach() {
+    kill_at_every_write(Killed::ReAttach).await;
+}
+
+#[tokio::test]
+async fn killed_at_every_write_of_a_split() {
+    kill_at_every_write(Killed::Split).await;
+}
+
+#[tokio::test]
+async fn killed_at_every_write_of_a_tenant_deletion() {
+    kill_at_every_write(Killed::TenantDeletion).await;
+}
+
+#[tokio::test]
+async fn killed_at_every_write_of_a_keeper_change() {
+    kill_at_every_write(Killed::KeeperChange).await;
 }
