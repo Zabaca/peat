@@ -57,7 +57,8 @@ async fn kubernetes_client_and_namespace() -> Option<(kube::Client, String)> {
         .expect("a client config from the test kubeconfig");
     // The test API server is on this machine: never through a proxy the environment names.
     config.proxy_url = None;
-    let client = kube::Client::try_from(config).expect("a Kubernetes client");
+    let client =
+        kube::Client::try_from(kubernetes::client_config(config)).expect("a Kubernetes client");
     let namespace = format!("records-test-{}", uuid::Uuid::new_v4().simple());
     let ns = Namespace {
         metadata: kube::api::ObjectMeta {
@@ -1332,4 +1333,88 @@ async fn reads_concurrent_with_writes_are_not_taken_for_the_store_going_back() {
         60,
         "every attach took a generation of its own"
     );
+}
+
+/// Reads of a tenant while its delete is committed by the API server and not yet answered here
+/// (two safekeeper reconcilers finishing one deletion, a tenant deleted while its generations
+/// are read), and while it is deleted and made again, are never taken for the store going back.
+#[tokio::test]
+async fn reads_during_a_delete_and_a_remake_are_not_taken_for_the_store_going_back() {
+    let Some((client, ns)) = kubernetes_client_and_namespace().await else {
+        return;
+    };
+    let p = Arc::new(
+        Persistence::kubernetes_with_client(client.clone(), ns.clone())
+            .delete_answer_delay(std::time::Duration::from_millis(500)),
+    );
+    p.migration_run().await.unwrap();
+    p.insert_node(&node(1)).await.unwrap();
+    let id = shard_id(TENANT, 0, 0);
+    p.insert_tenant_shards(vec![shard_row(TENANT, 0, 0)])
+        .await
+        .unwrap();
+    assert_eq!(p.tenant_generations(id.tenant_id).await.unwrap().len(), 1);
+
+    // The delete in flight: gone at the API server, its answer held
+    let delete = {
+        let p = p.clone();
+        tokio::spawn(async move { p.delete_tenant(id.tenant_id).await })
+    };
+    let tenants = raw::<kubernetes::objects::TenantSpec>(&client, &ns);
+    while tenants.get_opt(TENANT).await.unwrap().is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!delete.is_finished(), "the read falls inside the delete");
+    assert!(p.tenant_generations(id.tenant_id).await.unwrap().is_empty());
+    assert!(p.load_active_tenant_shards().await.unwrap().is_empty());
+    assert!(
+        p.shard_generations_on(NodeId(1), [id].iter())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    delete.await.unwrap().unwrap();
+
+    // Deleted and made again, over and over, while it is read
+    let p = Arc::new(
+        Persistence::kubernetes_with_client(client, ns)
+            .delete_answer_delay(std::time::Duration::from_millis(20)),
+    );
+    let writer = {
+        let p = p.clone();
+        tokio::spawn(async move {
+            for _ in 0..20 {
+                p.insert_tenant_shards(vec![shard_row(TENANT, 0, 0)])
+                    .await
+                    .unwrap();
+                p.delete_tenant(id.tenant_id).await.unwrap();
+            }
+        })
+    };
+    let readers: Vec<_> = (0..3)
+        .map(|r| {
+            let p = p.clone();
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    match r {
+                        0 => {
+                            p.tenant_generations(id.tenant_id).await.unwrap();
+                        }
+                        1 => {
+                            p.load_active_tenant_shards().await.unwrap();
+                        }
+                        _ => {
+                            p.shard_generations_on(NodeId(1), [id].iter())
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    writer.await.unwrap();
+    for r in readers {
+        r.await.unwrap();
+    }
 }

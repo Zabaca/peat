@@ -208,7 +208,8 @@ impl Persistence {
     /// Keep the records in Kubernetes objects in `namespace`, or, when none is given, in the
     /// namespace of the pod's service account (outside a pod, the kubeconfig's current one).
     pub async fn new_kubernetes(namespace: Option<String>) -> anyhow::Result<Self> {
-        let client = kube::Client::try_default().await?;
+        let config = kubernetes::client_config(kube::Config::infer().await?);
+        let client = kube::Client::try_from(config)?;
         let namespace = namespace.unwrap_or_else(|| client.default_namespace().to_string());
         Ok(Self::kubernetes_with_client(client, namespace))
     }
@@ -218,6 +219,15 @@ impl Persistence {
     pub(crate) fn list_page(mut self, page: u32) -> Self {
         if let Store::Kubernetes(store) = &mut self.store {
             store.list_page(page);
+        }
+        self
+    }
+
+    /// Hold each delete's answer in the Kubernetes store this long before noting it (tests).
+    #[cfg(test)]
+    pub(crate) fn delete_answer_delay(mut self, delay: std::time::Duration) -> Self {
+        if let Store::Kubernetes(store) = &mut self.store {
+            store.delete_answer_delay(delay);
         }
         self
     }
