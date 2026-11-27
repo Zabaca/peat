@@ -442,6 +442,44 @@ case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but 
 if k -n peat get configmap peat-move-execs -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
 echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, its old copy mv18-pg18 kept on 18"
 
+step "the way back from the move, while nothing was written since"
+k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
+t0=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = back ]; do
+  [ "$(since "$t0")" -lt 600 ] || fail "the way back did not end in 600 s: $(k -n shop get database mv18 -o jsonpath='{.status.phase}: {.status.message}')"
+  sleep 3
+done
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}')" = '18/Ready' ] || fail "mv18 is not back on 18: $(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}: {.status.message}')"
+if k -n shop get database mv18-pg18 >/dev/null 2>&1; then fail 'the old copy is still there after the way back'; fi
+t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'mv18 did not answer after the way back'; sleep 3; done
+case "$(mvsql 'show server_version_num')" in 18*) ;; *) fail 'mv18 answers, but not on Postgres 18';; esac
+[ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all there after the way back'
+[ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'reporter or its database did not come back'
+echo "  back on 18 under its own name and login: the old copy's data is the database's again"
+
+step "a move resumed after the control layer restarts mid-move, then its old copy deleted when keepOldFor ends"
+# asked again (the move to 19 ended in a way back), with a keepOldFor of seconds
+k -n shop patch database mv18 --type merge -p '{"spec":{"keepOldFor":"30s","requests":{"retryMove":"r1"}}}' >/dev/null
+t0=$(date +%s); until case "$(k -n shop get database mv18 -o jsonpath='{.status.move.request}/{.status.move.state}')" in r1/preparing|r1/copying) true;; *) false;; esac; do
+  [ "$(since "$t0")" -lt 120 ] || fail "the retried move did not start: $(k -n shop get database mv18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
+  sleep 1
+done
+cut_at=$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')
+k -n peat delete pod -l app=peat-control --wait=false >/dev/null
+echo "  the control layer's pod deleted while the move was $cut_at"
+[ "$(move_done 900)" = 'done' ] || fail "the resumed move did not end done: $(k -n shop get database mv18 -o jsonpath='{.status.move.message}')"
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}')" = '19/Ready' ] || fail 'the resumed move did not leave mv18 Ready on 19'
+retunnel control 18080
+t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'mv18 did not answer after the resumed move'; sleep 3; done
+case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but not on Postgres 19';; esac
+[ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all on 19 after the resumed move'
+computes_now=$(k -n peat-compute get pods -l app=peat-compute -o name | wc -l | tr -d ' ')
+if k -n peat-compute get deployments -o name | grep -q 'compute-mv-'; then fail "the move left its own compute behind"; fi
+echo "  resumed and done on 19 (computes now: $computes_now); waiting for keepOldFor (30 s) to delete mv18-pg18"
+t0=$(date +%s); while k -n shop get database mv18-pg18 >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'the old copy was not deleted after its keepOldFor'; sleep 5; done
+held_old=$(k -n peat get configmap -l peat-held=true -o jsonpath='{range .items[?(@.data.name=="mv18-pg18")]}{.data.deleteAfter}{end}')
+[ -n "$held_old" ] || fail "the old copy's data was not held as a deleted database's"
+echo "  mv18-pg18 deleted after its keepOldFor; its data held until $held_old"
+
 if [ -n "${UPGRADE_FROM:-}" ]; then
   step "the upgrade from $UPGRADE_FROM to this run's images, a writer and a reader running throughout"
   curl -fsS -X POST localhost:18080/db -H 'content-type: application/json' -d '{"name":"upg"}' >/dev/null || fail 'the upgrade test database was not made'
