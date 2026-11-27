@@ -467,7 +467,9 @@ async fn follow<S: Mirrored>(
         // API server's order, not the store going back.
         let mut in_stream: BTreeMap<String, u64> = BTreeMap::new();
         'watch: loop {
-            let params = WatchParams::default().timeout(290);
+            // The API server ends each watch before the client's read timeout would fail a quiet
+            // one, so a quiet watch is renewed from where it was instead of listed again.
+            let params = WatchParams::default().timeout(super::READ_TIMEOUT.as_secs() as u32 - 5);
             let stream = match api.watch(&params, &version).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -521,7 +523,12 @@ async fn follow<S: Mirrored>(
                     }
                 }
                 in_stream.insert(name.clone(), rev);
-                guard.saw::<S>(&name, rev, deleted);
+                let noted = if deleted {
+                    super::Noted::Deleted
+                } else {
+                    super::Noted::Live
+                };
+                guard.saw::<S>(&name, rev, noted);
                 let mut m = mirror.lock().unwrap();
                 if deleted {
                     S::slot(&mut m).remove(&name);

@@ -242,6 +242,7 @@ impl Persistence {
             None => kube::Config::infer().await?,
         };
         kubernetes::skip_proxy_where_excluded(&mut config);
+        let config = kubernetes::client_config(config);
         let namespace = namespace.unwrap_or_else(|| config.default_namespace.clone());
         let client = kube::Client::try_from(config)?;
         let copy = match &records.copy_storage {
@@ -336,21 +337,20 @@ impl Persistence {
         }
     }
 
-    /// Return an error when the Kubernetes store finds its records went back, instead of exiting
-    /// the process (tests).
-    #[cfg(test)]
-    pub(crate) fn do_not_exit(mut self) -> Self {
-        if let Store::Kubernetes(store) = &mut self.store {
-            store.do_not_exit();
-        }
-        self
-    }
-
     /// Read lists `page` objects at a time in the Kubernetes store (tests).
     #[cfg(test)]
     pub(crate) fn list_page(mut self, page: u32) -> Self {
         if let Store::Kubernetes(store) = &mut self.store {
             store.list_page(page);
+        }
+        self
+    }
+
+    /// Hold each delete's answer in the Kubernetes store this long before noting it (tests).
+    #[cfg(test)]
+    pub(crate) fn delete_answer_delay(mut self, delay: std::time::Duration) -> Self {
+        if let Store::Kubernetes(store) = &mut self.store {
+            store.delete_answer_delay(delay);
         }
         self
     }

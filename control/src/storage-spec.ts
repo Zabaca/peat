@@ -689,8 +689,8 @@ export function pgVersionOf(recorded: string | undefined): number {
 }
 
 /** The version a create call asks for (`pg_version`, a number or a numeric string): absent is `DEFAULT_PG_VERSION` (19), and a version the platform does not run is refused. */
-export function requestedPgVersion(asked: unknown): number {
-  if (asked === undefined || asked === null || asked === '') return DEFAULT_PG_VERSION
+export function requestedPgVersion(asked: unknown, byDefault: number = DEFAULT_PG_VERSION): number {
+  if (asked === undefined || asked === null || asked === '') return byDefault
   const v = Number(asked)
   if (!(PG_VERSIONS as readonly number[]).includes(v)) throw new Error(`pg_version must be one of ${PG_VERSIONS.join(', ')}, not ${JSON.stringify(asked)}`)
   return v

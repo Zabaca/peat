@@ -22,7 +22,7 @@ set -euo pipefail
 dest=$1; tag=$2
 arches=(arm64 amd64)
 read -ra names <<< "${PEAT_IMAGE_NAMES:-storage compute-pg18}"
-local_image() { case $1 in storage) echo peat-storage;; compute-pg18) echo peat-compute;; compute-pg19) echo peat-compute-pg19;; esac; }
+local_image() { case $1 in storage) echo peat-storage;; compute-pg18) echo peat-compute;; compute-pg19) echo peat-compute-pg19;; control) echo peat-control;; esac; }
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
 fail() { echo "::error::$*"; exit 1; }
 inspect_raw() { docker buildx imagetools inspect --raw "$1"; }
