@@ -1,16 +1,11 @@
-// Adoption: taking over a platform installed another way, object by object, without restarting it. Kept apart from the ordered upgrade
-// (reconcile.ts calls it), so either can change, or adoption be left out, without the other. An object listed in the Platform's adopt that
-// the operator's record does not hold is marked and taken into the record; what it differs by from what the operator would make is held
-// as a pending change until requests.applyPending asks, except a change the ordered upgrade's own step makes to its piece.
+// How a live object differs from what the operator would make: the fields it sets, the annotations it sets (less its release stamp) and a
+// Secret's values. The one user in this release is the remake of a Job whose template changed (a Job's template cannot change in place).
 import { RELEASE_ANNOTATION } from './render'
-import { GROUP } from '../api/v1alpha1'
 
-/** The mark on an object the operator took over from an install made another way. */
-export const ADOPTED = `${GROUP}/adopted`
 /**
  * How `live` differs from what the operator would make (`want`), as the paths of every field the operator sets whose value is not the live
  * one; fields the operator does not set (defaults the API server filled in, another tool's fields) are not differences. The operator's own
- * labels are not either: taking an object over is what adds them.
+ * labels are not either (they are its own to set).
  */
 export function differences(want: unknown, live: unknown, path = ''): string[] {
   if (path === '.metadata.labels') return []
@@ -36,17 +31,3 @@ export function differences(want: unknown, live: unknown, path = ''): string[] {
   }
   return out
 }
-
-/** Fields an object cannot change in place, by kind: a difference there is one an apply would be refused (422). */
-export const IMMUTABLE: Record<string, RegExp[]> = {
-  StatefulSet: [/^\.spec\.selector\b/, /^\.spec\.volumeClaimTemplates\b/, /^\.spec\.serviceName\b/, /^\.spec\.podManagementPolicy\b/],
-  Deployment: [/^\.spec\.selector\b/],
-  Job: [/^\.spec\.template\b/, /^\.spec\.selector\b/],
-  Service: [/^\.spec\.clusterIP\b/, /^\.spec\.clusterIPs\b/],
-  RoleBinding: [/^\.roleRef\b/],
-  ClusterRoleBinding: [/^\.roleRef\b/],
-}
-export const immutableFor = (kind: string) => (path: string) => (IMMUTABLE[kind] ?? []).some((re) => re.test(path))
-
-/** The paths of a difference that are only an image: what the upgrade's own step changes, as against what a person's install differs by. */
-export const imageOnly = (d: string) => /\.image: /.test(d) || /\.value: .* would be ".*\/(storage|control|compute-pg\d+)[:@]/.test(d)

@@ -329,13 +329,13 @@ describe('what is the operator\'s: its record of the objects it made, never a la
     await reconcile(k)
     expect(record()['Deployment.peat.peat-control']).toMatch(/^nonce:/)
   })
-  test('a record made new while the platform\'s objects exist says so, naming adopt; a record another pass made first is read, not taken as empty', async () => {
+  test('a record made new while the platform\'s objects exist says so: lost, with no way back in this release but by hand; a record another pass made first is read, not taken as empty', async () => {
     k.put(platform())
     await reconcile(k)
     const before = { ...record() }
     k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|configmaps|peat-owned'))!)
     const r = await reconcile(k)
-    expect(r.refused[0]).toContain('list it under adopt to take it back')
+    expect(r.refused[0]).toContain('the record is lost, and this release has no way to take its objects back but by hand')
     k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'peat-owned', namespace: 'peat-system' }, data: before })
     k.forcedOnce.set('GET /api/v1/namespaces/peat-system/configmaps/peat-owned', { status: 404, json: { message: 'not found' } })
     const again = await reconcile(k)
@@ -414,6 +414,19 @@ describe('what a client of a database needs, in its own namespace', () => {
     const r = await reconcile(k)
     expect(r.pruned).toBe(0)
     expect(k.get('v1', 'secrets', 'peat-db', 'orders-login')).toBeDefined()
+  })
+  test('a database whose status is wiped for a pass keeps its published login the operator\'s', async () => {
+    k.put(platform())
+    await reconcile(k)
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'db-orders-login', namespace: 'peat' }, data: { password: Buffer.from('pw').toString('base64') } })
+    const rec = { tenant: 'a'.repeat(32), timeline: 'b'.repeat(32), pgVersion: 19, phase: 'Ready', record: { mode: 'primary', root: true, parent: '', port: 15010 } }
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders', namespace: 'shop' }, spec: {}, status: rec })
+    await reconcile(k)
+    k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status = {}
+    await reconcile(k)
+    k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status = rec
+    const r = await reconcile(k)
+    expect(r.refused).toEqual([])
   })
   test('a person\'s own Secret of the login\'s name is left alone, and the status does not name it as the login', async () => {
     k.put(platform())
