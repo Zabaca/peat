@@ -469,6 +469,7 @@ settings_kept 'in the move'
 [ "$(k -n shop get database mv18-pg18 -o jsonpath='{.status.pgVersion}')" = 18 ] || fail 'the old copy mv18-pg18 was not kept'
 if k -n peat get configmap peat-move-execs -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
 echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, the settings, its old copy mv18-pg18 kept on 18"
+echo "  $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: the old version stopped [0-9]* ms after the last look at it' | tail -1)"
 
 step "the way back from the move, while nothing was written since"
 k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
@@ -548,6 +549,49 @@ case "$(sssql 'show server_version_num')" in "$want"*) ;; *) fail "ss18's move e
 [ "$got" = "$written" ] || fail "the move ended $state and $((written - got)) of the $written rows the session wrote are lost"
 echo "  the session wrote $written rows and was ended; the move $state, and every row is on Postgres $want: $(k -n shop get database ss18 -o jsonpath='{.status.move.message}' | cut -c1-200)"
 k -n shop delete database ss18 --wait=false >/dev/null
+
+step "a client that got in after a move's door shut, wrote one row and left during the comparison fails the move"
+dbobj sw18 'pgVersion: 18'
+phase_is sw18 Ready 120
+t0=$(date +%s); until k -n shop get secret sw18-login >/dev/null 2>&1; do [ "$(since "$t0")" -lt 60 ] || fail 'sw18 has no login'; sleep 2; done
+sw_password=$(k -n shop get secret sw18-login -o jsonpath='{.data.password}' | base64 -d)
+swsql() { PGPASSWORD="$sw_password" psql "host=sw18.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=${2:-app} sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+t0=$(date +%s); until swsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'sw18 did not answer'; sleep 3; done
+swsql 'create table w (id int primary key)'
+# a database compared after app, large enough that its comparison takes a while: a row written to app then is past app's own comparison
+swsql 'create database zbig'
+swsql "create table big as select g as id, md5(g::text) as note from generate_series(1, 1000000) g" zbig
+curl -fsS -X POST localhost:18080/db/sw18/stop >/dev/null || fail 'sw18 was not stopped'
+t0=$(date +%s); while k -n peat-compute get pods -l compute=sw18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'sw18 did not stop'; sleep 2; done
+k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
+t0=$(date +%s); until sw_pod=$(k -n peat-compute get pods -l compute=sw18 -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
+k -n peat-compute port-forward "pod/$sw_pod" 25433:5432 >>"$work/tunnel-sw.log" 2>&1 &
+pids+=($!); sw_tunnel=$!
+tunnel_up 25433
+# the moment: the comparison reads zbig on the source (app's own comparison is over), seen as the compute's own superuser over the pod's 127.0.0.1
+reading_zbig() { psql "host=127.0.0.1 port=25433 user=cloud_admin dbname=postgres sslmode=disable connect_timeout=5" -XAtc "select count(*) from pg_stat_activity where datname = 'zbig' and usename = 'cloud_admin' and state = 'active' and pid <> pg_backend_pid()" 2>/dev/null; }
+t0=$(date +%s); until [ "$(reading_zbig)" = 1 ]; do
+  [ "$(since "$t0")" -lt 600 ] || fail "sw18's move did not reach the comparison of zbig: $(k -n shop get database sw18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
+  case "$(k -n shop get database sw18 -o jsonpath='{.status.move.state}')" in done|failed|refused) fail "sw18's move ended before the comparison of zbig was seen";; esac
+  sleep 0.1
+done
+[ "$(k -n shop get database sw18 -o jsonpath='{.status.move.state}')" = comparing ] || fail 'zbig was read on the source outside the comparison'
+# one session: in, one row, out
+psql "host=127.0.0.1 port=25433 user=app dbname=app sslmode=disable connect_timeout=10" -XAtq -v ON_ERROR_STOP=1 -c 'insert into w values (1)' || fail "the client's row was not written during the comparison (the move was $(k -n shop get database sw18 -o jsonpath='{.status.move.state}'))"
+kill "$sw_tunnel" 2>/dev/null || true
+t0=$(date +%s); until state=$(k -n shop get database sw18 -o jsonpath='{.status.move.state}') && case "$state" in done|failed|refused) true;; *) false;; esac; do
+  [ "$(since "$t0")" -lt 600 ] || fail "sw18's move did not end in 600 s: $state"
+  sleep 2
+done
+sw_message=$(k -n shop get database sw18 -o jsonpath='{.status.move.message}')
+[ "$state" = failed ] || fail "a row written during the comparison did not fail the move: it ended $state ($sw_message)"
+grep -q 'written during the comparison' <<< "$sw_message" || fail "the move failed, but not on the write counts: $sw_message"
+phase_is sw18 Ready 120
+t0=$(date +%s); until got=$(swsql 'select count(*) from w') 2>/dev/null; do [ "$(since "$t0")" -lt 240 ] || fail 'sw18 did not answer after its move'; sleep 3; done
+case "$(swsql 'show server_version_num')" in 18*) ;; *) fail 'sw18 is not on Postgres 18 after its failed move';; esac
+[ "$got" = 1 ] || fail "the row written during the comparison is not on sw18"
+echo "  the move failed, the row on 18: $(cut -c1-220 <<< "$sw_message")"
+k -n shop delete database sw18 --wait=false >/dev/null
 
 if [ -n "${UPGRADE_FROM:-}" ]; then
   step "the upgrade from $UPGRADE_FROM to this run's images, a writer and a reader running throughout"

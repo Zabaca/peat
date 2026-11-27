@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exitCodeOf, execPath, frame } from '../src/exec'
-import { ROLES_SQL, SETTINGS_COPY_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, outsideSessionsSql, rehearsalVersion, targetNameOf } from '../src/move'
+import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
 
 // The move's pure parts: the globals filtered, the two sides compared, the decision of the database loop; and the exec's framing.
 
@@ -74,6 +74,16 @@ describe('the door', () => {
     expect(endOutsideSessionsSql('')).toContain('pg_terminate_backend(pid, 5000)')
     // who, never what it runs
     expect(outsideSessionsSql('')).not.toContain('query')
+  })
+  test('a client that came, wrote one row and left during the comparison is seen in the write counts; reads and an unchanged count are not', () => {
+    expect(WRITES_SQL).toContain('tup_inserted + tup_updated + tup_deleted')
+    // the counts as pg_stat_database gives them (read from a Postgres 17, 2026-11-27: `-` is the shared catalogs' row)
+    const before = '- 35\napp 50062\npostgres 0\ntemplate1 18426'
+    expect(writtenSince(before, before)).toEqual([])
+    expect(writtenSince(before, '- 35\napp 50063\npostgres 0\ntemplate1 18426')).toEqual(['app'])
+    expect(writtenSince(before, '- 36\napp 50062\npostgres 0\ntemplate1 18426')).toEqual(['-'])
+    // a database made since is a write too
+    expect(writtenSince(before, `${before}\nnewdb 0`)).toEqual(['newdb'])
   })
 })
 

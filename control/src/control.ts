@@ -22,7 +22,7 @@ import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
 import { DB_API, HELD_SELECTOR, beginMaking, knownDb, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 import { parseWindows, windowAt } from './quiet-hours'
-import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_EXECS_CONFIG_MAP, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, compareSides, endOutsideSessionsSql, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
+import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_EXECS_CONFIG_MAP, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, writtenSince, endOutsideSessionsSql, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
 import { exec, type ExecDeps } from './exec'
 import { durationMs } from './api/schema'
 import { PG_VERSIONS } from './storage-spec'
@@ -1560,7 +1560,7 @@ async function runMove(ns: string, name: string): Promise<void> {
     await localPsql(srcPod, 'postgres', makeRoleSql(role, password, 10, leftovers), 'make the move role')
     const renew = setInterval(() => { void localPsql(srcPod, 'postgres', renewRoleSql(role, 10), 'renew the move role').catch(() => {}) }, 180_000)
     const script = (mode: string, args: string[], more = '') => inCompute(tgtPod, ['bash', MOVE_SCRIPT_PATH, mode, String(src.status.podIP), role, ...args], `${password}\n${more}`, `${mode}${args.length ? ` ${args[0]}` : ''}`)
-    let seconds = 0
+    let seconds = 0, dropped = false
     try {
       await write({ state: 'copying' })
       const t0 = Date.now()
@@ -1576,13 +1576,20 @@ async function runMove(ns: string, name: string): Promise<void> {
       const settings = await localPsql(srcPod, 'postgres', SETTINGS_COPY_SQL, 'read the settings')
       if (settings.trim()) await localPsql(tgtPod, 'postgres', settings, 'make the settings on the new version')
       seconds = Math.round((Date.now() - t0) / 1000)
+      // the copy is done, and its role goes now: nothing the move does on the source from here writes to it (the write counts below)
+      clearInterval(renew)
+      await localPsql(srcPod, 'postgres', dropRolesSql([role]), 'drop the move role')
+      dropped = true
       await write({ state: 'comparing', seconds })
       // A session that got in after the door shut (a gateway whose read of the routes failed keeps the old route; a pooled client
-      // reconnects once the source is started for the copy) is ended before the comparison, so what it wrote is compared; one there again
-      // before the switch fails the move (below). Its writes are then on the old side, never lost under an "equal".
+      // reconnects once the source is started for the copy) is ended before the comparison, so what it wrote is compared, and the
+      // source's write counts are read. After the comparison a session still open, or a count that grew (a client that came, wrote and
+      // left), fails the move, and the source is stopped at once. What it wrote is then on the old side, never lost under an "equal".
+      let writes = ''
       if (!mv.rehearsal) {
         const ended = Number(lines(await localPsql(srcPod, 'postgres', endOutsideSessionsSql(role), 'end the sessions that got in after the door shut'))[0] ?? 0)
         if (ended) console.log(`move ${ns}/${name}: ${ended} session(s) that got in after the door shut ended before the comparison`)
+        writes = await localPsql(srcPod, 'postgres', WRITES_SQL, 'count the writes on the old version')
       }
       // each side read on its own compute, by its own superuser: what the copy made against what it was made from
       const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(srcPod, db, sql, `read ${db} on the old version`), await localPsql(tgtPod, db, sql, `read ${db} on the new version`)]
@@ -1590,14 +1597,20 @@ async function runMove(ns: string, name: string): Promise<void> {
       for (const db of dbs) sides.fingerprints[db] = await both(db, fingerprintSql(db))
       const c = compareSides(sides)
       if (!c.same) throw new Error(`the copy is not the same: ${c.why}`)
+      if (!mv.rehearsal) {
+        // the sessions first, then the counts: a session that ends before the look has its counts in them by then
+        const again = lines(await localPsql(srcPod, 'postgres', outsideSessionsSql(role), 'look for sessions on the old version'))
+        if (again.length) throw new Error(`a session got in after the door shut (${again.slice(0, 3).join(', ')}): what it wrote may not be in the copy`)
+        const written = writtenSince(writes, await localPsql(srcPod, 'postgres', WRITES_SQL, 'count the writes on the old version'))
+        if (written.length) throw new Error(`the old version was written during the comparison (${written.slice(0, 3).join(', ')}), by a client that got in after the door shut: what it wrote may not be in the copy`)
+        const looked = Date.now()
+        await stopCompute(name)
+        console.log(`move ${ns}/${name}: the old version stopped ${Date.now() - looked} ms after the last look at it`)
+      }
       await write({ equal: true, message: `copied in ${seconds} s and compared equal: ${c.databases} databases, ${c.roles} roles, ${c.tables} tables, ${c.rows} rows` })
     } finally {
       clearInterval(renew)
-      await localPsql(srcPod, 'postgres', dropRolesSql([role]), 'drop the move role').catch((e) => console.log(`move ${ns}/${name}: drop ${role}: ${e}`))
-    }
-    if (!mv.rehearsal) {
-      const again = lines(await localPsql(srcPod, 'postgres', outsideSessionsSql(role), 'look for sessions on the old version'))
-      if (again.length) throw new Error(`a session got in after the door shut (${again.slice(0, 3).join(', ')}): what it wrote may not be in the copy`)
+      if (!dropped) await localPsql(srcPod, 'postgres', dropRolesSql([role]), 'drop the move role').catch((e) => console.log(`move ${ns}/${name}: drop ${role}: ${e}`))
     }
     if (mv.rehearsal) {
       await cleanupMove(ns, name, mv, key)
@@ -1671,6 +1684,7 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
     // before the switch back fails it (what it wrote would be on the timeline that is given up)
     const ended = Number(lines(await localPsql(cur, 'postgres', endOutsideSessionsSql(''), 'end the sessions that got in after the door shut'))[0] ?? 0)
     if (ended) console.log(`move back ${ns}/${name}: ${ended} session(s) that got in after the door shut ended before the comparison`)
+    const writes = await localPsql(cur, 'postgres', WRITES_SQL, 'count the writes')
     const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(old, db, sql, `read ${db} on the old copy`), await localPsql(cur, db, sql, `read ${db}`)]
     const sides: Sides = { databases: await both('postgres', DATABASES_SQL), roles: await both('postgres', ROLES_SQL), fingerprints: {} }
     for (const db of lines(sides.databases[1])) sides.fingerprints[db] = await both(db, fingerprintSql(db))
@@ -1678,9 +1692,11 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
     if (c.same) {
       const again = lines(await localPsql(cur, 'postgres', outsideSessionsSql(''), 'look for sessions'))
       if (again.length) throw new Error(`a session got in after the door shut (${again.slice(0, 3).join(', ')}): what it wrote would not go back`)
+      const written = writtenSince(writes, await localPsql(cur, 'postgres', WRITES_SQL, 'count the writes'))
+      if (written.length) throw new Error(`the database was written during the comparison (${written.slice(0, 3).join(', ')}), by a client that got in after the door shut: what it wrote would not go back`)
     }
-    await listExecs(key, null)
     await stopCompute(name, true)
+    await listExecs(key, null)
     await stopCompute(oldRec.name, true)
     if (!c.same) {
       await patchDbStatus(ns, name, { ...doorBack, message: `the way back was refused: the database was written since the move (${c.why}). To go back by hand: copy it into ${mv.oldDatabase} with pg_dump, then ask again` })

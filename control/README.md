@@ -112,9 +112,14 @@ login. Neon has no in-place major upgrade, so a move is a copy, in the control l
   started on it.
 - The door is shut (`phase: Moving`: new connections are refused, open sessions ended) for the copy's length. The control layer waits
   12 s (two of a gateway's reads of its routes) before it stops the old compute and starts it again for the copy. A gateway whose read
-  failed keeps the old route, so a client may still get in. Every session that is not the compute's own or the move's is then ended
-  before the comparison (what it wrote is compared), and the move fails if one is there again after the comparison. What is not covered:
-  a client that, through such a gateway, connects, writes and leaves in the seconds between the comparison and the old compute's stop.
+  failed keeps the old route, so a client may still get in. Before the comparison every session on the old compute that is not the
+  compute's own is ended (what it wrote is compared), and the old compute's counts of rows written are read (`pg_stat_database`). After
+  it, a session still open, or a count that grew (a client that came, wrote and left), fails the move, and the old compute is stopped at
+  once. What remains: a write that lands between that last look and the old compute's shutdown (the stop's calls to the API server, 10 to 12 ms
+  in the install test, then the kubelet's signal to the pod and Postgres's fast shutdown, not measured), and one by a session that ends
+  at the very moment of the look, between leaving the list of sessions and its counts reaching the totals (microseconds). A control layer
+  that restarts during the comparison starts the copy again; once `switching` is recorded the old compute was already stopped after the
+  last look, and nothing starts it again while the door is shut.
 - A temporary superuser, `peat_move_<hex>`, is made on the old compute. The new compute reads the old one over TLS as that role,
   verified against the platform's authority:
   - every role (its password's verifier, its attributes, its memberships, its settings), then every database (each object made by
