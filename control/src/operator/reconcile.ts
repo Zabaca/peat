@@ -13,8 +13,9 @@ import { NONCE_ANNOTATION, Owned } from './owned'
 import { keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
 import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type Resolved } from './platform'
 import { storageOf, type Storage } from './storage'
-import { decide, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
+import { UNRECORDED, decide, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
 import { piecesOf, runStep } from './upgrade-run'
+import { ADOPTED, differences, imageOnly, immutableFor } from './adoption'
 import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, render, type Manifest } from './render'
 
 export const FIELD_MANAGER = OPERATOR
@@ -170,59 +171,38 @@ async function published(k: Kube, r: Resolved, keys: Record<string, string>, caP
   return { manifests: out, dbs, keep }
 }
 
-/** The mark on an object the operator took over from an install made another way. */
-export const ADOPTED = `${GROUP}/adopted`
-/**
- * How `live` differs from what the operator would make (`want`), as the paths of every field the operator sets whose value is not the live
- * one; fields the operator does not set (defaults the API server filled in, another tool's fields) are not differences. The operator's own
- * labels are not either: taking an object over is what adds them.
- */
-export function differences(want: unknown, live: unknown, path = ''): string[] {
-  if (path === '.metadata.labels') return []
-  // the annotations the operator sets, less its release stamp (which an upgrade moves on its own); another tool's are not its business
-  if (path === '.metadata.annotations') return differences(Object.fromEntries(Object.entries((want ?? {}) as Record<string, unknown>).filter(([a]) => a !== RELEASE_ANNOTATION)), live ?? {}, '.metadata.annotations.')
-  if (path === '.stringData') return []
-  if (want === null || typeof want !== 'object') return JSON.stringify(want) === JSON.stringify(live) ? [] : [`${path || '.'}: ${JSON.stringify(live) ?? 'none'} would be ${JSON.stringify(want)}`.slice(0, 240)]
-  // an empty list or object is what an API server does not store (omitempty): absent live, it is no difference, for every kind
-  if ((live === undefined || live === null) && (Array.isArray(want) ? want.length === 0 : Object.keys(want).length === 0)) return []
-  if (Array.isArray(want)) {
-    if (!Array.isArray(live) || live.length !== want.length) return [`${path}: ${Array.isArray(live) ? `${live.length} items` : JSON.stringify(live) ?? 'none'} would be ${want.length} items`]
-    return want.flatMap((w, i) => differences(w, live[i], `${path}[${i}]`))
-  }
-  if (!live || typeof live !== 'object' || Array.isArray(live)) return [`${path}: none would be set`]
-  const out = Object.entries(want as Record<string, unknown>).flatMap(([k2, v]) => differences(v, (live as Record<string, unknown>)[k2], path.endsWith('.') ? `${path}${k2}` : `${path}.${k2}`))
-  // a Secret's stringData is written as its data: each value compared, base64, with the live data's (never printed: a key's name only)
-  if (path === '' && (want as any)?.stringData && typeof (want as any).stringData === 'object') {
-    const data = ((live as any).data ?? {}) as Record<string, string>
-    for (const [key2, v] of Object.entries((want as any).stringData as Record<string, string>)) if (Buffer.from(String(v)).toString('base64') !== data[key2]) out.push(`.data.${key2}: its value would change`)
-  }
-  return out
-}
-
 /**
  * The images the platform runs, read from its live objects: for a status an earlier operator wrote without them, where a guess from the
- * release's name would miss an install that pins its images. Null when the pieces are not all there to read.
+ * release's name would miss an install that pins its images. Every piece is read: the storage image of the controller, the broker, each
+ * pageserver and each safekeeper, the control image of the control layer and the gateways. `disagree` names the pieces whose image is not
+ * the others' (moved by hand): nothing is recorded or started from such a platform. Null when the control layer is not there to read.
  */
-async function liveImages(k: Kube, r: Resolved, release?: string): Promise<Images | null> {
-  const dep = async (ns: string, name: string) => { const a = await k.request('GET', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`); return a.status === 200 ? a.json : null }
-  const [controller, control] = await Promise.all([dep(r.names.namespace, 'storage-controller'), dep(r.names.namespace, 'peat-control')])
+async function liveImages(k: Kube, r: Resolved, release?: string): Promise<{ images: Images; disagree: string[] } | null> {
+  const ns = r.names.namespace
+  const list = async (kind: 'deployments' | 'statefulsets', namespace: string) => { const a = await k.request('GET', `/apis/apps/v1/namespaces/${namespace}/${kind}`); return a.status === 200 ? (a.json.items as any[]) : [] }
+  const [deps, stss, gws] = await Promise.all([list('deployments', ns), list('statefulsets', ns), list('deployments', r.names.gatewayNamespace)])
   const image = (o: any) => String(o?.spec?.template?.spec?.containers?.[0]?.image ?? '')
+  const controller = deps.find((o) => o.metadata.name === 'storage-controller'), control = deps.find((o) => o.metadata.name === 'peat-control')
   const env = (name: string) => ((control?.spec?.template?.spec?.containers?.[0]?.env ?? []) as any[]).find((e) => e.name === name)?.value as string | undefined
   const c18 = env(COMPUTE_IMAGE_ENV[18]), c19 = env(COMPUTE_IMAGE_ENV[19])
   if (!image(controller) || !image(control) || !c18 || !c19) return null
-  return { release: release ?? String(controller?.metadata?.annotations?.[RELEASE_ANNOTATION] ?? 'unrecorded'), storage: image(controller), control: image(control), compute: { 18: c18, 19: c19 } }
+  const storagePieces = [...deps.filter((o) => ['storage-controller', 'storage-broker'].includes(o.metadata.name)), ...stss.filter((o) => /^(pageserver|safekeeper)-w\d+$/.test(o.metadata.name))]
+  const controlPieces = [control, ...gws.filter((o) => o.metadata.name === 'peat-gateway')]
+  const disagree = [...storagePieces.filter((o) => image(o) !== image(controller)).map((o) => `${o.metadata.name} runs ${image(o)}, the controller ${image(controller)}`), ...controlPieces.filter((o) => image(o) !== image(control)).map((o) => `${o.metadata.name} runs ${image(o)}, the control layer ${image(control)}`)]
+  return { images: { release: release ?? String(controller?.metadata?.annotations?.[RELEASE_ANNOTATION] ?? UNRECORDED), storage: image(controller), control: image(control), compute: { 18: c18, 19: c19 } }, disagree }
 }
 
-/** Fields an object cannot change in place, by kind: a difference there is one an apply would be refused (422). */
-const IMMUTABLE: Record<string, RegExp[]> = {
-  StatefulSet: [/^\.spec\.selector\b/, /^\.spec\.volumeClaimTemplates\b/, /^\.spec\.serviceName\b/, /^\.spec\.podManagementPolicy\b/],
-  Deployment: [/^\.spec\.selector\b/],
-  Job: [/^\.spec\.template\b/, /^\.spec\.selector\b/],
-  Service: [/^\.spec\.clusterIP\b/, /^\.spec\.clusterIPs\b/],
-  RoleBinding: [/^\.roleRef\b/],
-  ClusterRoleBinding: [/^\.roleRef\b/],
+/** The step's adopted pieces whose held differences are more than their images, each said in a line (empty: none). */
+async function heldByAdoption(k: Kube, rendered: Manifest[], names: string[]): Promise<string[]> {
+  const out: string[] = []
+  for (const m of rendered.filter((x) => (x.kind === 'Deployment' || x.kind === 'StatefulSet') && names.includes(x.metadata.name))) {
+    const live = await k.request('GET', pathOf(m))
+    if (live.status !== 200 || live.json.metadata?.labels?.[ADOPTED] !== 'true') continue
+    const diff = differences(m, live.json).filter((d) => !imageOnly(d))
+    if (diff.length) out.push(`${m.metadata.name} was adopted with differences held (${diff.slice(0, 3).join('; ')}): requests.applyPending lets this step apply them`)
+  }
+  return out
 }
-const immutableFor = (kind: string) => (path: string) => (IMMUTABLE[kind] ?? []).some((re) => re.test(path))
 
 /** One pass. Returns what it did, for the log and the tests. */
 export interface Deps { storage?: (r: Resolved, keys: Record<string, string>) => Storage; now?: () => Date }
@@ -307,6 +287,10 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
         return
       }
       // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret)
+      if (!ours && live.json.metadata?.labels?.[ADOPTED] === 'true') {
+        refused.push(`${key(m)} is marked adopted by a pass that did not finish taking it over, and is no longer listed: left alone (list it in adopt again, or take the operator's labels off it)`)
+        return
+      }
       if (!ours) {
         refused.push(`${key(m)} exists and was not made by the operator: left alone (adopt takes an object into the record${owned.fresh ? "; the operator's record was made new on this pass: if the operator made it before, list it under adopt to take it back" : ''})`)
         return
@@ -360,23 +344,36 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const status = (p.status ?? {}) as any
   // what the platform runs: the release recorded, or, with none recorded (a first install not yet Ready, an adopted platform), the live
   // pieces' images: once any piece runs, a changed release is only ever rendered through the ordered steps
-  const seeded = status.release ? null : await liveImages(k, r)
-  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? (await liveImages(k, r, String(status.release))) ?? imagesOf(spec, String(status.release)) }
-    : seeded ? { release: sameImages(seeded, r.images) ? spec.release : seeded.release, images: seeded } : undefined
+  // (mid-upgrade the release is cleared and the pieces disagree by design: the upgrade's own state says what runs)
+  const seeded = status.release || (status.upgrade && !status.upgrade.complete) ? null : await liveImages(k, r)
+  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? (await liveImages(k, r, String(status.release)))?.images ?? imagesOf(spec, String(status.release)) }
+    : seeded ? { release: sameImages(seeded.images, r.images) ? spec.release : seeded.images.release, images: seeded.images } : undefined
+  // why no upgrade may start from what runs: pieces on images that disagree, or images no release records (pin spec.images to them, and
+  // the release is recorded under the spec's name)
+  const unstartable = seeded?.disagree.length ? `the pieces do not all run the same images (${seeded.disagree.slice(0, 4).join('; ')}): nothing is recorded or started until they do`
+    : running?.release === UNRECORDED && !sameImages(running.images, r.images) ? `the pieces run images no release records (storage ${running.images.storage}, control ${running.images.control}): pin spec.images to what runs (the release is then recorded under the spec's name), then change it` : ''
+  // an object listed in adopt and not yet in the record is taken over on this pass: no upgrade starts on the pass that adopts
+  const adopting = [...adoptList].some((a) => !owned.get(a))
   const sks = await k.request('GET', `/apis/apps/v1/namespaces/${r.names.namespace}/statefulsets?labelSelector=${sel({ 'peat-sk': 'true' })}`)
   const skNames = sks.status === 200 ? (sks.json.items as any[]).map((x) => String(x.metadata.name)) : []
   const decision = decide({ release: spec.release, images: r.images, running, state: status.upgrade as UpgradeState | undefined, steps: stepsOf(r.placements.pageservers.map((x) => x.id), skNames), retry: spec.requests?.retry, quietHours: spec.upgrades.quietHours, now })
-  let upgrade: UpgradeState | undefined = decision.kind === 'none' ? undefined : decision.state
+  const startHeld = !status.upgrade && decision.kind !== 'none' && (adopting || Boolean(unstartable))
+  let upgrade: UpgradeState | undefined = decision.kind === 'none' || startHeld ? undefined : decision.state
   let stepMessage = ''
-  if (decision.kind === 'continue') {
+  if (decision.kind === 'continue' && !startHeld) {
     const before = await pieces(k, r, render(r, keys, imagesFor(upgrade, r.images)))
     const storage = (deps.storage ?? ((res, kk) => storageOf(res, kk['auth_private_key.pem']!)))(r, keys)
-    const work = await runStep(k, r, storage, upgrade!, now, before.filter((x) => !x.ready).map((x) => x.name))
+    // adoption's part in a step: before the step changes its pieces, an adopted piece's held differences that are not its images wait for
+    // requests.applyPending (once asked, the step applies the whole render to it)
+    const held = upgrade!.phase === 'precheck' && !applyPending ? await heldByAdoption(k, render(r, keys, imagesFor(upgrade, r.images)), piecesOf(upgrade!.step!)) : []
+    const work = await runStep(k, r, storage, upgrade!, now, before.filter((x) => !x.ready).map((x) => x.name), held)
     upgrade = work.state
     stepMessage = work.message
   }
   const live = upgrade && !upgrade.complete ? upgrade : undefined
-  const at = imagesFor(live, r.images)
+  // the images each piece is rendered at: the step's, the finished upgrade's, or, while no upgrade may run, what the pieces run now: a
+  // changed release is never rendered outside the ordered steps
+  const at = decision.kind === 'finish' && !live ? () => decision.images : !live && running && !sameImages(running.images, r.images) ? () => running.images : imagesFor(live, r.images)
   if (live?.step && !['precheck', 'draining'].includes(String(live.phase))) {
     const names = new Set(piecesOf(live.step))
     stepApplies = new Set(render(r, keys, at).filter((m) => (m.kind === 'Deployment' || m.kind === 'StatefulSet') && names.has(m.metadata.name)).map(key))
@@ -433,11 +430,11 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const unmatched = [...adoptList].filter((a) => !rendered.some((m) => key(m) === a))
   const note = unmatched.length ? `; adopt names ${unmatched.join(', ')}, which the platform does not make: nothing is taken over for ${unmatched.length === 1 ? 'it' : 'them'}` : ''
   // a pending change keeps the platform from Ready: what runs is not yet what is declared
-  const phase = notReady.length || refused.length || pending.length ? 'Installing' : 'Ready'
-  const message = (refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : pending.length ? `${pending.length} pending change${pending.length === 1 ? '' : 's'} wait for requests.applyPending (status.pendingChanges)` : `every piece is ready on ${spec.release}`) + note
-  // the release every piece runs, recorded once all are ready on it: what the next upgrade starts from
-  // the release every piece runs, recorded once all are ready on it, whatever is pending or refused: what the next upgrade starts from
-  const record = !notReady.length && !status.release && decision.kind === 'none'
+  const phase = notReady.length || refused.length || pending.length || unstartable ? 'Installing' : 'Ready'
+  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : pending.length ? `${pending.length} pending change${pending.length === 1 ? '' : 's'} wait for requests.applyPending (status.pendingChanges)` : `every piece is ready on ${spec.release}`) + note
+  // the release every piece runs, recorded once all are ready on it, whatever is pending or refused: what the next upgrade starts from;
+  // never a release no record names, nor images the pieces do not agree on
+  const record = !notReady.length && !status.release && (decision.kind === 'none' || startHeld) && !unstartable && running?.release !== UNRECORDED
   return done(phase, message, { ...more, namespaces: spec.namespaces, ...(record ? { release: running?.release ?? spec.release, images: running?.images ?? r.images } : {}) }, counts)
 }
 
