@@ -351,7 +351,11 @@ describe('the safekeepers: closing, seeding, moving, deciding', () => {
     expect(lostEverywhere([], new Set([7]))).toBe(false)
     // in the closing count: only after nobody answered, from the controller's own set (and its move), with the lost marks and the decommissioned
     const reads = control.slice(control.indexOf('async function readTimelines'), control.indexOf('async function replacementOpen'))
-    expect(reads).toContain('if (!read.answered) {')
+    expect(reads).toContain('if (!read.answered && answerLostEverywhere) {')
+    // only a person's decommission accepts a total loss: the replacement job's own close never does (every member looking lost may be a
+    // data disk not mounted), so it keeps the lost members and says so
+    expect(control).toContain('const findTodo = () => readTimelines(lost, lostHost, job.newId!)\n')
+    expect(control).toContain('await readTimelines(id, sk.host, Math.max(...(list.json as any[]).map((x) => x.id as number)), true)')
     expect(reads).toContain('/debug/v1/tenant/${t}/timeline/${tl}/locate')
     expect(reads).toContain('if (lostEverywhere(members, lostIds)) read = { answered: true, onLost: false }')
     expect(reads).toContain("labelSelector=peat-sk-lost")

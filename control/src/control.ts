@@ -1065,7 +1065,7 @@ async function pickNode(lost: number, all: any[]): Promise<string> {
  * Asks the members other than `lost` (ids 1 to `ceiling`, in id order, the first answer decides) about every primary timeline of the control layer's records: which still list `lost` (or a pending change of members), and which
  * nobody answered about (unknown). The rule that turns this into a decision is `closeDecision` (storage-spec.ts).
  */
-async function readTimelines(lost: number, lostHost: string, ceiling: number) {
+async function readTimelines(lost: number, lostHost: string, ceiling: number, answerLostEverywhere = false) {
   const todo: { tenant: string; timeline: string; set: number[] }[] = []
   const reads: TimelineRead[] = []
   let onNew = 0 // timelines that refer to the new member (`ceiling` is its id) in their set or a pending change of it: where a replacement made progress
@@ -1097,8 +1097,10 @@ async function readTimelines(lost: number, lostHost: string, ceiling: number) {
         read = { answered: true, onLost }
         break
       }
-      // nobody answered: answered for only when every member the controller lists for it (and any it moves to) is lost for good
-      if (!read.answered) {
+      // nobody answered: answered for only when every member the controller lists for it (and any it moves to) is lost for good, and only for
+      // a person's decommission: every member that looks lost may be a data disk that was not mounted, so a total loss is never accepted
+      // without someone who checked
+      if (!read.answered && answerLostEverywhere) {
         const loc = await storcon('GET', `/debug/v1/tenant/${t}/timeline/${tl}/locate`).catch(() => null)
         const members = loc?.status === 200 ? [...((loc.json.sk_set ?? []) as number[]), ...((loc.json.new_sk_set ?? []) as number[])].map(Number) : []
         if (lostEverywhere(members, lostIds)) read = { answered: true, onLost: false }
@@ -2260,7 +2262,7 @@ Bun.serve({
           }
         }
         // the closing count is read only when it can decide (it is slow at many databases): not for a member that answers, nor when nobody does
-        const count = answersItself || othersAnswering === 0 ? null : await readTimelines(id, sk.host, Math.max(...(list.json as any[]).map((x) => x.id as number))).then((c) => ({ todo: c.todo.length, unknown: c.unknown, close: c.close })).catch(() => null)
+        const count = answersItself || othersAnswering === 0 ? null : await readTimelines(id, sk.host, Math.max(...(list.json as any[]).map((x) => x.id as number)), true).then((c) => ({ todo: c.todo.length, unknown: c.unknown, close: c.close })).catch(() => null)
         const verdict = decommissionDecision({ answers: answersItself, othersAnswering, lossEvidenced, count, force: url.searchParams.get('force') === '1' })
         if (!verdict.allow) return json({ error: `safekeeper ${id} is not decommissioned: ${verdict.why}`, ...(count ?? {}) }, 409)
         console.log(`sk-decommission: safekeeper ${id}: ${verdict.why}`)
