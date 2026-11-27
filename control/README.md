@@ -26,7 +26,12 @@ shard attached, nothing reconciling, every secondary copy warm, every safekeeper
 `upgrades.checkTimeout` (a duration, `10m` by default) halts the upgrade with the step and the reason in the status (`peat status`); it stays halted until `peat retry`
 (it goes on from that step) or until the earlier release is set back (only what had moved goes back, last first, with the same checks,
 except that the check before each step back leaves out that step's own piece and its own storage readings: it is the broken piece the way
-back mends). A drain asked again when its node reads Active also restarts one a person cancelled, until `upgrades.checkTimeout` halts it.
+back mends). With two pieces broken at once the way back halts at the first it reaches: for the keepers this is the safe side (a write needs
+two of three); the way out is `suspend: true` on the Platform and a fix by hand. Changing the target's images while an upgrade is under way
+(the release kept, its images pinned anew to mend a bad one) takes back what moved and then runs the upgrade again to the new images. No
+upgrade starts from pieces that do not all run the same images, nor from images no release records (a platform installed another way):
+pin `spec.images` to what runs, and the release is recorded under the spec's name. A drain asked again when its node reads Active also
+restarts one a person cancelled, until `upgrades.checkTimeout` halts it.
 No step starts inside `upgrades.quietHours`: an upgrade under way waits at the next step boundary. A compute takes the new image at its
 next start, or, awake, inside `upgrades.restartHours`, one at a time. The state is in `status.upgrade`, so a restarted operator goes on.
 
@@ -38,8 +43,10 @@ taken over as it is, and is the operator's from then on, listed or not; one it w
 is listed in `status.pendingChanges` until `requests.applyPending` asks for it (taking it off the list applies nothing). A change of a
 field that cannot change in place (a Deployment's or StatefulSet's selector, a StatefulSet's volume claims, serviceName or
 podManagementPolicy, a Job's template, a Service's clusterIP, a binding's roleRef) is listed as one that cannot be applied. A change to a
-pageserver's pods is not applied by `requests.applyPending`: the ordered upgrade makes it, when the release or the images change, and its
-step applies the new images to the adopted object as it does to any other. Once any piece runs, a changed release goes through the ordered
+pageserver's pods is not applied by `requests.applyPending`: the ordered upgrade makes it, when the release or the images change. A step
+waits, before it changes anything, while one of its adopted pieces holds a difference beyond its images, and says which; once
+`requests.applyPending` asks, the step applies the whole render to it (every difference, not only the new images). No upgrade starts on
+the pass that adopts. Once any piece runs, a changed release goes through the ordered
 steps, from the images the live pieces run when no release has been recorded yet. While anything is pending the platform reads Installing,
 not Ready (the release is recorded all the same once every piece is ready). An entry that names nothing the operator makes is said in the
 status. It never deletes what it did not make or adopt.

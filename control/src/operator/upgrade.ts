@@ -32,7 +32,14 @@ export interface UpgradeState {
   retried?: string
   lastCheck?: { at: string; passed: boolean; message: string }
   complete?: boolean
+  /** A pageserver a dropped draining step left paused: the next step's check fills it again before anything else. */
+  refill?: number
+  /** Why the way back was taken without the earlier release being set (new target images while the upgrade was under way). */
+  reason?: string
 }
+
+/** A release no record names: a platform installed another way, whose pieces carry no release of ours. Never an upgrade's end. */
+export const UNRECORDED = 'unrecorded'
 
 /** The pageserver a step is of (0: not a pageserver's): the step is its piece, as render.ts names it. */
 export const pageserverOf = (step: string): number => { const id = Number(step.replace(/^\D+/, '')); return Number.isInteger(id) && id > 0 && pageserverPiece(id) === step ? id : 0 }
@@ -82,8 +89,8 @@ export function decide(o: {
   const now = o.now.toISOString()
   let u = o.state && !o.state.complete ? { ...o.state } : undefined
   if (!u) {
-    // a changed release, or the same release name with other images (an install that pins them)
-    if (!o.running || (o.running.release === o.release && sameImages(o.running.images, o.images))) return { kind: 'none' }
+    // a changed release, or the same release name with other images (an install that pins them); never from a release no record names
+    if (!o.running || (o.running.release === o.release && sameImages(o.running.images, o.images)) || o.running.release === UNRECORDED) return { kind: 'none' }
     u = { from: o.running.release, to: o.release, fromImages: o.running.images, toImages: o.images, direction: 'forward', steps: o.steps, moved: [], startedAt: now }
   }
   if (o.release !== u.to && o.release !== u.from) {
@@ -91,7 +98,10 @@ export function decide(o: {
     // halted once for it: the time it halted is kept, not written again every pass
     return { kind: 'halt', state: { ...u, halted: u.halted?.reason === reason ? u.halted : { at: now, step: u.step ?? '(between steps)', reason } } }
   }
-  const wanted = o.release === u.to ? 'forward' : 'back'
+  // the target's images replaced (the release kept, its images pinned anew, to mend a bad one): what moved goes back to where it started, in
+  // order, and the next upgrade then starts to the new images; the frozen images of the one under way are never mixed with the new
+  const replaced = o.release === u.to && !sameImages(o.images, u.toImages)
+  const wanted = o.release === u.to && !replaced ? 'forward' : 'back'
   if (wanted !== u.direction) {
     // the step under way counts where its images are: once anything of it was applied it is on the release it was going to
     let moved = u.moved
@@ -99,7 +109,9 @@ export function decide(o: {
       if (u.direction === 'forward' && !moved.includes(u.step)) moved = [...moved, u.step]
       if (u.direction === 'back') moved = moved.filter((x) => x !== u!.step)
     }
-    u = { ...u, direction: wanted, moved, step: undefined, phase: undefined, since: undefined, halted: undefined }
+    // a pageserver step dropped while it drained (nothing of it applied) leaves its node paused: the next step's check fills it again
+    const refill = u.step && !applied(u.phase) && u.phase === 'draining' && pageserverOf(u.step) ? pageserverOf(u.step) : u.refill
+    u = { ...u, direction: wanted, moved, step: undefined, phase: undefined, since: undefined, halted: undefined, ...(refill ? { refill } : {}), ...(replaced ? { reason: 'the target images were replaced while it was under way: what moved goes back, then the upgrade starts again to the new images' } : {}) }
   }
   if (u.halted) {
     if (o.retry && o.retry !== u.retried) u = { ...u, halted: undefined, retried: o.retry, since: now }
