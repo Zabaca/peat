@@ -123,6 +123,14 @@ describe('the names and settings the program reads', () => {
     expect(frontDoor(DEFAULT_NAMES)).toBe('pg-front.peat-gateway.svc.cluster.local')
   })
 
+  test('the compute reconciler knows a database by its record too, and a status written again keeps its requests answered', () => {
+    const reconciler = control.slice(control.indexOf('async function reconcileComputes'), control.indexOf('async function reconcileComputes') + 1500)
+    expect(reconciler).toContain('const recs = await readRecords(RECORDS)')
+    expect(reconciler).toContain('const d = knownDb(name, dbs, recs)')
+    const rebuild = control.slice(control.indexOf("=== 'rebuild') {"), control.indexOf("=== 'rebuild') {") + 1200)
+    expect(rebuild).toContain("Object.entries(o.spec?.requests ?? {})")
+    expect(rebuild).toContain('{ answered }')
+  })
   test('its program imports nothing but Node\'s own and the folder\'s shared modules', () => {
     for (const f of ['control.ts', 'storage-spec.ts']) {
       const specifiers = [...src(f).matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]!)
