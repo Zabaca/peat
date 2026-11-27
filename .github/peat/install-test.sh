@@ -525,8 +525,9 @@ t0=$(date +%s); until oldsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -
 t0=$(date +%s)
 k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
 t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = going-back ]; do [ "$(since "$t1")" -lt 120 ] || fail "the way back did not start: $(k -n shop get database mv18 -o jsonpath='{.status.move.state}: {.status.message}')"; sleep 0.2; done
-k -n peat delete pod -l app=peat-control --wait=false >/dev/null
-echo "  the control layer's pod deleted during the way back (going-back)"
+# killed at once (no grace: a graceful stop lets the pod finish the way back first)
+k -n peat delete pod -l app=peat-control --grace-period=0 --force --wait=false >/dev/null 2>&1
+echo "  the control layer's pod killed during the way back (going-back)"
 t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = back ]; do
   [ "$(since "$t1")" -lt 300 ] || fail "the way back did not end in 300 s: $(k -n shop get database mv18 -o jsonpath='{.status.phase}: {.status.message}')"
   sleep 1
@@ -551,7 +552,9 @@ newsql() { PGPASSWORD="$mv_password" psql "host=mv18-pg19.peat-db.svc hostaddr=1
 t0=$(date +%s); until newsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'the kept newer copy mv18-pg19 did not answer'; sleep 3; done
 case "$(newsql 'show server_version_num')" in 19*) ;; *) fail 'mv18-pg19 is not on Postgres 19';; esac
 [ "$(newsql 'select note from items where id = 501')" = 'written on 19' ] || fail 'the row written after the move is not in the kept newer copy mv18-pg19'
-echo "  back on 18 in $back_s s with the control layer restarted in it (its own steps: $(k -n shop get database mv18 -o jsonpath='{.status.move.seconds}') s), as frozen at the move (500 rows); the row written on 19 since is in the kept copy mv18-pg19"
+# finished by the control layer's new pod: it went on from the state going-back
+k -n peat logs "pod/$(ready_pod peat app=peat-control)" --tail=-1 2>/dev/null | grep -q 'move back shop/mv18: back on Postgres 18' || fail 'the way back was not finished by the restarted control layer'
+echo "  back on 18 in $back_s s, finished by the control layer restarted in it, as frozen at the move (500 rows); the row written on 19 since is in the kept copy mv18-pg19"
 
 step "a move resumed after the control layer restarts mid-move, then its old copy deleted when keepOldFor ends"
 # asked again (the move to 19 ended in a way back), with a keepOldFor of seconds
