@@ -14,7 +14,7 @@
 // namespace. Run by Bun from the control image, under the account `peat-control`.
 import { X509Certificate, createHmac, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, pbkdf2Sync, randomBytes, sign as edSign, verify as edVerify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { SAFEKEEPER_RESOURCES, SEED_GROUP_ANNOTATION, closeDecision, decommissionDecision, reopenDecision, totalLossEvidence, formatSeedGroup, parseSeedGroup, membersOffBox, moveDecision, otherReplacementOpen, placementFor, replaceDecision, replacementMachines, replacementPool, safekeeperStatefulSet, seedCompletion, seedDecision, seedGroup, seedIds, neverWritten, isPullTimelineFailure, keeperNodeProblem, keeperReplacementVerdict, certInfo, certNeedsReload, tcpUp, memoryGauges, placementVerdict, startVerdict, within, type MemberAt, type ReplacementMark, type SkRecord, type TimelineRead } from './storage-spec'
+import { SAFEKEEPER_RESOURCES, SEED_GROUP_ANNOTATION, closeDecision, decommissionDecision, lostEverywhere, reopenDecision, totalLossEvidence, formatSeedGroup, parseSeedGroup, membersOffBox, moveDecision, otherReplacementOpen, placementFor, replaceDecision, replacementMachines, replacementPool, safekeeperStatefulSet, seedCompletion, seedDecision, seedGroup, seedIds, neverWritten, isPullTimelineFailure, keeperNodeProblem, keeperReplacementVerdict, certInfo, certNeedsReload, tcpUp, memoryGauges, placementVerdict, startVerdict, within, type MemberAt, type ReplacementMark, type SkRecord, type TimelineRead } from './storage-spec'
 import { callerVerdict, computeImageFor, pgVersionOf, requestedPgVersion } from './storage-spec' // a database's Postgres version and the compute image that serves it
 import { ancestorFor, olderTimelineFor, ownMemberProbe, recoverDecision, recoverStep, recoveryPoint, recoveryScope, timelineOwnMembers, unfinishedRepoint, type MemberProbe, type RecoveryMark } from './storage-spec' // the recovery of a database under its own name (recoverDatabase)
 import { GROUP, controlUrl, fromEnv, frontDoor, parseLabel, placement } from './names'
@@ -155,7 +155,7 @@ const hookTokenOk = (header: string | null): boolean => {
 
 // ---- Neon's storage controller and pageserver
 const storcon = async (method: string, path: string, body?: unknown, timeoutMs = 60_000) => {
-  const r = await fetch(`${STORCON}${path}`, { method, headers: { ...scoped(path.startsWith('/control/') ? 'admin' : 'pageserverapi'), ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) })
+  const r = await fetch(`${STORCON}${path}`, { method, headers: { ...scoped(path.startsWith('/control/') || path.startsWith('/debug/') ? 'admin' : 'pageserverapi'), ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) })
   const text = await r.text()
   return { status: r.status, json: text ? safeJson(text) : {} }
 }
@@ -1065,13 +1065,20 @@ async function pickNode(lost: number, all: any[]): Promise<string> {
  * Asks the members other than `lost` (ids 1 to `ceiling`, in id order, the first answer decides) about every primary timeline of the control layer's records: which still list `lost` (or a pending change of members), and which
  * nobody answered about (unknown). The rule that turns this into a decision is `closeDecision` (storage-spec.ts).
  */
-async function readTimelines(lost: number, lostHost: string, ceiling: number) {
+async function readTimelines(lost: number, lostHost: string, ceiling: number, answerLostEverywhere = false) {
   const todo: { tenant: string; timeline: string; set: number[] }[] = []
   const reads: TimelineRead[] = []
   let onNew = 0 // timelines that refer to the new member (`ceiling` is its id) in their set or a pending change of it: where a replacement made progress
   const pairs: [string, string][] = []
   const seen = new Set<string>()
   for (const d of await listDbs()) { const k = `${d.tenant}/${d.timeline}`; if (d.mode === 'primary' && !seen.has(k)) { seen.add(k); pairs.push([d.tenant, d.timeline]) } }
+  // the members that are lost for good: a lost-disk mark (its pod refused to start empty), or decommissioned already
+  const marks = ok(await kube('GET', `/api/v1/namespaces/${NS}/configmaps?labelSelector=peat-sk-lost`), 'list the lost marks').json.items as any[]
+  const listed = await storcon('GET', '/control/v1/safekeeper')
+  const lostIds = new Set<number>([
+    ...marks.map((m) => Number(String(m.metadata?.name).replace(/^sk-lost-/, ''))).filter(Number.isInteger),
+    ...(Array.isArray(listed.json) ? (listed.json as any[]).filter((x) => /^decom/i.test(String(x.scheduling_policy))).map((x) => Number(x.id)) : []),
+  ])
   let pi = 0
   await Promise.all(Array.from({ length: 16 }, async () => {
     for (;;) {
@@ -1089,6 +1096,14 @@ async function readTimelines(lost: number, lostHost: string, ceiling: number) {
         if (onLost) todo.push({ tenant: t, timeline: tl, set: ids })
         read = { answered: true, onLost }
         break
+      }
+      // nobody answered: answered for only when every member the controller lists for it (and any it moves to) is lost for good, and only for
+      // a person's decommission: every member that looks lost may be a data disk that was not mounted, so a total loss is never accepted
+      // without someone who checked
+      if (!read.answered && answerLostEverywhere) {
+        const loc = await storcon('GET', `/debug/v1/tenant/${t}/timeline/${tl}/locate`).catch(() => null)
+        const members = loc?.status === 200 ? [...((loc.json.sk_set ?? []) as number[]), ...((loc.json.new_sk_set ?? []) as number[])].map(Number) : []
+        if (lostEverywhere(members, lostIds)) read = { answered: true, onLost: false }
       }
       reads.push(read)
     }
@@ -2247,7 +2262,7 @@ Bun.serve({
           }
         }
         // the closing count is read only when it can decide (it is slow at many databases): not for a member that answers, nor when nobody does
-        const count = answersItself || othersAnswering === 0 ? null : await readTimelines(id, sk.host, Math.max(...(list.json as any[]).map((x) => x.id as number))).then((c) => ({ todo: c.todo.length, unknown: c.unknown, close: c.close })).catch(() => null)
+        const count = answersItself || othersAnswering === 0 ? null : await readTimelines(id, sk.host, Math.max(...(list.json as any[]).map((x) => x.id as number)), true).then((c) => ({ todo: c.todo.length, unknown: c.unknown, close: c.close })).catch(() => null)
         const verdict = decommissionDecision({ answers: answersItself, othersAnswering, lossEvidenced, count, force: url.searchParams.get('force') === '1' })
         if (!verdict.allow) return json({ error: `safekeeper ${id} is not decommissioned: ${verdict.why}`, ...(count ?? {}) }, 409)
         console.log(`sk-decommission: safekeeper ${id}: ${verdict.why}`)

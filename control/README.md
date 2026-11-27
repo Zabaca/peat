@@ -65,6 +65,25 @@ branches to be deleted first, and the name can be used again at once. The contro
 (an install whose records are the control layer's older ConfigMaps, or a cluster whose objects were lost) and compares the two
 (`?dry=1` compares only); `?held=<name>` first brings a deleted database back from its held data while the hold lasts.
 
+When every safekeeper is lost (every member's disk, so no member holds a timeline's write-ahead log), no database can start: what
+each one wrote and the pageservers uploaded to the store is kept; what was written and not yet uploaded is gone. The way on:
+
+1. The control layer's replacement job makes a new member for each lost one (it does so before anything else), so three new members
+   usually exist by the time a person looks; it then keeps the lost members and says "done with unknowns": it never accepts a total
+   loss by itself.
+2. A person checks that the loss is real before retiring anything: every lost member's machine has its data disk mounted where the
+   Platform's safekeeper `hostPath` points (on Talos, `talosctl -n <machine> mounts` or `talosctl -n <machine> get mountstatus`;
+   elsewhere `findmnt <path>` or `df <path>` on the machine). A member that restarted on an empty folder because its disk was not
+   mounted is not lost: mount the disk and restart its pod, and it starts on its data (the replacement made meanwhile is then finished
+   by the control layer, its timelines moved to the new member, as for any lost member that answers again).
+3. The person retires each lost member, `POST /sk/<id>/decommission`. A timeline no member answers about counts as answered when
+   every member its set lists carries a lost-disk mark or is already retired; one member alive, or only silent with no mark, keeps
+   it unknown and refuses (`force=1` retires anyway). A retirement removes the member's StatefulSet and marks it retired in the
+   storage controller; its folder on the disk stays, but no command brings that member back.
+4. If every listed member is retired and no new one exists, the control layer seeds three.
+5. Each database is recovered under its own name, `POST /db/<name>/recover` (`?dry=1` first says what it would do): a new timeline
+   from the store's last upload, the same name, address and login.
+
 ## Installing
 
 The control image is `ghcr.io/zabaca/peat/control`, published with the storage and compute images on every merge to main, tagged with

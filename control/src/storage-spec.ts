@@ -272,6 +272,14 @@ export function closeDecision(reads: TimelineRead[]): { todo: number; unknown: n
   const unknown = reads.filter((r) => !r.answered).length
   return { todo, unknown, close: todo === 0 && unknown === 0 }
 }
+/**
+ * Whether a timeline nobody answered about is lost everywhere: every member its set lists (and any it is moving to) is lost, by a
+ * lost-disk mark or by being decommissioned already. Then it is answered for (nothing of it is left on any member to move: the way on is
+ * the database's recovery from the store). A member that is alive, or only silent with no mark (a reboot, a blip), keeps it unknown.
+ */
+export function lostEverywhere(members: number[], lost: ReadonlySet<number>): boolean {
+  return members.length > 0 && members.every((id) => lost.has(id))
+}
 /** A seeded set is recorded on each of its StatefulSets as `7=machine-1,8=machine-2,9=machine-3` (the annotation below), so that a seeding that stopped half way is finished rather than mistaken for a platform that has a safekeeper. */
 export const SEED_GROUP_ANNOTATION = 'peat.zabaca.com/seed-group'
 export interface SeedMember { id: number; node: string }

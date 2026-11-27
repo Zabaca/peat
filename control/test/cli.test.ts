@@ -84,6 +84,13 @@ describe('keeping them', () => {
     expect(await peat('delete', 'orders', '--yes')).toBe(0)
     expect(k.get(DB, 'databases', 'shop', 'orders')).toBeUndefined()
   })
+  test('delete takes a drill\'s name (a database a failed drill left), which making and the other verbs refuse', async () => {
+    made('drill-left')
+    expect(await peat('show', 'drill-left')).toBe(1)
+    expect(await peat('delete', 'drill-left', '--yes')).toBe(0)
+    expect(k.get(DB, 'databases', 'shop', 'drill-left')).toBeUndefined()
+    expect(() => checkName('drill-a', 'the database', true)).not.toThrow()
+  })
   test('move raises the version and follows the move to its end; a rehearsal names its version; a retry and the way back are requests', async () => {
     made('orders', 'shop', { pgVersion: 18 })
     const answer = (move: Record<string, unknown>, from: 'rehearseMove' | 'retryMove' | null = null) => setTimeout(() => { const o = k.get(DB, 'databases', 'shop', 'orders'); o.status.move = { ...move, ...(from ? { request: o.spec.requests?.[from] } : {}) } }, 20)
