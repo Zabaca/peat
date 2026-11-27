@@ -97,6 +97,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     pageservers: store('the pageservers'),
     safekeepers: store('the safekeepers'),
     records: store("the copy of the storage controller's records"),
+    egressExcept: list("The address ranges the pieces' way out to the store leaves out, as CIDRs (IPv4). Default: when the endpoint is a public host, the private ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10), so a piece on a machine of a home or office network cannot reach that network's devices on the store's port; when it is a cluster Service, a single-label or private name, or a private address, none, so an in-cluster or private-network store keeps working. [] leaves none out.", str('A CIDR, a.b.c.d/n.', { pattern: '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])/([0-9]|[12][0-9]|3[0-2])$' })),
     walTrim: obj("The key the control layer's WAL trim lists and deletes the safekeepers' old WAL with, when it is not the safekeepers' own.", { credentialsSecret: str('A Secret holding AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.') }, { required: ['credentialsSecret'] }),
   }, { required: ['endpoint'], ...rules(['(has(self.bucket) && has(self.credentialsSecret)) || (has(self.pageservers) && has(self.safekeepers) && has(self.records))', 'the store needs the one bucket and its credentialsSecret, or a bucket of their own for the pageservers, the safekeepers and the records']) }),
   pageservers: obj('The pageservers: where the databases\' pages are kept and served.', {
@@ -279,7 +280,7 @@ export interface PlatformSpec {
   namespaces: { platform: string; computes: string; gateways: string; databases: string }
   machines: { label: { key: string; value: string }; taint?: { key: string; value?: string; effect: string }; deadTaint?: { key: string; value?: string; effect: string } }
   spread: 'machines' | 'none'
-  objectStore: { endpoint: string; region: string; bucket?: string; credentialsSecret?: string; pageservers?: Store; safekeepers?: Store; records?: Store; walTrim?: { credentialsSecret: string } }
+  objectStore: { endpoint: string; region: string; egressExcept?: string[]; bucket?: string; credentialsSecret?: string; pageservers?: Store; safekeepers?: Store; records?: Store; walTrim?: { credentialsSecret: string } }
   pageservers: { count?: number; machines?: string[]; memory: Memory; storage: Storage }
   safekeepers: { count: 3 | 5; zoneLabel: string; machines?: string[]; outside?: { machines?: string[]; label: { key: string; value: string }; tolerations?: Record<string, unknown>[] }; memory: Memory; storage: Storage }
   controller: { records: 'kubernetes' | 'postgres'; postgres?: { urlSecret: string; key: string }; machine?: string; memory: Memory }
