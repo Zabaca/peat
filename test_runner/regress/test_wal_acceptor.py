@@ -531,7 +531,17 @@ def test_s3_wal_replay(neon_env_builder: NeonEnvBuilder, remote_storage_kind: Re
                 tenant_id, timeline_id, {"remote_consistent_lsn": str(offloaded_seg_end)}
             )
 
-            last_lsn = Lsn(query_scalar(cur, "SELECT pg_current_wal_flush_lsn()"))
+            # The end of a record, not pg_current_wal_flush_lsn(): the flush position can fall
+            # inside a record (it stops at a WAL page boundary), and the pageserver, fed WAL
+            # only up to last_lsn below, then stops at the record before it and never reaches
+            # last_lsn ("Timed out waiting for WAL redo": last_record_lsn 0/37C45F8 against
+            # flush 0/37C6000, the same on both attempts). A transactional logical message
+            # returns the end of its own record, and its transaction's commit flushes it.
+            last_lsn = Lsn(
+                query_scalar(
+                    cur, "SELECT pg_logical_emit_message(true, 'test_s3_wal_replay', 'end')"
+                )
+            )
 
             for sk in env.safekeepers:
                 # require WAL to be trimmed, so no more than one segment is left

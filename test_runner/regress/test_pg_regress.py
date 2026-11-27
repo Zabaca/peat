@@ -521,7 +521,13 @@ def test_tx_abort_with_many_relations(
         try:
             # Rollback phase should be fast: this is one WAL record that we should process efficiently
             fut = exec.submit(rollback_and_wait)
-            fut.result(timeout=15 if reldir_type == "v1" else 30)
+            # Peat: upstream's 15 s (v1) and 30 s (v2) assume Neon's larger CI machines. On a
+            # 4 vCPU hosted runner, the endpoint's stop and its restart (which waits for the
+            # pageserver to ingest the 5000 relations' WAL) took 2 to 40 s across 26 runs
+            # (2026-11-26 and -27), the first attempt of v1 usually the slowest, and failed
+            # this timeout on both attempts at 18 s and 35 s. The bug this reproduces
+            # (neondatabase/neon#9505) takes minutes, so 90 s and 120 s still catch it.
+            fut.result(timeout=90 if reldir_type == "v1" else 120)
         except:
             exec.shutdown(wait=False, cancel_futures=True)
             raise

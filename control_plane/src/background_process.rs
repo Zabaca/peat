@@ -31,12 +31,18 @@ use utils::pid_file::{self, PidFileRead};
 
 // These constants control the loop used to poll for process start / stop.
 //
-// The loop waits for at most 10 seconds, polling every 100 ms.
+// The loop waits for at most STOP_RETRY_TIMEOUT when stopping (a start's timeout comes from
+// the caller), polling every 100 ms.
 // Once a second, it prints a dot ("."), to give the user an indication that
 // it's waiting. If the process hasn't started/stopped after 5 seconds,
 // it prints a notice that it's taking long, but keeps waiting.
 //
-const STOP_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+// Peat: 60 seconds, not Neon's 10. A pageserver's graceful stop flushes its open layer, which
+// on a 4 vCPU hosted runner with the test output on a loop-mounted filesystem took over 10 s
+// after tests that write a lot (test_tx_abort_with_many_relations, test_truncate and others
+// failed their teardown with "pageservers failed to stop gracefully", 2026-11-26 and -27).
+// neon_local is the regression suite's harness only; no image carries it.
+const STOP_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_RETRIES: u128 = STOP_RETRY_TIMEOUT.as_millis() / RETRY_INTERVAL.as_millis();
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const DOT_EVERY_RETRIES: u128 = 10;

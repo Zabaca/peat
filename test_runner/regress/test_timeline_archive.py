@@ -249,10 +249,16 @@ def test_timeline_offloading(neon_env_builder: NeonEnvBuilder, manual_offload: b
     wait_until(leaf_offloaded)
     wait_until(parent_offloaded)
 
-    offloaded_count = ps_http.get_metric_value(
-        "pageserver_tenant_offloaded_timelines", {"tenant_id": f"{tenant_id}"}
-    )
-    assert offloaded_count == 2
+    # The "offloading archived timeline" line is logged when an offload starts; the gauge is
+    # set when it ends (the tenant manifest upload). With automatic offloading the parent's
+    # line can be seen before its offload is done, so wait for the gauge ("assert 1.0 == 2").
+    def offloaded_count_is_two():
+        offloaded_count = ps_http.get_metric_value(
+            "pageserver_tenant_offloaded_timelines", {"tenant_id": f"{tenant_id}"}
+        )
+        assert offloaded_count == 2
+
+    wait_until(offloaded_count_is_two)
 
     # Offloaded child timelines should still prevent deletion
     with pytest.raises(
