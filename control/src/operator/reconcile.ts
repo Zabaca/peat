@@ -6,11 +6,10 @@
 // What it never does: change an object it did not make (one already there, of the same name, is reported and left alone; a namespace the
 // Platform names is the one exception, as a person makes it first to hold the store's Secret), delete an object it did not make, delete a
 // namespace, or copy the Platform's labels onto anything.
-import { X509Certificate } from 'node:crypto'
 import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
 import { ok, pathOf, serverApply, type Kube } from '../kube'
 import { NONCE_ANNOTATION, Owned } from './owned'
-import { keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
+import { issuerCaFindings, keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
 import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type Resolved } from './platform'
 import { storageOf, type Storage } from './storage'
 import { UNRECORDED, decide, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
@@ -74,9 +73,9 @@ async function readPlacements(k: Kube, ns: string): Promise<Partial<Placements>>
 
 /**
  * The keys as kept, with any the install gives in place of the operator's own; and, with an issuer, the issuer's certificate alone
- * (`issuerCa`), which is published and never kept: an issuer's authority may be trusted far beyond the platform, so its key is never read.
+ * (`issuer`: issuerCaFindings, keys.ts), which is published and never kept; a Secret that holds the issuer's key fails the pass.
  */
-async function readKeys(k: Kube, r: Resolved): Promise<{ kept: Record<string, string>; issuerCa?: string }> {
+async function readKeys(k: Kube, r: Resolved): Promise<{ kept: Record<string, string>; issuer?: ReturnType<typeof issuerCaFindings> }> {
   const n = r.names
   const secretData = async (ns: string, name: string, what: string): Promise<Record<string, string> | null> => {
     const s = await k.request('GET', `/api/v1/namespaces/${ns}/secrets/${name}`)
@@ -93,9 +92,7 @@ async function readKeys(k: Kube, r: Resolved): Promise<{ kept: Record<string, st
   }
   if (r.spec.keys.caSecret && r.spec.certificates.issuer) {
     const given = await secretData(n.namespace, r.spec.keys.caSecret, `read ${r.spec.keys.caSecret}`)
-    const cert = given?.['tls.crt'] || given?.['ca.crt']
-    if (!cert) throw new Error(`keys.caSecret: ${n.namespace}/${r.spec.keys.caSecret} holds no tls.crt or ca.crt`)
-    return { kept, issuerCa: cert }
+    return { kept, issuer: issuerCaFindings(given ?? {}) }
   }
   if (r.spec.keys.caSecret) {
     const given = await secretData(n.namespace, r.spec.keys.caSecret, `read ${r.spec.keys.caSecret}`)
@@ -289,12 +286,10 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
     await writeKeys(k, r, keys)
   }
   const problems = keyProblems(keys)
-  if (read.issuerCa) {
-    try { if (new X509Certificate(read.issuerCa).validToDate.getTime() < Date.now()) problems.push(`keys.caSecret: the issuer's certificate has expired`) } catch { problems.push(`keys.caSecret: the issuer's certificate is not a certificate`) }
-  }
+  if (read.issuer) problems.push(...read.issuer.problems)
   if (problems.length) return done('Failed', `the keys: ${problems.join('; ')}`)
   // what is published from here on: the issuer's certificate in peat-ca, in place of the operator's own (which then signs nothing)
-  if (read.issuerCa) keys = { ...keys, [CA_CERT]: read.issuerCa }
+  if (read.issuer?.cert) keys = { ...keys, [CA_CERT]: read.issuer.cert }
   if (JSON.stringify(kept) !== JSON.stringify(r.placements)) {
     const cm = { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: PLACEMENTS_CONFIG_MAP, namespace: r.names.namespace, labels: { [MANAGED_BY]: OPERATOR } }, data: { 'placements.json': JSON.stringify(r.placements) } }
     ok(await serverApply(k, cm, FIELD_MANAGER), 'keep the placements')
@@ -379,7 +374,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   if (live) return done('Upgrading', `${live.direction === 'forward' ? `${live.from} to ${live.to}` : `back from ${live.to} to ${live.from}`}: ${stepMessage}`, { ...more, ...midway }, counts)
   if (decision.kind === 'finish') return done(notReady.length ? 'Installing' : 'Ready', `the upgrade ${decision.state.direction === 'forward' ? 'to' : 'back to'} ${decision.release} is done: every piece runs it`, { ...more, release: decision.release, images: decision.images }, counts)
   const phase = notReady.length || refused.length || unstartable ? 'Installing' : 'Ready'
-  const message = unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`
+  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
   // the release every piece runs, recorded once all are ready on it, whatever is refused: what the next upgrade starts from; never a
   // release no record names, nor images the pieces do not agree on (the images recorded under the release recorded)
   const record = !notReady.length && !status.release && (decision.kind === 'none' || startHeld) && !unstartable && running?.release !== UNRECORDED

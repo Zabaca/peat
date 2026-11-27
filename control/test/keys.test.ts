@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { X509Certificate, createPrivateKey, createPublicKey } from 'node:crypto'
 import { connect, createServer } from 'node:tls'
-import { AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY, ENTRIES, TOKENS, keyProblems, makeMissing, mintToken, newCa, newLeaf, plan, verifiedScope } from '../src/operator/keys'
+import { AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY, ENTRIES, TOKENS, issuerCaFindings, keyProblems, makeMissing, mintToken, newCa, newLeaf, plan, verifiedScope } from '../src/operator/keys'
 
 describe('the keys an install gives none of', () => {
   test('made whole from nothing: the pair, seven tokens each of its scope, the authority; and nothing is left to make', () => {
@@ -68,5 +68,29 @@ describe('certificates', () => {
     expect(await talk('orders.db.example.com')).toBe('ok')
     await expect(talk('other.db.example.com')).rejects.toThrow()
     server.close()
+  })
+})
+
+describe('an issuer\'s certificate, given with certificates.issuer', () => {
+  const ca = newCa(new Date('2026-12-01T00:00:00Z'))
+  const until = new X509Certificate(ca.certPem).validToDate
+  test('the certificate alone: ca.crt first (the authority above an intermediate issuer), else tls.crt', () => {
+    const leaf = newLeaf(ca, ['issuer.example.com'], new Date('2026-12-01T00:00:00Z'))
+    expect(issuerCaFindings({ 'ca.crt': ca.certPem, 'tls.crt': leaf.certPem }, new Date('2027-01-01T00:00:00Z'))).toEqual({ cert: ca.certPem, problems: [], warnings: [] })
+    expect(issuerCaFindings({ 'tls.crt': ca.certPem }, new Date('2027-01-01T00:00:00Z')).cert).toBe(ca.certPem)
+  })
+  test('refused: its key beside it, no certificate, not a certificate, not an authority, not valid yet, expired', () => {
+    const at = new Date('2027-01-01T00:00:00Z')
+    expect(issuerCaFindings({ 'ca.crt': ca.certPem, 'tls.key': ca.keyPem }, at).problems).toEqual(["keys.caSecret: holds tls.key; with certificates.issuer give the issuer's certificate alone (ca.crt or tls.crt): the control layer can read the platform namespace's Secrets"])
+    expect(issuerCaFindings({}, at).problems).toEqual(['keys.caSecret: holds no ca.crt or tls.crt'])
+    expect(issuerCaFindings({ 'ca.crt': 'junk' }, at).problems).toEqual(["keys.caSecret: the issuer's certificate is not a certificate"])
+    const leaf = newLeaf(ca, ['issuer.example.com'], new Date('2026-12-01T00:00:00Z'))
+    expect(issuerCaFindings({ 'tls.crt': leaf.certPem }, at).problems).toEqual(["keys.caSecret: the issuer's certificate is not an authority"])
+    expect(issuerCaFindings({ 'ca.crt': ca.certPem }, new Date('2026-01-01T00:00:00Z')).problems[0]).toContain('is not valid until')
+    expect(issuerCaFindings({ 'ca.crt': ca.certPem }, new Date(until.getTime() + 1000)).problems).toEqual(["keys.caSecret: the issuer's certificate has expired"])
+  })
+  test('a warning in its last 30 days, none before', () => {
+    expect(issuerCaFindings({ 'ca.crt': ca.certPem }, new Date(until.getTime() - 10 * 86_400_000)).warnings[0]).toContain(`expires on ${until.toISOString()}`)
+    expect(issuerCaFindings({ 'ca.crt': ca.certPem }, new Date(until.getTime() - 31 * 86_400_000)).warnings).toEqual([])
   })
 })

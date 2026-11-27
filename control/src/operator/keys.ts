@@ -191,6 +191,29 @@ export function makeMissing(kept: Readonly<Record<string, string>>, now: Date = 
   return out
 }
 
+/** How long before an issuer's certificate expires the status says so. */
+export const ISSUER_WARN_DAYS = 30
+
+/**
+ * With certificates.issuer, what keys.caSecret gives: the issuer's certificate (ca.crt first, the authority above an intermediate issuer's
+ * own certificate, else tls.crt), and what is wrong with it. Its key must not be there: the control layer's account can read the platform
+ * namespace's Secrets, and an issuer's authority may be trusted far beyond the platform. Problems fail the pass; warnings go in the status.
+ */
+export function issuerCaFindings(given: Readonly<Record<string, string>>, now: Date = new Date()): { cert?: string; problems: string[]; warnings: string[] } {
+  const problems: string[] = [], warnings: string[] = []
+  if (given['tls.key']) problems.push("keys.caSecret: holds tls.key; with certificates.issuer give the issuer's certificate alone (ca.crt or tls.crt): the control layer can read the platform namespace's Secrets")
+  const cert = given['ca.crt'] || given['tls.crt'] || undefined
+  if (!cert) return { problems: [...problems, 'keys.caSecret: holds no ca.crt or tls.crt'], warnings }
+  try {
+    const c = new X509Certificate(cert)
+    if (!c.ca) problems.push("keys.caSecret: the issuer's certificate is not an authority")
+    if (c.validFromDate.getTime() > now.getTime()) problems.push(`keys.caSecret: the issuer's certificate is not valid until ${c.validFromDate.toISOString()}`)
+    if (c.validToDate.getTime() < now.getTime()) problems.push("keys.caSecret: the issuer's certificate has expired")
+    else if (c.validToDate.getTime() - now.getTime() < ISSUER_WARN_DAYS * 86_400_000) warnings.push(`keys.caSecret: the issuer's certificate expires on ${c.validToDate.toISOString()}: give its successor before then`)
+  } catch { problems.push("keys.caSecret: the issuer's certificate is not a certificate") }
+  return { cert, problems, warnings }
+}
+
 /** Whether what is kept is whole and right: every problem, by entry, naming a property and never a value. Empty when all is well. */
 export function keyProblems(kept: Readonly<Record<string, string>>, now: Date = new Date()): string[] {
   const out: string[] = []
