@@ -52,7 +52,7 @@ describe('making databases', () => {
     expect(await peat('make', 'orders', '--no-wait')).toBe(1)
     expect(lines.at(-1)).toBe('peat: orders exists in shop')
     expect(await peat('branch', 'nothing', 'x')).toBe(1)
-    expect(lines.at(-1)).toBe('peat: no database nothing')
+    expect(lines.at(-1)).toBe('peat: no database nothing in shop (-n names another namespace; -A looks in every one)')
     setTimeout(() => { k.get(DB, 'databases', 'shop', 'taken').status = { phase: 'Failed', message: 'the name taken is taken by the database in other: a name is unique across the platform' } }, 20)
     expect(await peat('make', 'taken')).toBe(1)
     expect(lines.at(-1)).toContain('a name is unique across the platform')
@@ -63,6 +63,8 @@ describe('keeping them', () => {
   test('stop asks once and waits for the answer', async () => {
     made('orders')
     setTimeout(() => { const o = k.get(DB, 'databases', 'shop', 'orders'); o.status.answered = { stop: o.spec.requests.stop } }, 20)
+    // answered is not enough: a status written again from the record marks a request answered whatever the compute does
+    setTimeout(() => { k.get(DB, 'databases', 'shop', 'orders').status.awake = false }, 60)
     expect(await peat('stop', 'orders')).toBe(0)
     expect(k.get(DB, 'databases', 'shop', 'orders').spec.requests.stop).toBe('2026-12-01T12:00:00.000Z')
   })
@@ -82,12 +84,63 @@ describe('keeping them', () => {
     expect(await peat('delete', 'orders', '--yes')).toBe(0)
     expect(k.get(DB, 'databases', 'shop', 'orders')).toBeUndefined()
   })
-  test('move raises the version; a rehearsal is a request', async () => {
+  test('move is refused in this release, and changes nothing', async () => {
     made('orders', 'shop', { pgVersion: 18 })
-    expect(await peat('move', 'orders', '--pg', '19', '--rehearse')).toBe(0)
-    expect(k.get(DB, 'databases', 'shop', 'orders').spec.requests.rehearseMove).toBe('19@2026-12-01T12:00:00.000Z')
-    expect(await peat('move', 'orders', '--pg', '19')).toBe(0)
-    expect(k.get(DB, 'databases', 'shop', 'orders').spec.pgVersion).toBe(19)
+    expect(await peat('move', 'orders', '--pg', '19')).toBe(1)
+    expect(await peat('move', 'orders', '--pg', '19', '--rehearse')).toBe(1)
+    expect(lines.at(-1)).toBe('peat: the move to a newer Postgres version is not in this release: nothing was changed')
+    expect(k.get(DB, 'databases', 'shop', 'orders').spec).toEqual({})
+  })
+
+})
+
+describe('which database a name means', () => {
+  test('the context\'s namespace (or -n), as make and list use; another namespace\'s database of the name is never touched', async () => {
+    made('orders', 'prod')
+    expect(await peat('delete', 'orders', '--yes')).toBe(1)
+    expect(lines.at(-1)).toBe('peat: no database orders in shop (-n names another namespace; -A looks in every one)')
+    expect(k.get(DB, 'databases', 'prod', 'orders')).toBeDefined()
+    expect(await peat('close', 'orders', '--no-wait')).toBe(1)
+    expect(k.get(DB, 'databases', 'prod', 'orders').spec.closed).toBeUndefined()
+    expect(await peat('show', 'orders', '-n', 'prod')).toBe(0)
+  })
+  test('-A finds the one of that name in any namespace, and refuses a name more than one namespace holds', async () => {
+    made('orders', 'prod')
+    expect(await peat('show', 'orders', '-A')).toBe(0)
+    expect(lines.at(-1)).toContain('prod/orders: Ready')
+    made('orders', 'staging')
+    expect(await peat('delete', 'orders', '-A', '--yes')).toBe(1)
+    expect(lines.at(-1)).toBe('peat: orders is in more than one namespace (prod, staging): name one with -n')
+    expect(k.get(DB, 'databases', 'prod', 'orders')).toBeDefined()
+  })
+  test('the delete prompt and outcome, and a close, name where they act', async () => {
+    made('orders')
+    const here = Object.assign(k, { where: 'context staging at https://cluster.example.com' })
+    const at = (...argv: string[]) => run(argv, { kube: here, out, everyMs: 5 })
+    expect(await at('delete', 'orders')).toBe(1)
+    expect(lines.at(-1)).toContain('deleting shop/orders (context staging at https://cluster.example.com) removes its compute')
+    expect(await at('delete', 'orders', '--yes')).toBe(0)
+    expect(lines.at(-1)).toBe("shop/orders (context staging at https://cluster.example.com): deleted (its compute goes now, its data after the platform's hold)")
+  })
+  test('--timeout needs a number; peat help prints the commands', async () => {
+    expect(await peat('show', 'orders', '--timeout', 'abc')).toBe(2)
+    expect(await peat('help')).toBe(0)
+    expect(lines.join('\n')).toContain('peat url <db>')
+  })
+  test('retry asks the one Platform, or the one named; never the first of several', async () => {
+    k.put({ apiVersion: DB, kind: 'Platform', metadata: { name: 'a' }, spec: {} })
+    k.put({ apiVersion: DB, kind: 'Platform', metadata: { name: 'b' }, spec: {} })
+    expect(await peat('retry')).toBe(1)
+    expect(lines.at(-1)).toBe('peat: more than one Platform (a, b): name one')
+    expect(await peat('retry', 'b')).toBe(0)
+    expect(k.get(DB, 'platforms', null, 'b').spec.requests.retry).toBeDefined()
+    expect(k.get(DB, 'platforms', null, 'a').spec.requests).toBeUndefined()
+  })
+  test('ca <db> reads the ConfigMap its status names, in its namespace', async () => {
+    made('orders', 'shop', { caConfigMap: 'corp-ca' })
+    k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'corp-ca', namespace: 'shop' }, data: { 'ca.crt': 'the corp one' } })
+    expect(await peat('ca', 'orders')).toBe(0)
+    expect(lines.at(-1)).toBe('the corp one')
   })
 })
 
