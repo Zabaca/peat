@@ -207,6 +207,15 @@ spec:
   namespaces: { platform: elsewhere }
   objectStore: { endpoint: "http://minio.store.svc:9000", bucket: peat, credentialsSecret: peat-store }
 EOF
+kind_refused 'adopt is not in this release' <<EOF
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Platform
+metadata: { name: peat }
+spec:
+  release: ${UPGRADE_FROM:-ci}
+  objectStore: { endpoint: "http://minio.store.svc:9000", bucket: peat, credentialsSecret: peat-store }
+  adopt: [{ kind: Deployment, namespace: peat, name: storage-broker }]
+EOF
 
 # The tunnels to the control layer and the front door. kubectl port-forward ends when its stream is lost (seen under a client that
 # reconnects ten times a second), so each runs in a loop that starts it again, its errors kept for the failure dump, and every step

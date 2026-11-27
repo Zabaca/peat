@@ -329,13 +329,13 @@ describe('what is the operator\'s: its record of the objects it made, never a la
     await reconcile(k)
     expect(record()['Deployment.peat.peat-control']).toMatch(/^nonce:/)
   })
-  test('a record made new while the platform\'s objects exist says so, naming adopt; a record another pass made first is read, not taken as empty', async () => {
+  test('a record made new while the platform\'s objects exist says so: lost, with no way back in this release but by hand; a record another pass made first is read, not taken as empty', async () => {
     k.put(platform())
     await reconcile(k)
     const before = { ...record() }
     k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|configmaps|peat-owned'))!)
     const r = await reconcile(k)
-    expect(r.refused[0]).toContain('list it under adopt to take it back')
+    expect(r.refused[0]).toContain('the record is lost, and this release has no way to take its objects back but by hand')
     k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'peat-owned', namespace: 'peat-system' }, data: before })
     k.forcedOnce.set('GET /api/v1/namespaces/peat-system/configmaps/peat-owned', { status: 404, json: { message: 'not found' } })
     const again = await reconcile(k)

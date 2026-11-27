@@ -23,8 +23,7 @@ const deploymentDone = (o: any, image: string) => o && imageOf(o) === image && (
 const statefulSetDone = (o: any, image: string) => o && imageOf(o) === image && (o.status?.readyReplicas ?? 0) >= (o.spec?.replicas ?? 1) && (!o.status?.updateRevision || o.status.updateRevision === o.status.currentRevision)
 const podReady = (p: any) => !!p?.status?.conditions?.some((c: any) => c.type === 'Ready' && c.status === 'True')
 
-/** `held`: what keeps the step from starting besides the platform's state (an adopted piece's held differences), each said as it is. */
-export async function runStep(k: Kube, r: Resolved, storage: Storage, u: UpgradeState, now: Date, notReady: string[], held: string[] = []): Promise<StepWork> {
+export async function runStep(k: Kube, r: Resolved, storage: Storage, u: UpgradeState, now: Date, notReady: string[]): Promise<StepWork> {
   const step = u.step!
   const phase = u.phase!
   const target = u.direction === 'forward' ? u.toImages : u.fromImages
@@ -59,18 +58,21 @@ export async function runStep(k: Kube, r: Resolved, storage: Storage, u: Upgrade
     // must still answer: a write needs two of three)
     const ownReading = (x: string) => (pageserverId ? ownNode.test(x) : keeperId ? x === `safekeeper ${keeperId} does not answer` : false)
     const read = await storage.problems(back && pageserverId ? psIds.filter((x) => x !== pageserverId) : psIds).then((x) => ({ problems: x, failed: false }), (e) => ({ problems: [String(e)], failed: true }))
-    // a node a dropped draining step left paused is filled again first, and its scheduling is no problem until it is
-    const refillNode = phase === 'precheck' && u.refill ? new RegExp(`^node ${u.refill} scheduling is`) : null
-    if (refillNode) {
-      const n = await storage.node(u.refill!).catch(() => null)
-      if (n?.scheduling === 'Active') { u = { ...u }; delete u.refill }
-      else await storage.fill(u.refill!).catch(() => undefined)
+    // a node a dropped draining step left paused is filled again first, at any check: the check waits until it reads Active (bounded by
+    // checkTimeout, as every wait), and a failed reading or fill is a wait too
+    if (u.refill) {
+      const id = u.refill
+      try {
+        const n = await storage.node(id)
+        if (n?.scheduling !== 'Active') { await storage.fill(id); return wait(`filling pageserver ${id} again (a drain dropped by the way back left it ${n?.scheduling ?? 'unread'})`) }
+        u = { ...u }; delete u.refill
+      } catch (e) { return wait(`filling pageserver ${id} again: ${String(e).slice(0, 200)}`) }
     }
     // at the controller's step on the way back every storage reading is the controller's own (it may be the broken piece, failing or
     // answering wrongly); the other pieces' readiness still counts
     const storageProblems = back && step === 'controller' ? []
-      : read.problems.filter((x) => !(refillNode?.test(x)) && !(phase === 'precheck' && (back ? ownReading(x) : pageserverId && /^node \d+ scheduling is/.test(x) && ownNode.test(x))))
-    const problems = [...(phase === 'precheck' ? held : []), ...notReady.filter((x) => !(back && own(x))).map((x) => `${x} is not ready`), ...storageProblems]
+      : read.problems.filter((x) => !(phase === 'precheck' && (back ? ownReading(x) : pageserverId && /^node \d+ scheduling is/.test(x) && ownNode.test(x))))
+    const problems = [...notReady.filter((x) => !(back && own(x))).map((x) => `${x} is not ready`), ...storageProblems]
     // a keeper is restarted only with the others answering (a write needs two of three) and no keeper replacement open (the control layer
     // is moving a member)
     if (step.startsWith('safekeeper-w') && phase === 'precheck') {
@@ -116,9 +118,9 @@ export async function runStep(k: Kube, r: Resolved, storage: Storage, u: Upgrade
   }
   if (phase === 'restarting') {
     // the pod is deleted only once its StatefulSet's template carries the new image: a pod made again from an older template comes back on
-    // the old image (a template held back, for example as an adopted object's pending change)
+    // the old image (a template someone else changed back)
     const sts = await k.request('GET', `/apis/apps/v1/namespaces/${ns}/statefulsets/${step}`)
-    if (sts.status !== 200 || imageOf(sts.json) !== target.storage) return wait(`its StatefulSet's template does not carry ${target.storage}${sts.status === 200 ? ` (it has ${imageOf(sts.json)}: a pending change? requests.applyPending applies it)` : ''}`)
+    if (sts.status !== 200 || imageOf(sts.json) !== target.storage) return wait(`its StatefulSet's template does not carry ${target.storage}${sts.status === 200 ? ` (it has ${imageOf(sts.json)})` : ''}`)
     const podPath = `/api/v1/namespaces/${ns}/pods/${step}-0`
     const pod = await k.request('GET', podPath)
     if (pod.status === 200 && imageOf(pod.json) !== target.storage && !pod.json.metadata?.deletionTimestamp) {

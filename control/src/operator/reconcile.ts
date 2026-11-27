@@ -14,7 +14,7 @@ import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placemen
 import { storageOf, type Storage } from './storage'
 import { UNRECORDED, decide, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
 import { piecesOf, runStep } from './upgrade-run'
-import { ADOPTED, differences, imageOnly, immutableFor } from './adoption'
+import { differences } from './differences'
 import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, render, type Manifest } from './render'
 
 export const FIELD_MANAGER = OPERATOR
@@ -47,7 +47,7 @@ const kindOf = (key: string) => RENDERED_KINDS.find((x) => x.kind === key.split(
 export interface PassResult { platform?: string; phase: string; message: string; applied: number; pruned: number; refused: string[] }
 
 /** The upgrade's optional fields: in a merge patch a field left out is kept, so a cleared one is written as null (which removes it). */
-const UPGRADE_CLEARABLE = ['step', 'phase', 'since', 'halted', 'lastCheck', 'retried', 'complete'] as const
+const UPGRADE_CLEARABLE = ['step', 'phase', 'since', 'halted', 'lastCheck', 'retried', 'complete', 'refill', 'reason'] as const
 /** Writes the status, unless it would change nothing (a pass every few seconds over a settled platform writes nothing); null removes a field. */
 async function writeStatus(k: Kube, p: Platform, status: Record<string, unknown>): Promise<void> {
   const u = status['upgrade'] as Record<string, unknown> | undefined
@@ -178,31 +178,28 @@ async function published(k: Kube, r: Resolved, keys: Record<string, string>, caP
  * the others' (moved by hand): nothing is recorded or started from such a platform. Null when the control layer is not there to read.
  */
 async function liveImages(k: Kube, r: Resolved, release?: string): Promise<{ images: Images; disagree: string[] } | null> {
-  const ns = r.names.namespace
-  const list = async (kind: 'deployments' | 'statefulsets', namespace: string) => { const a = await k.request('GET', `/apis/apps/v1/namespaces/${namespace}/${kind}`); return a.status === 200 ? (a.json.items as any[]) : [] }
-  const [deps, stss, gws] = await Promise.all([list('deployments', ns), list('statefulsets', ns), list('deployments', r.names.gatewayNamespace)])
-  const image = (o: any) => String(o?.spec?.template?.spec?.containers?.[0]?.image ?? '')
-  const controller = deps.find((o) => o.metadata.name === 'storage-controller'), control = deps.find((o) => o.metadata.name === 'peat-control')
+  // the pieces as the render names them (its workloads, each with the image kind it is rendered at), and the keepers the control layer makes
+  const rendered = render(r, {}).filter((m) => m.kind === 'Deployment' || m.kind === 'StatefulSet')
+  const kindOfImage = (m: Manifest): 'storage' | 'control' | null => { const i = imagesOfPod(m)[0]; return i === r.images.storage ? 'storage' : i === r.images.control ? 'control' : null }
+  // the workloads of each namespace the render puts them in, listed once each (a list that fails stops the pass: it never reads as none)
+  const nss = [...new Set(rendered.map((m) => m.metadata.namespace!))]
+  const listed = new Map<string, any>()
+  for (const ns of nss) for (const plural of ['deployments', 'statefulsets']) for (const o of ok(await k.request('GET', `/apis/apps/v1/namespaces/${ns}/${plural}`), `list the ${plural} of ${ns}`).json.items as any[]) listed.set(`${ns}/${o.metadata.name}`, o)
+  const sks = [...listed.values()].filter((o) => o.metadata?.labels?.['peat-sk'] === 'true')
+  const pieces = [...rendered.map((m) => ({ name: m.metadata.name, kind: kindOfImage(m), live: listed.get(`${m.metadata.namespace}/${m.metadata.name}`) ?? null })), ...sks.map((o) => ({ name: String(o.metadata.name), kind: 'storage' as const, live: o }))]
+  const controller = pieces.find((x) => x.name === 'storage-controller')?.live, control = pieces.find((x) => x.name === 'peat-control')?.live
   const env = (name: string) => ((control?.spec?.template?.spec?.containers?.[0]?.env ?? []) as any[]).find((e) => e.name === name)?.value as string | undefined
   const c18 = env(COMPUTE_IMAGE_ENV[18]), c19 = env(COMPUTE_IMAGE_ENV[19])
-  if (!image(controller) || !image(control) || !c18 || !c19) return null
-  const storagePieces = [...deps.filter((o) => ['storage-controller', 'storage-broker'].includes(o.metadata.name)), ...stss.filter((o) => /^(pageserver|safekeeper)-w\d+$/.test(o.metadata.name))]
-  const controlPieces = [control, ...gws.filter((o) => o.metadata.name === 'peat-gateway')]
-  const disagree = [...storagePieces.filter((o) => image(o) !== image(controller)).map((o) => `${o.metadata.name} runs ${image(o)}, the controller ${image(controller)}`), ...controlPieces.filter((o) => image(o) !== image(control)).map((o) => `${o.metadata.name} runs ${image(o)}, the control layer ${image(control)}`)]
-  return { images: { release: release ?? String(controller?.metadata?.annotations?.[RELEASE_ANNOTATION] ?? UNRECORDED), storage: image(controller), control: image(control), compute: { 18: c18, 19: c19 } }, disagree }
+  const storage = imagesOfPod(controller)[0], controlImage = imagesOfPod(control)[0]
+  if (!storage || !controlImage || !c18 || !c19) return null
+  // every container and init container of every piece, against the image of its kind the controller and the control layer run
+  const want = { storage, control: controlImage }
+  const disagree = pieces.filter((x) => x.kind && x.live).flatMap((x) => imagesOfPod(x.live).filter((i) => i !== want[x.kind!]).map((i) => `${x.name} runs ${i}, the ${x.kind === 'storage' ? 'controller' : 'control layer'} ${want[x.kind!]}`))
+  return { images: { release: release ?? String(controller?.metadata?.annotations?.[RELEASE_ANNOTATION] ?? UNRECORDED), storage, control: controlImage, compute: { 18: c18, 19: c19 } }, disagree }
 }
+/** Every image a workload's pods run: its containers' and its init containers'. */
+const imagesOfPod = (o: any): string[] => [...(o?.spec?.template?.spec?.containers ?? []), ...(o?.spec?.template?.spec?.initContainers ?? [])].map((c: any) => String(c.image ?? '')).filter(Boolean)
 
-/** The step's adopted pieces whose held differences are more than their images, each said in a line (empty: none). */
-async function heldByAdoption(k: Kube, rendered: Manifest[], names: string[]): Promise<string[]> {
-  const out: string[] = []
-  for (const m of rendered.filter((x) => (x.kind === 'Deployment' || x.kind === 'StatefulSet') && names.includes(x.metadata.name))) {
-    const live = await k.request('GET', pathOf(m))
-    if (live.status !== 200 || live.json.metadata?.labels?.[ADOPTED] !== 'true') continue
-    const diff = differences(m, live.json).filter((d) => !imageOnly(d))
-    if (diff.length) out.push(`${m.metadata.name} was adopted with differences held (${diff.slice(0, 3).join('; ')}): requests.applyPending lets this step apply them`)
-  }
-  return out
-}
 
 /** One pass. Returns what it did, for the log and the tests. */
 export interface Deps { storage?: (r: Resolved, keys: Record<string, string>) => Storage; now?: () => Date }
@@ -245,54 +242,14 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const owned = await Owned.load(k, k.namespace)
   const applied: string[] = []
   const refused: string[] = []
-  // adoption's pending changes are applied when requests.applyPending asks (a value not yet answered)
-  const applyPending = Boolean(spec.requests?.applyPending) && spec.requests?.applyPending !== (p.status as any)?.answered?.applyPending
-  const adoptList = new Set((spec.adopt ?? []).map((a) => `${a.kind}/${a.namespace ?? ''}/${a.name}`))
-  const pending: { kind: string; namespace?: string; name: string; change: string }[] = []
-  // the objects the upgrade's current step is applying this pass (set below, once the step is decided)
-  let stepApplies = new Set<string>()
   const applyOne = async (m: Manifest) => {
     const live = await k.request('GET', pathOf(m))
     if (live.status === 200) {
       const ours = m.kind === 'Namespace' || (await owned.ours(key(m), live.json))
-      // an object listed in adopt that the record does not hold is taken into it (an install made another way, or a record lost or restored
-      // with new UIDs), and stays as it was taken over (marked adopted, listed or not): a difference between it and what the operator would
-      // make is listed as a pending change and applied only when requests.applyPending asks
-      // once in the record with nothing left pending (the adopted mark gone), it is the operator's like any other, listed or not: a later change,
-      // an upgrade's included, is applied, never held as pending
-      if ((adoptList.has(key(m)) && !ours) || (ours && live.json.metadata?.labels?.[ADOPTED] === 'true')) {
-        if (!ours) {
-          // the mark first, then the record: a pass that dies between them leaves an object still marked and listed (taken into the record
-          // on the next pass, its difference still held), never one in the record without the mark (which would count as ordinary and be
-          // applied with every difference)
-          ok(await k.request('PATCH', pathOf(m), { metadata: { labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name, [ADOPTED]: 'true' } } }, 'application/merge-patch+json'), `adopt ${key(m)}`)
-          await owned.made(key(m), String(live.json.metadata.uid))
-        }
-        const diff = differences(m, live.json)
-        // a difference in a field that cannot change in place is never applied (it would be refused on every pass): said as such
-        const fixed = diff.filter((d) => immutableFor(m.kind)(d))
-        // the upgrade's own step applies its piece's new images to an adopted object too: that is how an adopted platform moves, in order
-        const byStep = stepApplies.has(key(m))
-        // a pageserver's pods take a new template only when the ordered upgrade restarts them (OnDelete): applyPending does not change one
-        const podsHeld = !byStep && m.kind === 'StatefulSet' && diff.some((d) => d.startsWith('.spec.template'))
-        if (diff.length && ((!applyPending && !byStep) || fixed.length || podsHeld)) {
-          if (podsHeld && applyPending) diff.unshift('its pods change only through the ordered upgrade: set the release or images it should run')
-          pending.push({ kind: m.kind, ...(m.metadata.namespace ? { namespace: m.metadata.namespace } : {}), name: m.metadata.name, change: (fixed.length ? `cannot be applied in place (${fixed.slice(0, 3).join('; ')}): make the object again by hand, or leave it; ` : '') + diff.slice(0, 8).join('; ') + (diff.length > 8 ? `; and ${diff.length - 8} more` : '') })
-          return
-        }
-        ok(await serverApply(k, m, FIELD_MANAGER), `apply ${key(m)}`)
-        // taken over with nothing left pending: an object of the operator's like any other
-        ok(await k.request('PATCH', pathOf(m), { metadata: { labels: { [ADOPTED]: null } } }, 'application/merge-patch+json'), `adopted ${key(m)}`)
-        applied.push(key(m))
-        return
-      }
-      // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret)
-      if (!ours && live.json.metadata?.labels?.[ADOPTED] === 'true') {
-        refused.push(`${key(m)} is marked adopted by a pass that did not finish taking it over, and is no longer listed: left alone (list it in adopt again, or take the operator's labels off it)`)
-        return
-      }
+      // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret); any
+      // other object the record does not hold is left alone: this release takes over nothing it did not make
       if (!ours) {
-        refused.push(`${key(m)} exists and was not made by the operator: left alone (adopt takes an object into the record${owned.fresh ? "; the operator's record was made new on this pass: if the operator made it before, list it under adopt to take it back" : ''})`)
+        refused.push(`${key(m)} exists and was not made by the operator: left alone${owned.fresh ? " (the operator's record of what it made was made new on this pass: if it made this before, the record is lost, and this release has no way to take its objects back but by hand)" : ''}`)
         return
       }
       // a Job's template cannot change (the API server answers 422): a Job the operator made whose template differs is deleted and made again
@@ -340,7 +297,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
 
   // the upgrade: decided before anything is applied, so each piece is rendered at the release its step has reached
   const status = (p.status ?? {}) as any
-  // what the platform runs: the release recorded, or, with none recorded (a first install not yet Ready, an adopted platform), the live
+  // what the platform runs: the release recorded, or, with none recorded (a first install not yet Ready, a status lost), the live
   // pieces' images: once any piece runs, a changed release is only ever rendered through the ordered steps
   // (mid-upgrade the release is cleared and the pieces disagree by design: the upgrade's own state says what runs)
   const seeded = status.release || (status.upgrade && !status.upgrade.complete) ? null : await liveImages(k, r)
@@ -350,21 +307,17 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   // the release is recorded under the spec's name)
   const unstartable = seeded?.disagree.length ? `the pieces do not all run the same images (${seeded.disagree.slice(0, 4).join('; ')}): nothing is recorded or started until they do`
     : running?.release === UNRECORDED && !sameImages(running.images, r.images) ? `the pieces run images no release records (storage ${running.images.storage}, control ${running.images.control}): pin spec.images to what runs (the release is then recorded under the spec's name), then change it` : ''
-  // an object listed in adopt and not yet in the record is taken over on this pass: no upgrade starts on the pass that adopts
-  const adopting = [...adoptList].some((a) => !owned.get(a))
   const sks = await k.request('GET', `/apis/apps/v1/namespaces/${r.names.namespace}/statefulsets?labelSelector=${sel({ 'peat-sk': 'true' })}`)
   const skNames = sks.status === 200 ? (sks.json.items as any[]).map((x) => String(x.metadata.name)) : []
   const decision = decide({ release: spec.release, images: r.images, running, state: status.upgrade as UpgradeState | undefined, steps: stepsOf(r.placements.pageservers.map((x) => x.id), skNames), retry: spec.requests?.retry, quietHours: spec.upgrades.quietHours, now })
-  const startHeld = !status.upgrade && decision.kind !== 'none' && (adopting || Boolean(unstartable))
+  // an upgrade (none under way: one finished keeps complete) does not start from pieces it cannot start from
+  const startHeld = (!status.upgrade || status.upgrade.complete) && decision.kind !== 'none' && decision.kind !== 'finish' && Boolean(unstartable)
   let upgrade: UpgradeState | undefined = decision.kind === 'none' || startHeld ? undefined : decision.state
   let stepMessage = ''
   if (decision.kind === 'continue' && !startHeld) {
     const before = await pieces(k, r, render(r, keys, imagesFor(upgrade, r.images)))
     const storage = (deps.storage ?? ((res, kk) => storageOf(res, kk['auth_private_key.pem']!)))(r, keys)
-    // adoption's part in a step: before the step changes its pieces, an adopted piece's held differences that are not its images wait for
-    // requests.applyPending (once asked, the step applies the whole render to it)
-    const held = upgrade!.phase === 'precheck' && !applyPending ? await heldByAdoption(k, render(r, keys, imagesFor(upgrade, r.images)), piecesOf(upgrade!.step!)) : []
-    const work = await runStep(k, r, storage, upgrade!, now, before.filter((x) => !x.ready).map((x) => x.name), held)
+    const work = await runStep(k, r, storage, upgrade!, now, before.filter((x) => !x.ready).map((x) => x.name))
     upgrade = work.state
     stepMessage = work.message
   }
@@ -372,10 +325,6 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   // the images each piece is rendered at: the step's, the finished upgrade's, or, while no upgrade may run, what the pieces run now: a
   // changed release is never rendered outside the ordered steps
   const at = decision.kind === 'finish' && !live ? () => decision.images : !live && running && !sameImages(running.images, r.images) ? () => running.images : imagesFor(live, r.images)
-  if (live?.step && !['precheck', 'draining'].includes(String(live.phase))) {
-    const names = new Set(piecesOf(live.step))
-    stepApplies = new Set(render(r, keys, at).filter((m) => (m.kind === 'Deployment' || m.kind === 'StatefulSet') && names.has(m.metadata.name)).map(key))
-  }
   // the authority that signs the databases' certificates: with an issuer, only the one keys.caSecret names (none is published otherwise)
   const caPublished = !r.spec.certificates.issuer || Boolean(r.spec.keys.caSecret)
   const pub = await published(k, r, keys, caPublished)
@@ -417,23 +366,20 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const ps = await pieces(k, r, rendered)
   const notReady = ps.filter((x) => !x.ready)
   const counts = { applied: applied.length, pruned, refused }
-  const more = { pieces: ps, survives: r.survives, pendingChanges: pending, ...(applyPending ? { answered: { applyPending: spec.requests!.applyPending } } : {}), ...(upgrade ? { upgrade } : {}) }
+  const more = { pieces: ps, survives: r.survives, ...(upgrade ? { upgrade } : {}) }
   // while an upgrade is under way no one release is what every piece runs: status.release is cleared until it ends (the upgrade holds both ends)
   const midway = live ? { release: null, images: null } : {}
   if (live?.halted) return done('Halted', `the upgrade to ${live.direction === 'forward' ? live.to : live.from} halted at ${live.halted.step}: ${live.halted.reason}. peat retry goes on from there; setting ${live.direction === 'forward' ? live.from : live.to} takes back what moved`, { ...more, ...midway }, counts)
-  if (decision.kind === 'pause') return done('Paused', `the upgrade to ${live!.direction === 'forward' ? live!.to : live!.from} waits for the quiet hours (${decision.window}) to end: ${live!.moved.length} of ${live!.steps.length} steps moved`, { ...more, ...midway }, counts)
+  if (decision.kind === 'pause' && live) return done('Paused', `the upgrade to ${live!.direction === 'forward' ? live!.to : live!.from} waits for the quiet hours (${decision.window}) to end: ${live!.moved.length} of ${live!.steps.length} steps moved`, { ...more, ...midway }, counts)
   if (live) return done('Upgrading', `${live.direction === 'forward' ? `${live.from} to ${live.to}` : `back from ${live.to} to ${live.from}`}: ${stepMessage}`, { ...more, ...midway }, counts)
-  if (decision.kind === 'finish') return done(notReady.length || pending.length ? 'Installing' : 'Ready', `the upgrade ${decision.state.direction === 'forward' ? 'to' : 'back to'} ${decision.release} is done: every piece runs it`, { ...more, release: decision.release, images: decision.images }, counts)
-  // an adopt entry naming nothing the operator makes is said, not silently ignored
-  const unmatched = [...adoptList].filter((a) => !rendered.some((m) => key(m) === a))
-  const note = unmatched.length ? `; adopt names ${unmatched.join(', ')}, which the platform does not make: nothing is taken over for ${unmatched.length === 1 ? 'it' : 'them'}` : ''
-  // a pending change keeps the platform from Ready: what runs is not yet what is declared
-  const phase = notReady.length || refused.length || pending.length || unstartable ? 'Installing' : 'Ready'
-  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : pending.length ? `${pending.length} pending change${pending.length === 1 ? '' : 's'} wait for requests.applyPending (status.pendingChanges)` : `every piece is ready on ${spec.release}`) + note + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
-  // the release every piece runs, recorded once all are ready on it, whatever is pending or refused: what the next upgrade starts from;
-  // never a release no record names, nor images the pieces do not agree on
+  if (decision.kind === 'finish') return done(notReady.length ? 'Installing' : 'Ready', `the upgrade ${decision.state.direction === 'forward' ? 'to' : 'back to'} ${decision.release} is done: every piece runs it`, { ...more, release: decision.release, images: decision.images }, counts)
+  const phase = notReady.length || refused.length || unstartable ? 'Installing' : 'Ready'
+  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
+  // the release every piece runs, recorded once all are ready on it, whatever is refused: what the next upgrade starts from; never a
+  // release no record names, nor images the pieces do not agree on (the images recorded under the release recorded)
   const record = !notReady.length && !status.release && (decision.kind === 'none' || startHeld) && !unstartable && running?.release !== UNRECORDED
-  return done(phase, message, { ...more, namespaces: spec.namespaces, ...(record ? { release: running?.release ?? spec.release, images: running?.images ?? r.images } : {}) }, counts)
+  const recordedRelease = running?.release ?? spec.release
+  return done(phase, message, { ...more, namespaces: spec.namespaces, ...(record ? { release: recordedRelease, images: { ...(running?.images ?? r.images), release: recordedRelease } } : {}) }, counts)
 }
 
 export { GROUP }

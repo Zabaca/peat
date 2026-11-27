@@ -156,15 +156,16 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     replicas: int('How many pods; one acts at a time.', { minimum: 1, maximum: 5, default: 2 }),
     memory: memory('a control layer pod', '64Mi', '256Mi'),
   }, { default: {} }),
-  adopt: list('Objects the operator may take over by name from an install made another way. It compares each with what it would make: one it would not change is taken over as it is; one it would change is taken over and left as it is, the difference listed in status.pendingChanges, until requests.applyPending asks for it to be applied (taking an object off the list applies nothing). It is also how the operator takes back objects its record of what it made has lost (a cluster restored with new UIDs).', obj('An object.', {
-    kind: str('Its kind.'), namespace: str('Its namespace (none: cluster-scoped).'), name: str('Its name.'),
-  }, { required: ['kind', 'name'] })),
-  suspend: bool('True: the operator changes nothing (it reports, and lets go of nothing it adopted). The way to hand the platform back to another way of running it.', { default: false }),
+  // the fields of adoption, not in this release: kept in the kind so that a Platform naming them is refused, never stripped in silence
+  adopt: list('Not in this release: a Platform that names it is refused (the operator takes over nothing it did not make).', obj('An object.', { kind: str('Its kind.'), namespace: str('Its namespace.'), name: str('Its name.') })),
+  suspend: bool('True: the operator changes nothing (it reports). The way to hand the platform back to another way of running it.', { default: false }),
   requests: obj('One-off requests: set a new value to ask again.', {
     retry: str('Go on with a halted upgrade from the step that halted.'),
-    applyPending: str('Apply the changes listed in status.pendingChanges to the adopted objects (each may restart its pods).'),
+    applyPending: str('Not in this release (it belonged to adoption): a Platform that names it is refused.'),
   }),
 }, { required: ['release', 'objectStore'], ...rules(
+  ['!has(self.adopt)', 'adopt is not in this release: the operator takes over nothing it did not make; an existing object it did not make is refused and left alone'],
+  ['!has(self.requests) || !has(self.requests.applyPending)', 'requests.applyPending is not in this release (it belonged to adoption)'],
   ["!has(self.spread) || self.spread != 'none' || !has(self.pageservers) || !has(self.pageservers.count) || self.pageservers.count == 1", 'spread none runs one pageserver: two would share one machine and its directory'],
 ) })
 
@@ -178,7 +179,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
   namespaces: obj('The namespaces the platform runs in, recorded: a Platform that names others is refused.', { platform: str('The platform namespace.'), computes: str('The computes\' namespace.'), gateways: str('The gateways\' namespace.'), databases: str('The database namespace.') }),
   pieces: list('Every piece and the release it runs.', obj('A piece.', {
     kind: str('Its kind.'), namespace: str('Its namespace.'), name: str('Its name.'),
-    release: str('The release it runs.'), ready: bool('Whether it is ready.'), adopted: bool('Whether the operator took it over.'), message: str('Why not, when not.'),
+    release: str('The release it runs.'), ready: bool('Whether it is ready.'), message: str('Why not, when not.'),
   })),
   upgrade: obj('The upgrade under way, or the last one.', {
     from: str('The release it started from.'), to: str('The release it goes to.'),
@@ -195,8 +196,6 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
     refill: int('A pageserver whose drain the way back dropped: filled again before the next step.'),
     reason: str('Why the way back was taken without the earlier release being set.'),
   }),
-  answered: obj('The requests answered, by the value that was asked (the retry an upgrade answered is upgrade.retried).', { applyPending: str('The applyPending answered.') }),
-  pendingChanges: list('Differences between an adopted object and what the operator would make, not applied (requests.applyPending applies them).', obj('A difference.', { kind: str('Kind.'), namespace: str('Namespace.'), name: str('Name.'), change: str('What would change.') })),
   conditions: list('Conditions.', condition),
 })
 
@@ -283,7 +282,7 @@ export interface PlatformSpec {
   upgrades: { quietHours: Window[]; restartHours: Window[]; checkTimeout: string }
   keys: { authSecret?: string; caSecret?: string }
   control: { replicas: number; memory: Memory }
-  adopt?: { kind: string; namespace?: string; name: string }[]
+  adopt?: unknown[]
   suspend: boolean
   requests?: { retry?: string; applyPending?: string }
 }
