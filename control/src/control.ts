@@ -1465,7 +1465,10 @@ const localPsql = (pod: string, db: string, sql: string, what: string) => inComp
 async function listExecs(key: string, pods: string[] | null): Promise<void> {
   const path = `/api/v1/namespaces/${NS}/configmaps/${MOVE_EXECS_CONFIG_MAP}`
   const r = await kube('PATCH', path, { data: { [key]: pods ? pods.join(' ') : null } }, 'application/merge-patch+json')
-  if (r.status === 404 && pods) ok(await kube('POST', `/api/v1/namespaces/${NS}/configmaps`, { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: MOVE_EXECS_CONFIG_MAP, namespace: NS }, data: { [key]: pods.join(' ') } }), 'list the move\'s pods', [409])
+  // the list is the operator's (made empty and kept): one this layer made would be an object the operator did not make, which it leaves
+  // alone and reports, keeping the Platform Installing. A list that is missing (deleted, the operator not yet past it) fails this step:
+  // the move fails, and goes on when asked again
+  if (r.status === 404 && pods) throw new Error(`the exec guard's list ${MOVE_EXECS_CONFIG_MAP} is missing (the operator makes it again at its next pass): ask again with requests.retryMove`)
   else ok(r, 'list the move\'s pods', [404])
 }
 /** The ready compute pod of a database, waited for (a start may pull the image first). */

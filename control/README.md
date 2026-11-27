@@ -159,8 +159,10 @@ What guards it:
   `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). Two admission
   rules enforce it: one the shape (namespace, container, command), one the list, which the operator makes empty and keeps. Neither
   judges any account but the control layer's, whatever exists or is missing: an API server reads a rule's parameter before the rule's
-  own conditions, so the list's rule lets a missing list through. With the list deleted by hand, until the operator makes it again, the
-  control layer is held to the shape alone.
+  own conditions, so the list's rule lets a missing list through. With the list deleted (by hand, or by the control layer's own account,
+  whose Role may delete ConfigMaps in the platform namespace), until the operator makes it again, the control layer is held to the shape
+  alone; a move that finds it missing fails, and goes on when asked again. The list was `peat-move-execs` before, made by the control
+  layer: one an earlier release left behind is an orphan, read by nothing, and may be deleted.
 - The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-pods`
   among them, so a control layer that misbehaves can list any compute. The list bounds what a move does, not what the account could do.
 - The rule does not bound `psql`'s arguments, so in a listed pod the control layer may run any SQL as the local superuser, and so any
