@@ -57,11 +57,15 @@ const gateway = createGateway({
 })
 gateway.start()
 const ports = new Map<string, { port: number; at: number }>()
+// one read of the routes at a time, shared by every caller that asks for one meanwhile
+let reading: Promise<void> | undefined
 startFront({
   port: s.frontPort,
-  routePort: async (database) => {
+  refresh: () => (reading ??= gateway.refresh().finally(() => { reading = undefined })),
+  routePort: async (database, fresh) => {
     const hit = ports.get(database)
-    if (hit && Date.now() - hit.at < 30_000) return hit.port
+    if (hit && !fresh && Date.now() - hit.at < 30_000) return hit.port
+    if (fresh) ports.delete(database)
     const r = await fetch(`${CONTROL}/route/${encodeURIComponent(database)}`, { signal: AbortSignal.timeout(5000) }).catch(() => null)
     if (!r || !r.ok) return null
     const port = ((await r.json()) as { port: number }).port

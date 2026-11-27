@@ -520,6 +520,7 @@ case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but 
 [ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all on 19'
 [ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'the second role, its password or its database did not come with the move'
 settings_kept 'in the move'
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.move.verify}')" = counts ] || fail "a real move did not check by row counts, the default: $(k -n shop get database mv18 -o jsonpath='{.status.move.verify}')"
 [ "$(k -n shop get database mv18-pg18 -o jsonpath='{.status.pgVersion}')" = 18 ] || fail 'the old copy mv18-pg18 was not kept'
 t0=$(date +%s); while k -n peat-compute get role peat-move-mv18 >/dev/null 2>&1; do [ "$(since "$t0")" -lt 30 ] || fail "the move's exec grant was left after it ended"; sleep 1; done
 [ -z "$(k -n shop get database mv18 -o jsonpath='{.status.move.pods}')" ] || fail 'the move left pods asked for exec'
@@ -527,19 +528,46 @@ echo "  moved in $move_s s, under its own name, address and login: 500 rows in a
 echo "  $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: the old version stopped [0-9]* ms after the last look at it' | tail -1)"
 echo "  the grants of its exec: $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: exec on [^ ]* *[^ ]* granted in [0-9]* ms' | sed 's/.*granted in //' | tr '\n' ' ')"
 
-step "the way back from the move, while nothing was written since"
+step "the way back: a return to the frozen copy, what was written since kept in the version it leaves, the control layer restarted in the middle"
+# a row written on 19 after the move
+mvsql 'insert into items values (501, $$written on 19$$)'
+execs() { k -n peat logs "pod/$(ready_pod peat app=peat-control)" --tail=-1 2>/dev/null | grep -c 'move shop/mv18: exec on' || true; }
+# the old copy woken, so the way back's first step (stopping both computes) lasts a few seconds: the control layer is restarted in it
+oldsql() { PGPASSWORD="$mv_password" psql "host=mv18-pg18.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+t0=$(date +%s); until oldsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'the old copy mv18-pg18 did not wake'; sleep 3; done
+t0=$(date +%s)
 k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
-t0=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = back ]; do
-  [ "$(since "$t0")" -lt 600 ] || fail "the way back did not end in 600 s: $(k -n shop get database mv18 -o jsonpath='{.status.phase}: {.status.message}')"
-  sleep 3
+t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = going-back ]; do [ "$(since "$t1")" -lt 120 ] || fail "the way back did not start: $(k -n shop get database mv18 -o jsonpath='{.status.move.state}: {.status.message}')"; sleep 0.2; done
+# killed at once (no grace: a graceful stop lets the pod finish the way back first)
+k -n peat delete pod -l app=peat-control --grace-period=0 --force --wait=false >/dev/null 2>&1
+echo "  the control layer's pod killed during the way back (going-back)"
+t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = back ]; do
+  [ "$(since "$t1")" -lt 300 ] || fail "the way back did not end in 300 s: $(k -n shop get database mv18 -o jsonpath='{.status.phase}: {.status.message}')"
+  sleep 1
 done
+back_s=$(since "$t0")
+retunnel control 18080
 [ "$(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}')" = '18/Ready' ] || fail "mv18 is not back on 18: $(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}: {.status.message}')"
 if k -n shop get database mv18-pg18 >/dev/null 2>&1; then fail 'the old copy is still there after the way back'; fi
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.move.newerDatabase}')" = mv18-pg19 ] || fail 'the way back did not name the version it left as kept'
+case "$(k -n shop get database mv18 -o jsonpath='{.status.message}')" in 'back on Postgres 18 as of the move ('*'); what was written since is in mv18-pg19 until '*) ;; *) fail "the way back does not say where what was written since is: $(k -n shop get database mv18 -o jsonpath='{.status.message}')";; esac
+# it reads nothing (no exec asked of either compute) and takes seconds, not a read of the data
+# (the control layer's pod that finished it has logged nothing of mv18 but the way back)
+[ "$(execs)" = 0 ] || fail 'the way back asked for exec into a compute'
+[ "$back_s" -lt 240 ] || fail "the way back took $back_s s"
 t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'mv18 did not answer after the way back'; sleep 3; done
 case "$(mvsql 'show server_version_num')" in 18*) ;; *) fail 'mv18 answers, but not on Postgres 18';; esac
-[ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all there after the way back'
+[ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'mv18 is not the copy frozen at the move'
+[ "$(mvsql 'select count(*) from items where id = 501')" = 0 ] || fail 'a row written after the move is on mv18 after the way back'
 [ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'reporter or its database did not come back'
-echo "  back on 18 under its own name and login: the old copy's data is the database's again"
+# what was written since, in the version it left, kept as a database of its own (the root's login)
+newsql() { PGPASSWORD="$mv_password" psql "host=mv18-pg19.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+t0=$(date +%s); until newsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'the kept newer copy mv18-pg19 did not answer'; sleep 3; done
+case "$(newsql 'show server_version_num')" in 19*) ;; *) fail 'mv18-pg19 is not on Postgres 19';; esac
+[ "$(newsql 'select note from items where id = 501')" = 'written on 19' ] || fail 'the row written after the move is not in the kept newer copy mv18-pg19'
+# finished by the control layer's new pod: it went on from the state going-back
+k -n peat logs "pod/$(ready_pod peat app=peat-control)" --tail=-1 2>/dev/null | grep -q 'move back shop/mv18: back on Postgres 18' || fail 'the way back was not finished by the restarted control layer'
+echo "  back on 18 in $back_s s, finished by the control layer restarted in it, as frozen at the move (500 rows); the row written on 19 since is in the kept copy mv18-pg19"
 
 step "a move resumed after the control layer restarts mid-move, then its old copy deleted when keepOldFor ends"
 # asked again (the move to 19 ended in a way back), with a keepOldFor of seconds
@@ -577,6 +605,10 @@ sssql 'create table w (id int primary key)'
 # stopped first, so the first compute of ss18 that is ready after the version is raised is its source, started again for the copy
 curl -fsS -X POST localhost:18080/db/ss18/stop >/dev/null || fail 'ss18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=ss18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'ss18 did not stop'; sleep 2; done
+# another database's compute, held awake by a session of its own, to be named in the move's ask below
+sql 'select pg_sleep(900)' >/dev/null 2>&1 &
+pids+=($!); first_held=$!
+t0=$(date +%s); until [ -n "$(ready_pod peat-compute compute=first)" ]; do [ "$(since "$t0")" -lt 120 ] || fail 'first did not wake'; sleep 1; done
 k -n shop patch database ss18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
 t0=$(date +%s); until ss_pod=$(ready_pod peat-compute compute=ss18) && [ -n "$ss_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 [ "$(k -n shop get database ss18 -o jsonpath='{.status.phase}')" = Moving ] || fail 'the source was started, but the door is not shut'
@@ -586,6 +618,19 @@ pids+=($!); ss_tunnel=$!
 tunnel_up 25432
 ( i=0; while :; do i=$((i+1)); printf 'insert into w values (%d);\n\\echo ok %d\n' "$i" "$i"; sleep 0.3; done ) | psql "host=127.0.0.1 port=25432 user=app dbname=app sslmode=disable connect_timeout=10" -XAtq -v ON_ERROR_STOP=1 >"$work/ss-written" 2>"$work/ss-writer.err" &
 pids+=($!); ss_writer=$!
+# during the move: its grant names exactly its two pods, its source and its target; a pod of another database named in its ask (as a
+# control layer that misbehaves would) is not granted
+t0=$(date +%s); until grant=$(k -n peat-compute get role peat-move-ss18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null) && case "$grant" in *'","'*) true;; *) false;; esac; do [ "$(since "$t0")" -lt 300 ] || fail 'the move ran with no exec grant of its two pods'; sleep 0.5; done
+tgt_pod=$(k -n peat-compute get pods -l peat-move=target -o jsonpath='{.items[0].metadata.name}')
+[ "$grant" = "[\"$ss_pod\",\"$tgt_pod\"]" ] || [ "$grant" = "[\"$tgt_pod\",\"$ss_pod\"]" ] || fail "the move's grant is not exactly its source $ss_pod and target $tgt_pod: $grant"
+other_pod=$(ready_pod peat-compute compute=first)
+[ -n "$other_pod" ] || fail "first, held awake to be named in ss18's ask, has no compute"
+k "${as[@]}" -n shop patch database ss18 --subresource=status --type merge -p "{\"status\":{\"move\":{\"pods\":[\"$ss_pod\",\"$tgt_pod\",\"$other_pod\"]}}}" >/dev/null
+sleep 2
+case "$(k -n peat-compute get role peat-move-ss18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null)" in *"$other_pod"*) fail "a pod of another database named in a move's ask was granted: $other_pod";; esac
+[ "$(k "${as[@]}" auth can-i create pods/"$other_pod" --subresource=exec -n peat-compute 2>/dev/null)" = no ] || fail "the control layer may exec into another database's pod $other_pod"
+echo "  the move's grant is its two pods; $other_pod, another database's, named in its ask, is not granted"
+pkill -P "$first_held" 2>/dev/null || true; kill "$first_held" 2>/dev/null || true
 t0=$(date +%s); until state=$(k -n shop get database ss18 -o jsonpath='{.status.move.state}') && case "$state" in done|failed|refused) true;; *) false;; esac; do
   [ "$(since "$t0")" -lt 900 ] || fail "ss18's move did not end in 900 s: $state"
   sleep 2
@@ -614,41 +659,23 @@ sw_password=$(k -n shop get secret sw18-login -o jsonpath='{.data.password}' | b
 swsql() { PGPASSWORD="$sw_password" psql "host=sw18.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=${2:-app} sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
 t0=$(date +%s); until swsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'sw18 did not answer'; sleep 3; done
 swsql 'create table w (id int primary key)'
-# a database compared after app, large enough (2M rows) that its comparison takes a while: a row written to app then is past app's own comparison
+# a database compared after app, large enough (1M rows) that the comparison lasts a while after app's own
 swsql 'create database zbig'
-swsql "create table big as select g as id, md5(g::text) as note from generate_series(1, 2000000) g" zbig
+swsql "create table big as select g as id, md5(g::text) as note from generate_series(1, 1000000) g" zbig
 curl -fsS -X POST localhost:18080/db/sw18/stop >/dev/null || fail 'sw18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=sw18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'sw18 did not stop'; sleep 2; done
-# another database's compute, held awake by a session of its own, to be named in the move's ask below
-sql 'select pg_sleep(900)' >/dev/null 2>&1 &
-pids+=($!); first_held=$!
-t0=$(date +%s); until [ -n "$(ready_pod peat-compute compute=first)" ]; do [ "$(since "$t0")" -lt 120 ] || fail 'first did not wake'; sleep 1; done
-k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
+# moveVerify full: a comparison of every row (row counts take a moment), so the comparison lasts long enough to write during it
+k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19,"moveVerify":"full"}}' >/dev/null
 t0=$(date +%s); until sw_pod=$(ready_pod peat-compute compute=sw18) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 k -n peat-compute port-forward "pod/$sw_pod" 25433:5432 >>"$work/tunnel-sw.log" 2>&1 &
 pids+=($!); sw_tunnel=$!
 tunnel_up 25433
-# during the move: its grant names exactly its two pods, its source and its target; a pod of another database named in its ask (as a
-# control layer that misbehaves would) is not granted
-t0=$(date +%s); until grant=$(k -n peat-compute get role peat-move-sw18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null) && case "$grant" in *'","'*) true;; *) false;; esac; do [ "$(since "$t0")" -lt 300 ] || fail 'the move ran with no exec grant of its two pods'; sleep 0.5; done
-tgt_pod=$(k -n peat-compute get pods -l peat-move=target -o jsonpath='{.items[0].metadata.name}')
-[ "$grant" = "[\"$sw_pod\",\"$tgt_pod\"]" ] || [ "$grant" = "[\"$tgt_pod\",\"$sw_pod\"]" ] || fail "the move's grant is not exactly its source $sw_pod and target $tgt_pod: $grant"
-other_pod=$(ready_pod peat-compute compute=first)
-[ -n "$other_pod" ] || fail "first, held awake to be named in sw18's ask, has no compute"
-k "${as[@]}" -n shop patch database sw18 --subresource=status --type merge -p "{\"status\":{\"move\":{\"pods\":[\"$sw_pod\",\"$tgt_pod\",\"$other_pod\"]}}}" >/dev/null
-sleep 3
-case "$(k -n peat-compute get role peat-move-sw18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null)" in *"$other_pod"*) fail "a pod of another database named in a move's ask was granted: $other_pod";; esac
-[ "$(k "${as[@]}" auth can-i create pods/"$other_pod" --subresource=exec -n peat-compute 2>/dev/null)" = no ] || fail "the control layer may exec into another database's pod $other_pod"
-echo "  the move's grant is its two pods; $other_pod, another database's, named in its ask, is not granted"
-pkill -P "$first_held" 2>/dev/null || true; kill "$first_held" 2>/dev/null || true
-# the moment: the comparison is reading zbig (app's own comparison is over), seen as the session the compute's own superuser holds on the
-# source's zbig while it reads it (the target's side is read after it): looked for every 50 ms over the pod's 127.0.0.1, since a CI
-# runner read 1M rows before a look every few tenths of a second (one with the state read each time) caught it
-reading_zbig() { psql "host=127.0.0.1 port=25433 user=cloud_admin dbname=postgres sslmode=disable connect_timeout=5" -XAtc "select count(*) from pg_stat_activity where datname = 'zbig' and usename = 'cloud_admin' and pid <> pg_backend_pid()" 2>/dev/null; }
-t0=$(date +%s); n=0; until [ "$(reading_zbig)" = 1 ]; do
-  [ "$(since "$t0")" -lt 600 ] || fail "sw18's move did not reach the comparison of zbig: $(k -n shop get database sw18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
-  n=$((n + 1)); if [ $((n % 40)) = 0 ]; then case "$(k -n shop get database sw18 -o jsonpath='{.status.move.state}')" in done|failed|refused) fail "sw18's move ended before the comparison of zbig was seen";; esac; fi
-  sleep 0.05
+# the moment: the comparison, as the move's state says. A row written then is caught by the comparison of app (when it lands before app's
+# own reading) or by the write counts (after it, while the other databases are read): either way the move must fail and the row stay
+t0=$(date +%s); until [ "$(k -n shop get database sw18 -o jsonpath='{.status.move.state}')" = comparing ]; do
+  [ "$(since "$t0")" -lt 600 ] || fail "sw18's move did not reach its comparison: $(k -n shop get database sw18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
+  case "$(k -n shop get database sw18 -o jsonpath='{.status.move.state}')" in done|failed|refused|switching) fail "sw18's move went past its comparison before it was seen";; esac
+  sleep 0.1
 done
 # one session: in, one row, out
 psql "host=127.0.0.1 port=25433 user=app dbname=app sslmode=disable connect_timeout=10" -XAtq -v ON_ERROR_STOP=1 -c 'insert into w values (1)' || fail "the client's row was not written during the comparison (the move was $(k -n shop get database sw18 -o jsonpath='{.status.move.state}'))"
@@ -659,7 +686,7 @@ t0=$(date +%s); until state=$(k -n shop get database sw18 -o jsonpath='{.status.
 done
 sw_message=$(k -n shop get database sw18 -o jsonpath='{.status.move.message}')
 [ "$state" = failed ] || fail "a row written during the comparison did not fail the move: it ended $state ($sw_message)"
-grep -q 'written during the comparison' <<< "$sw_message" || fail "the move failed, but not on the write counts: $sw_message"
+case "$sw_message" in *'written during the comparison'*|*'the copy is not the same: app differs'*) ;; *) fail "the move failed, but on neither the write counts nor the comparison of app: $sw_message";; esac
 phase_is sw18 Ready 120
 t0=$(date +%s); while k -n peat-compute get role peat-move-sw18 >/dev/null 2>&1; do [ "$(since "$t0")" -lt 30 ] || fail "the failed move's exec grant was left"; sleep 1; done
 [ "$(k "${as[@]}" auth can-i create pods/"$sw_pod" --subresource=exec -n peat-compute 2>/dev/null)" = no ] || fail 'the control layer may still exec into the source after the move'

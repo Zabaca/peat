@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exitCodeOf, execPath, frame } from '../src/exec'
-import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
+import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, backSteps, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, moveFailure, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
 
 // The move's pure parts: the globals filtered, the two sides compared, the decision of the database loop; and the exec's framing.
 
@@ -106,6 +106,14 @@ describe('the settings (ALTER DATABASE ... SET, ALTER ROLE ... [IN DATABASE ...]
   })
 })
 
+describe('a failure said', () => {
+  test('a size or a space the copy ran out of is named first; anything else as it was', () => {
+    expect(moveFailure(new Error('read app on the old version: ERROR:  invalid memory alloc request size 1073741824'))).toStartWith('a size limit was reached: a value or a sort larger than a compute can hold (Postgres takes at most 1 GB in one value): Error: read app')
+    expect(moveFailure(new Error('load app: pg_restore: error: could not write to file "base/pgsql_tmp/x": No space left on device'))).toStartWith("a size limit was reached: the compute's disk for temporary files is full")
+    expect(moveFailure(new Error('the copy is not the same: app differs'))).toBe('Error: the copy is not the same: app differs')
+  })
+})
+
 describe('the exec a move is granted', () => {
   const pod = (name: string, compute: string, more: Record<string, string> = {}, deleting = false) => ({ name, labels: { app: 'peat-compute', compute, ...more }, deleting })
   const pods = [pod('src-1', 'orders'), pod('tgt-1', 'mv-0123456789ab', { 'peat-move': 'target' }), pod('old-1', 'orders-pg18'), pod('other-1', 'shop'), pod('gone-1', 'orders', {}, true), pod('fake-tgt', 'mv-0123456789ab')]
@@ -115,21 +123,54 @@ describe('the exec a move is granted', () => {
     expect(moveExecPods(db({ state: 'switching', pods: ['src-1'] }), pods)).toEqual(['src-1'])
     // a rehearsal keeps the door open: its state is what asks
     expect(moveExecPods(db({ state: 'comparing', rehearsal: true, pods: ['src-1', 'tgt-1'] }, 'Ready'), pods)).toEqual(['src-1', 'tgt-1'])
-    // the way back: the door shut, the database and its old copy
-    expect(moveExecPods(db({ state: 'done', pods: ['src-1', 'old-1'] }), pods)).toEqual(['old-1', 'src-1'])
+    // a way back reads nothing: a done move's ask, with the door shut, grants nothing, its old copy neither
+    expect(moveExecPods(db({ state: 'done', pods: ['src-1', 'old-1'] }), pods)).toEqual([])
   })
   test('a pod of another database, a pod on its way out, one not there, a target without its label: never granted', () => {
     expect(moveExecPods(db({ state: 'copying', pods: ['src-1', 'other-1', 'gone-1', 'nowhere', 'fake-tgt'] }), pods)).toEqual(['src-1'])
     // a target that is not a move's name (it could name another database's compute) grants nothing for it
     expect(moveExecPods(db({ state: 'copying', target: 'shop', pods: ['other-1'] }), pods)).toEqual([])
-    // an old copy named otherwise than the move names it
-    expect(moveExecPods(db({ state: 'done', oldDatabase: 'shop', pods: ['other-1'] }), pods)).toEqual([])
+    // the old copy is never the move's to exec into
+    expect(moveExecPods(db({ state: 'copying', pods: ['old-1'] }), pods)).toEqual([])
   })
   test('nothing outside a step that execs, for a database on its way out, or with nothing asked', () => {
     expect(moveExecPods(db({ state: 'failed', pods: ['src-1'] }, 'Ready'), pods)).toEqual([])
     expect(moveExecPods(db({ state: 'done', pods: ['src-1'] }, 'Ready'), pods)).toEqual([])
     expect(moveExecPods({ ...db({ state: 'copying', pods: ['src-1'] }), metadata: { name: 'orders', deletionTimestamp: '2026-11-27T00:00:00Z' } }, pods)).toEqual([])
     expect(moveExecPods(db({ state: 'copying', pods: null }), pods)).toEqual([])
+  })
+})
+
+describe('a way back that a restart cuts short', () => {
+  // what each boundary leaves done: the door shut (nothing else), the newer copy kept, the name repointed, the old copy's object gone
+  const boundaries = {
+    'after the door shut': { newerObject: false, newerRecord: false, repointed: false, oldCopy: true },
+    'after the newer copy\'s object': { newerObject: true, newerRecord: false, repointed: false, oldCopy: true },
+    'after the newer copy\'s record': { newerObject: true, newerRecord: true, repointed: false, oldCopy: true },
+    'after the repoint': { newerObject: true, newerRecord: true, repointed: true, oldCopy: true },
+    'after the old copy\'s object went': { newerObject: true, newerRecord: true, repointed: true, oldCopy: false },
+  }
+  test('goes on from each boundary with the steps left, in order, and ends back with the newer copy kept', () => {
+    expect(backSteps(boundaries['after the door shut'])).toEqual(['stop', 'keep-newer', 'repoint', 'drop-old', 'finish'])
+    expect(backSteps(boundaries['after the newer copy\'s object'])).toEqual(['stop', 'keep-newer', 'repoint', 'drop-old', 'finish'])
+    expect(backSteps(boundaries['after the newer copy\'s record'])).toEqual(['stop', 'repoint', 'drop-old', 'finish'])
+    expect(backSteps(boundaries['after the repoint'])).toEqual(['stop', 'drop-old', 'finish'])
+    expect(backSteps(boundaries['after the old copy\'s object went'])).toEqual(['stop', 'finish'])
+    // run to the end from each, step by step: it ends with the newer copy kept, the name on the old timeline, the old copy's object gone
+    for (const [at, start] of Object.entries(boundaries)) {
+      const f = { ...start }
+      for (const step of backSteps(f)) {
+        if (step === 'keep-newer') { f.newerObject = true; f.newerRecord = true }
+        if (step === 'repoint') f.repointed = true
+        if (step === 'drop-old') f.oldCopy = false
+        // at every boundary the newer timeline is some record's (the database's until the newer copy's is written), and the old one too
+        expect(f.newerRecord || !f.repointed, at).toBe(true)
+        expect(f.oldCopy || f.repointed, at).toBe(true)
+      }
+      expect(f, at).toEqual({ newerObject: true, newerRecord: true, repointed: true, oldCopy: false })
+      // asked again at the end: only the stop (a no-op on stopped computes) and the status
+      expect(backSteps(f), at).toEqual(['stop', 'finish'])
+    }
   })
 })
 
@@ -151,10 +192,30 @@ describe('the comparison', () => {
     expect(compareSides({ ...same, databases: ['app\nlake\npostgres', 'app\npostgres'] }).why).toBe('the databases differ: only on the old side lake; only on the new -')
     expect(compareSides({ ...same, roles: ['role lake_reader verifier=1\nrole lake_writer verifier=2', 'role lake_reader verifier=1'] }).why).toContain('role lake_writer')
     expect(compareSides({ ...same, roles: ['role lake_reader verifier=1', 'role lake_reader verifier=9'] }).same).toBe(false)
-    expect(compareSides({ ...same, fingerprints: { ...same.fingerprints, app: ['table public.t owner=app acl=- rows=3 md5=x', 'table public.t owner=app acl=- rows=3 md5=y'] } }).why).toBe('app differs: only on the old side table public.t owner=app acl=-; only on the new table public.t owner=app acl=-')
+    expect(compareSides({ ...same, fingerprints: { ...same.fingerprints, app: ['table public.t owner=app acl=- rows=3 md5=x', 'table public.t owner=app acl=- rows=3 md5=y'] } }).why).toBe('app differs: only on the old side table public.t owner=app acl=- rows=3; only on the new table public.t owner=app acl=- rows=3')
     expect(compareSides({ ...same, fingerprints: { ...same.fingerprints, lake: ['unsupported public.remote kind=f', 'unsupported public.remote kind=f'] } }).why).toBe('lake holds what the move cannot copy and compare: public.remote (a foreign table)')
     const { lake: _, ...missing } = same.fingerprints
     expect(compareSides({ ...same, fingerprints: missing as any }).why).toBe('lake was not compared')
+  })
+  test('a real move\'s check is every table\'s row count; a full one adds a hash of every row, order-independent and of no size limit', () => {
+    const counts = fingerprintSql('app', 'counts'), full = fingerprintSql('app', 'full')
+    expect(counts).toContain("'' rows='' || count(*) from %s%I.%I t")
+    expect(counts).toContain("case when c.relkind = 'r' then 'only ' else '' end")
+    expect(counts).not.toMatch(/hash=|string_agg\(t::text/)
+    // each row's md5, its two halves summed as 64-bit numbers: nothing held but two sums (the old hash of every row joined stopped at 1 GB)
+    expect(full).toContain("sum((''x'' || substr(md5(t::text), 1, 16))::bit(64)::bigint::numeric)")
+    expect(full).toContain("sum((''x'' || substr(md5(t::text), 17, 16))::bit(64)::bigint::numeric)")
+    expect(full).not.toContain('string_agg(t::text')
+    expect(fingerprintSql('app')).toBe(full)
+    // read from a Postgres 17 (2026-11-27): the same rows in another order give the same line; a changed, missing or doubled row does not
+    const line = (rows: number, hash: string) => `table public.t owner=app acl=- rows=${rows} hash=${hash}`
+    const same = line(3, '15824462171170473472/-15499744221373098623')
+    const sides = (a: string, b: string) => ({ databases: ['app', 'app'] as [string, string], roles: ['', ''] as [string, string], fingerprints: { app: [a, b] as [string, string] } })
+    expect(compareSides(sides(same, same))).toMatchObject({ same: true, tables: 1, rows: 3 })
+    for (const other of [line(3, '18633034878675430594/-18494230842328794849'), line(2, '9416011521456614484/-12053845330010379241'), line(4, '22232912820884332460/-18945643112735818005')]) expect(compareSides(sides(same, other)).same).toBe(false)
+    // the difference is said with its row counts, never its hash
+    expect(compareSides(sides(same, line(2, '9416011521456614484/-12053845330010379241'))).why).toBe('app differs: only on the old side table public.t owner=app acl=- rows=3; only on the new table public.t owner=app acl=- rows=2')
+    expect(compareSides(sides('table public.t owner=app acl=- rows=5', 'table public.t owner=app acl=- rows=5'))).toMatchObject({ same: true, rows: 5 })
   })
   test('the fingerprint reads every user schema and leaves the platform\'s own out', () => {
     const sql = fingerprintSql('postgres')

@@ -26,7 +26,7 @@ export const MOVE_SCRIPT_PATH = '/move/copy.sh'
 export const MOVE_SCRIPT_CONFIG_MAP = 'peat-move-script'
 /** The Role (in the compute namespace) by which the operator lets the control layer exec into a move's own pods, one per moving Database. */
 export const moveExecRole = (database: string) => `peat-move-${database}`
-/** The move states in which the control layer execs into the move's pods (and a way back, which shuts the door: phase Moving). */
+/** The move states in which the control layer execs into the move's pods (a way back reads nothing, and asks for none). */
 export const MOVE_EXEC_STATES = ['preparing', 'copying', 'comparing', 'switching'] as const
 /** The label on the move's target compute pod: the network rule that lets it reach the source on 5432 selects it. */
 export const MOVE_TARGET_LABEL = 'peat-move'
@@ -143,9 +143,13 @@ export const SETTINGS_COPY_SQL = `select format('alter %s set %I to %s;', case w
  * prints an `unsupported` line, which fails the comparison. Rows are never printed, only counts and hashes. The platform's own schemas and
  * tables are left out.
  */
-export function fingerprintSql(database: string): string {
+export function fingerprintSql(database: string, verify: 'counts' | 'full' = 'full'): string {
   const skip = (PLATFORM_TABLES[database] ?? []).map((t) => lit(t))
   const notSkipped = skip.length ? ` and (n.nspname || '.' || c.relname) not in (${skip.join(', ')})` : ''
+  // full: each row's md5 (of the row as text), its two halves summed as 64-bit numbers: order does not matter, a changed, missing or
+  // doubled row changes a sum, and nothing is held but two sums (no limit with the table's size, unlike a hash of every row joined).
+  // counts: the row count alone. A table's own rows only (ONLY): an inheritance parent's children are counted once, as tables of their own.
+  const rowsHash = verify === 'full' ? ` || '' hash='' || coalesce(sum((''x'' || substr(md5(t::text), 1, 16))::bit(64)::bigint::numeric)::text, ''-'') || ''/'' || coalesce(sum((''x'' || substr(md5(t::text), 17, 16))::bit(64)::bigint::numeric)::text, ''-'')` : ''
   return `
 select 'database ' || datname || ' owner=' || pg_get_userbyid(datdba) || ' acl=' || coalesce((select string_agg(a::text, ',' order by a::text) from unnest(datacl) a), '-') from pg_database where datname = current_database();
 select 'schema ' || nspname || ' owner=' || pg_get_userbyid(nspowner) || ' acl=' || coalesce((select string_agg(a::text, ',' order by a::text) from unnest(nspacl) a), '-') from pg_namespace where nspname not in ${SYSTEM} and nspname !~ '^pg_' order by nspname;
@@ -161,7 +165,7 @@ select 'type ' || n.nspname || '.' || t.typname || ' kind=' || t.typtype::text |
 select 'function ' || n.nspname || '.' || p.proname || ' owner=' || pg_get_userbyid(p.proowner) || ' md5=' || md5(pg_get_functiondef(p.oid)) from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname not in ${SYSTEM} and p.prokind in ('f', 'p') order by 1;
 select 'trigger ' || n.nspname || '.' || c.relname || '.' || t.tgname || ' md5=' || md5(pg_get_triggerdef(t.oid)) from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace where not t.tgisinternal and n.nspname not in ${SYSTEM} order by 1;
 select 'sequence ' || schemaname || '.' || sequencename || ' last=' || coalesce(last_value::text, '-') from pg_sequences where schemaname not in ${SYSTEM} order by 1;
-select format('select %L || '' owner='' || %L || '' acl='' || %L || '' rows='' || count(*) || '' md5='' || coalesce(md5(string_agg(t::text, E''\\n'' order by t::text collate "C")), ''-'') from %I.%I t', 'table ' || n.nspname || '.' || c.relname, pg_get_userbyid(c.relowner), coalesce((select string_agg(a::text, ',' order by a::text) from unnest(c.relacl) a), '-'), n.nspname, c.relname)
+select format('select %L || '' owner='' || %L || '' acl='' || %L || '' rows='' || count(*)${rowsHash} from %s%I.%I t', 'table ' || n.nspname || '.' || c.relname, pg_get_userbyid(c.relowner), coalesce((select string_agg(a::text, ',' order by a::text) from unnest(c.relacl) a), '-'), case when c.relkind = 'r' then 'only ' else '' end, n.nspname, c.relname)
   from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'm') and n.nspname not in ${SYSTEM} and n.nspname !~ '^pg_'${notSkipped} order by n.nspname, c.relname \\gexec
 `
 }
@@ -201,12 +205,25 @@ export function compareSides(s: Sides): Compared {
     if (unsupported.length) return fail(`${db} holds what the move cannot copy and compare: ${[...new Set(unsupported.map((l) => l.slice('unsupported '.length).replace(' kind=f', ' (a foreign table)')))].slice(0, 5).join(', ')}`)
     const d = diff(a, b)
     if (d.onlyA.length || d.onlyB.length) {
-      const what = (l: string) => l.replace(/ md5=\S+/, '').replace(/ rows=\d+/, '').slice(0, 120)
+      // a row count is said (it is no row's content), a hash is not
+      const what = (l: string) => l.replace(/ (md5|hash)=\S+/, '').slice(0, 120)
       return fail(`${db} differs: only on the old side ${d.onlyA.slice(0, 4).map(what).join(' | ') || '-'}; only on the new ${d.onlyB.slice(0, 4).map(what).join(' | ') || '-'}`)
     }
-    for (const l of a) { const m = /^table \S+ .* rows=(\d+) md5=/.exec(l); if (m) { tables++; rows += Number(m[1]) } }
+    for (const l of a) { const m = /^table \S+ .* rows=(\d+)(?: |$)/.exec(l); if (m) { tables++; rows += Number(m[1]) } }
   }
   return { same: true, why: '', tables, rows, databases: dbA.length, roles: rA.filter((l) => l.startsWith('role ')).length }
+}
+
+/**
+ * A failure of a move said with its cause first when it is a size or a space the copy ran out of (Postgres's 1 GB limit on one value, a
+ * compute out of memory, its disk for temporary files full), which the tool's own words name only deep in the message.
+ */
+export function moveFailure(e: unknown): string {
+  const text = String(e)
+  const cause = /invalid memory alloc request size|string too long|out of memory/i.test(text) ? 'a value or a sort larger than a compute can hold (Postgres takes at most 1 GB in one value)'
+    : /No space left on device|could not extend file|could not write to (file|temporary file)/i.test(text) ? "the compute's disk for temporary files is full (an index or a sort of a large table)"
+    : ''
+  return cause ? `a size limit was reached: ${cause}: ${text}` : text
 }
 
 // ---- the script the target compute runs
@@ -243,32 +260,44 @@ export const MOVE_SCRIPT = [
 
 // ---- what the database loop does about a move
 
-export interface MoveStatus { from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
+export interface MoveStatus { oldTimeline?: string; newerTimeline?: string; newerDatabase?: string; deleteNewerAfter?: string; verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
 
 /** A pod of the compute namespace as the grant reads it. */
 export interface ComputePod { name: string; labels: Record<string, string>; deleting: boolean }
 /**
  * The pods the operator lets the control layer exec into for one Database: of the pods its status.move.pods names (the control layer
- * writes them), those that exist, are not on their way out, are computes, and are this database's own (its compute, its move's target,
- * which carries the target label, or the old copy its last move left, by the name that move gives it); and only while the database is in
- * a step that execs (a move's MOVE_EXEC_STATES, or a way back's shut door). Anything else named is never granted.
+ * writes them), those that exist, are not on their way out, are computes, and are this database's own (its compute, or its move's target,
+ * which carries the target label); and only while its move is in a step that execs (MOVE_EXEC_STATES). Anything else named is never
+ * granted.
  */
 export function moveExecPods(db: { metadata: { name: string; deletionTimestamp?: string }; status?: { phase?: string; move?: MoveStatus } }, pods: ComputePod[]): string[] {
   const mv = db.status?.move
   const named = Array.isArray(mv?.pods) ? mv!.pods! : []
   if (!mv || named.length === 0 || db.metadata.deletionTimestamp) return []
-  if (!(MOVE_EXEC_STATES as readonly string[]).includes(String(mv.state)) && db.status?.phase !== 'Moving') return []
+  if (!(MOVE_EXEC_STATES as readonly string[]).includes(String(mv.state))) return []
   const name = db.metadata.name
   const target = typeof mv.target === 'string' && /^mv-[0-9a-f]{12}$/.test(mv.target) ? mv.target : undefined
-  const old = mv.from && mv.oldDatabase === oldNameOf(name, mv.from) ? mv.oldDatabase : undefined
   const byName = new Map(pods.map((p) => [p.name, p]))
   return [...new Set(named)].filter((n) => {
     const p = byName.get(n)
     if (!p || p.deleting || p.labels['app'] !== 'peat-compute') return false
     const c = p.labels['compute']
-    return c === name || (c === old && old !== undefined) || (c === target && target !== undefined && p.labels[MOVE_TARGET_LABEL] === 'target')
+    return c === name || (c === target && target !== undefined && p.labels[MOVE_TARGET_LABEL] === 'target')
   }).sort().slice(0, 4)
 }
+/** What a way back finds done, read afresh each time it goes on (after a restart, from its state going-back). */
+export interface BackFacts { newerObject: boolean; newerRecord: boolean; repointed: boolean; oldCopy: boolean }
+export type BackStep = 'stop' | 'keep-newer' | 'repoint' | 'drop-old' | 'finish'
+/**
+ * The steps a way back has left, in their order, each safe to repeat: the computes stopped; the version being left kept as a database of
+ * its own (its object and its record, on the newer timeline); the name pointed at the old copy's timeline; the old copy's object taken
+ * away without its data; the status. The newer timeline is held by a record at every boundary (the database's until the newer copy's is
+ * written, that one after), and the old one too (the old copy's until the name is pointed at it).
+ */
+export function backSteps(f: BackFacts): BackStep[] {
+  return ['stop', ...(f.newerObject && f.newerRecord ? [] : ['keep-newer' as const]), ...(f.repointed ? [] : ['repoint' as const]), ...(f.oldCopy ? ['drop-old' as const] : []), 'finish']
+}
+
 export type MoveAction =
   | { do: 'none' }
   | { do: 'start'; to: number; rehearsal: boolean; request: string }

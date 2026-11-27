@@ -144,17 +144,37 @@ login. Neon has no in-place major upgrade, so a move is a copy, in the control l
   - every role (its password's verifier, its attributes, its memberships, its settings), then every database (each object made by
     its own owner, and its settings and its roles' settings in it);
   - and loads it all locally.
-- Both sides are compared: the database list, the roles, the settings (of each database, each role, and each role in a database), and
-  every database's tables (rows hashed), views, sequences, functions, triggers, types, indexes, constraints, privileges and default
-  privileges. A database holding what the comparison cannot read (a foreign table) fails the move, and the message names it.
+- The copy stops at its first error. Then both sides are compared: the database list, the roles, the settings (of each database, each
+  role, and each role in a database), every database's tables, views, sequences, functions, triggers, types, indexes, constraints,
+  privileges and default privileges, and every table's row count. A database holding what the comparison cannot read (a foreign
+  table) fails the move, and the message names it. That is a real move's check (`moveVerify: counts`, the default). With
+  `moveVerify: full` (`peat move <db> --pg 19 --verify full`) it also compares every row, as a rehearsal always does: each row's hash,
+  summed per table, so order does not matter and no table is too large for it. A row count costs a read of the table; a hash of every
+  row costs that read and a hash of each row (on a Postgres 17, 3 million rows in memory: 30 ms counted, 2.4 s hashed).
+- What a real move does not catch: a copy wrong in a way no count shows (a value changed in the copy, with the same number of rows) on a
+  move made without a rehearsal or `--verify full`. The old copy and the way back remain for that. Rehearse first
+  (`peat move <db> --pg 19 --rehearse`): it copies and compares every row with the door open, and switches nothing.
 - Equal, the database's record is pointed at the new timeline and version, and the door opens. The old timeline is kept as a stopped
   database `<name>-pg<old>` for `keepOldFor` (30 days by default), then deleted, its data then held as any deleted database's.
 
 A failed move switches nothing, opens the door and waits for `requests.retryMove` (`peat move <db> --retry`). A rehearsal
 (`requests.rehearseMove: 19@<anything>`, `peat move <db> --pg 19 --rehearse`) copies and compares with the door open and switches
-nothing; `status.move.seconds` is how long the copy took. While the old copy is kept, `requests.moveBack` (`peat move <db> --back`) goes
-back: the door is shut and the database compared with its old copy, and only if they are the same (nothing written since the move) is
-the record pointed back at the old timeline. A database written since is refused; copying it down to the older version is by hand. A
+nothing; `status.move.seconds` is how long the copy took.
+
+While the old copy is kept, `requests.moveBack` (`peat move <db> --back`) goes back: a return to the frozen copy the move left, which
+nothing prevents. The door is shut and the database's compute stopped (its sessions ended); the version being left is kept as a
+database of its own, `<name>-pg<newer>`, stopped, for `keepOldFor` from then; and the name is pointed at the old copy as it was at the
+move. Nothing is read or compared, so it takes seconds whatever the size. It writes what it needs to finish (`state: going-back`)
+before its first step, so a control layer that restarts in the middle goes on with it, each step safe to repeat; the door stays shut
+until it is back. It costs what was written since the move: that is in
+`<name>-pg<newer>` until its keep period ends (connect to it by its own name, with the database's login, to read it or copy from it by
+hand). The status says so: back on Postgres N as of the move; what was written since is in `<name>-pg<newer>` until a time. It is
+refused only when it cannot be done: no move to go back from (or one under way), the old copy or its timeline gone, or the name
+`<name>-pg<newer>` taken (a kept copy of an earlier way back: delete it first). After a way back `spec.pgVersion` still names the
+newer version (the API server refuses to lower it, the guard against an accidental downgrade) while `status.pgVersion` says what runs.
+Moving forward again is a new move from what the database holds now, asked with `requests.retryMove` (`peat move <db> --retry`): it
+copies the old version's database into a new timeline of the newer one, and does not take up `<name>-pg<newer>`, which stays, with its
+own keep period, beside it. A
 restore of a moved database to a moment before its move is refused, and names the old copy, which holds that history. A replica does
 not move, nor a database that has replicas (delete them, move, make them again); branches stay on the old version.
 
@@ -167,19 +187,18 @@ What a move leaves out of the copy and the comparison, matched by exact name, ne
 A person's role granted to `app`, and a person's role's membership in `neon_superuser`, are copied.
 
 What guards it:
-- The control layer's account holds no exec of its own. For a step of a move that needs one (the copy, the comparison, the switch, a
-  way back), it names the pods in the Database's `status.move.pods`; the operator, woken by its watch of the Databases, grants exec on
+- The control layer's account holds no exec of its own. For a step of a move that needs one (the copy, the comparison, the switch; a
+  way back needs none), it names the pods in the Database's `status.move.pods`; the operator, woken by its watch of the Databases, grants exec on
   exactly those of them that are the database's own, by a Role `peat-move-<database>` in the compute namespace naming them, and takes
   it back when the step ends, the move fails, or the Database goes. The control layer waits for the grant at most 60 s, then the move
   fails and goes on when asked again. A pod is the database's own when it exists, is not on its way out, is a compute, and is the
-  database's compute, its move's target (a name `mv-<hex>` with the target label) or the old copy its last move left (by the name the
-  move gives it). A stale name (a compute restarted mid-move) names no pod and is never granted.
+  database's compute or its move's target (a name `mv-<hex>` with the target label). A stale name (a compute restarted mid-move) names no pod and is never granted.
 - The grant is taken back by the operator: at the end of each pass, and also by a pass that stops early (a Platform not valid, the
   keys, the placements). With the operator down (or the Platform suspended), a grant outlives its move until the operator's next pass;
   after a failed move the source compute runs on under the same name, so the control layer can still run psql there until then.
 - A move under way on the old control layer while the platform is upgraded to this release fails safely: the new operator takes exec
   out of the control layer's Role before the move asks the new way. Ask again with `requests.retryMove` once the upgrade is done.
-- What the control layer could still widen: it writes `status.move` (and so the target and old copy's names), and it makes the
+- What the control layer could still widen: it writes `status.move` (and so the target's name), and it makes the
   computes' Deployments (and so their labels). A control layer that misbehaves could name, or relabel, another database's compute as
   a move's target and be granted it. The check bounds a fault in the control layer (a pod of another database named by mistake is
   refused), not one that sets out to reach another database.
