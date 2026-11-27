@@ -211,8 +211,17 @@ def test_lfc_prewarm_cancel(neon_simple_env: NeonEnv):
 
     thread = Thread(target=lambda: prewarm_endpoint(method, client, pg_cur, None))
     thread.start()
-    # wait 2 seconds to ensure we cancel prewarm SQL query
-    sleep(2)
+
+    # Cancel while the prewarm is running, not after a fixed wait: loading this state takes
+    # about 2 s on a Peat CI runner (prewarm_time_ms 1901 in one run), so a fixed 2 s wait
+    # sometimes found it already completed ("completed" == "cancelled", main run 46041779303,
+    # both attempts). Poll fast for the start, then give it a moment so the cancel lands on the
+    # SQL query (neon.prewarm_local_cache()) that loads the pages, as the old wait intended.
+    def prewarming():
+        assert client.prewarm_lfc_status()["status"] == "prewarming"
+
+    wait_until(prewarming, timeout=30, interval=0.05)
+    sleep(0.25)
     client.cancel_prewarm_lfc()
     thread.join()
     assert client.prewarm_lfc_status()["status"] == "cancelled"
