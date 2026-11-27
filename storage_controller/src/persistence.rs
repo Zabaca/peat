@@ -4,7 +4,7 @@ pub(crate) mod records;
 pub(crate) mod split_state;
 #[cfg(test)]
 pub(crate) mod tests;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::str::FromStr;
 use std::time::Duration;
@@ -68,6 +68,21 @@ use crate::timeline_import::{TimelineImport, TimelineImportUpdateError};
 /// `persistence/kubernetes.rs`, described in `storage_controller/kubernetes/README.md`).
 pub struct Persistence {
     store: Store,
+}
+
+/// The settings of the Kubernetes store (the controller's `--records-*` settings).
+#[derive(Default)]
+pub struct KubernetesRecords {
+    /// `--records-copy-storage`: the copy in the bucket; none only with `--dev`.
+    pub copy_storage: Option<remote_storage::RemoteStorageConfig>,
+    /// `--address-for-peers`, which the Leader record names while this controller leads.
+    pub own_address: Option<String>,
+    /// `--records-copy-max-lag`: no generation is raised while the copy is further behind.
+    pub copy_max_lag: Option<Duration>,
+    /// `--records-accept-deleted`, as `<Kind>/<name>`.
+    pub accept_deleted: Vec<String>,
+    /// `--records-start-without-copy`, within its time.
+    pub start_without_copy: bool,
 }
 
 /// Where the records are kept.
@@ -214,7 +229,7 @@ impl Persistence {
     pub async fn new_kubernetes(
         kubeconfig: Option<&std::path::Path>,
         namespace: Option<String>,
-        copy: Option<remote_storage::RemoteStorageConfig>,
+        records: KubernetesRecords,
     ) -> anyhow::Result<Self> {
         let mut config = match kubeconfig {
             Some(path) => {
@@ -229,17 +244,50 @@ impl Persistence {
         kubernetes::skip_proxy_where_excluded(&mut config);
         let namespace = namespace.unwrap_or_else(|| config.default_namespace.clone());
         let client = kube::Client::try_from(config)?;
-        let copy = match copy {
+        let copy = match &records.copy_storage {
             Some(config) => Some(std::sync::Arc::new(
-                kubernetes::copy::BucketCopy::new(&config).await?,
+                kubernetes::copy::BucketCopy::new(config).await?,
             )),
             None => None,
         };
+        let settings = kubernetes::Settings {
+            copy,
+            own_address: records.own_address,
+            copy_max_lag: records.copy_max_lag,
+            accept_deleted: records.accept_deleted.into_iter().collect(),
+            start_without_copy: records.start_without_copy,
+        };
         Ok(Self {
             store: Store::Kubernetes(Box::new(kubernetes::KubernetesStore::new(
-                client, namespace, copy,
+                client, namespace, settings,
             ))),
         })
+    }
+
+    /// The checks a store makes before the controller does anything with its records, and
+    /// before a controller started as a candidate asks the leader to step down. Postgres has
+    /// none; the Kubernetes store compares every record with the copy in the bucket.
+    pub async fn start_checks(&self) -> anyhow::Result<()> {
+        match &self.store {
+            Store::Postgres(_) => Ok(()),
+            Store::Kubernetes(store) => Ok(store.start_checks().await?),
+        }
+    }
+
+    /// The Kubernetes store's kinds are installed (the copy tool's check; Postgres has none).
+    pub(crate) async fn check_kinds(&self) -> DatabaseResult<()> {
+        match &self.store {
+            Store::Postgres(_) => Ok(()),
+            Store::Kubernetes(store) => store.check_kinds().await,
+        }
+    }
+
+    /// This controller is stepping down: the Kubernetes store stops writing its copy, after any
+    /// write under way.
+    pub(crate) async fn step_down(&self) {
+        if let Store::Kubernetes(store) = &self.store {
+            store.step_down().await;
+        }
     }
 
     /// Stop writing the copy in the bucket, as a controller lost with its cluster stops.
@@ -264,10 +312,14 @@ impl Persistence {
         &self,
         records: &records::Records,
         replace: bool,
-    ) -> DatabaseResult<()> {
+        floors: &BTreeMap<String, u64>,
+    ) -> DatabaseResult<BTreeMap<String, u64>> {
         match &self.store {
-            Store::Postgres(store) => store.write_all(&records.to_rows()?, replace).await,
-            Store::Kubernetes(store) => store.write_all(records, replace).await,
+            Store::Postgres(store) => {
+                store.write_all(&records.to_rows()?, replace).await?;
+                Ok(BTreeMap::new())
+            }
+            Store::Kubernetes(store) => store.write_all(records, replace, floors).await,
         }
     }
 
@@ -277,7 +329,9 @@ impl Persistence {
     pub(crate) fn kubernetes_with_client(client: kube::Client, namespace: String) -> Self {
         Self {
             store: Store::Kubernetes(Box::new(kubernetes::KubernetesStore::new(
-                client, namespace, None,
+                client,
+                namespace,
+                kubernetes::Settings::default(),
             ))),
         }
     }

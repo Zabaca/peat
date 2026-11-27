@@ -10152,6 +10152,9 @@ impl Service {
         failpoint_support::sleep_millis_async!("sleep-on-step-down-handling");
 
         self.inner.write().unwrap().step_down();
+        // The records' copy in the bucket is written only by the leader: stop writing it, after
+        // any write under way, before answering.
+        self.persistence.step_down().await;
 
         let stop_reconciliations =
             self.stop_reconciliations(StopReconciliationsReason::SteppingDown);

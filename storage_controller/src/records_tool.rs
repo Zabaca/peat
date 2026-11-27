@@ -1,8 +1,9 @@
 //! `storcon_records`, the copy tool of `storage_controller/kubernetes/README.md`: dump, compare
-//! and copy the controller's records between its two stores, and rebuild them from the copy in
-//! the bucket, always with the controller stopped.
+//! and copy the controller's records between its two stores, scan the pageservers' store for
+//! the generations it holds, and rebuild the records from the copy in the bucket, always with
+//! the controller stopped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -10,14 +11,18 @@ use anyhow::Context;
 use futures::StreamExt;
 use pageserver_api::shard::TenantShardId;
 use remote_storage::{GenericRemoteStorage, ListingMode, RemotePath, RemoteStorageConfig};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use utils::generation::Generation;
 use utils::id::{TenantId, TimelineId};
 use utils::logging::SecretString;
 
-use crate::persistence::Persistence;
-use crate::persistence::kubernetes::copy::BucketCopy;
+use crate::persistence::kubernetes::copy::{BucketCopy, CopyDocument, Mark, record_key};
+use crate::persistence::kubernetes::objects::{
+    Spec, TenantSpec, TimelineSpec, timeline_object_name,
+};
 use crate::persistence::records::Records;
+use crate::persistence::{KubernetesRecords, Persistence};
 
 /// One of the places the records can be read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -35,6 +40,15 @@ pub struct Stores {
     pub database_url: Option<String>,
     pub records_namespace: Option<String>,
     pub records_copy_storage: Option<String>,
+}
+
+/// The check that nothing still runs, as the command line sets it.
+#[derive(Clone, Debug, Default)]
+pub struct Running {
+    /// `--controller-address`: where the controller is, when the records name no leader.
+    pub controller_address: Option<String>,
+    /// `--assume-stopped`: skip the check (the person checked that nothing runs).
+    pub assume_stopped: bool,
 }
 
 /// How a command ended, as the exit codes of the README.
@@ -74,16 +88,24 @@ impl Stores {
                 Ok(p)
             }
             Store::Kubernetes => {
+                let copy_storage = self
+                    .records_copy_storage
+                    .as_deref()
+                    .map(RemoteStorageConfig::from_toml_str)
+                    .transpose()?;
                 let p = Persistence::new_kubernetes(
                     self.kubeconfig.as_deref(),
                     self.records_namespace.clone(),
-                    None,
+                    KubernetesRecords {
+                        copy_storage,
+                        ..Default::default()
+                    },
                 )
                 .await?;
-                p.migration_run().await?;
+                p.check_kinds().await?;
                 Ok(p)
             }
-            Store::Bucket => anyhow::bail!("the bucket is read with read_bucket"),
+            Store::Bucket => anyhow::bail!("the bucket is read with read_copy"),
         }
     }
 
@@ -112,9 +134,7 @@ impl Stores {
         }
     }
 
-    async fn read_copy(
-        &self,
-    ) -> anyhow::Result<crate::persistence::kubernetes::copy::CopyDocument> {
+    async fn read_copy(&self) -> anyhow::Result<CopyDocument> {
         self.bucket()
             .await?
             .read()
@@ -161,6 +181,8 @@ pub async fn copy(
     from: Store,
     to: Store,
     replace: bool,
+    running: &Running,
+    accept_remade: &BTreeSet<String>,
 ) -> anyhow::Result<Outcome> {
     if from == Store::Bucket || to == Store::Bucket {
         return Ok(Outcome::Refused(
@@ -175,11 +197,103 @@ pub async fn copy(
     }
     let source = stores.open(from, false).await?;
     let records = source.read_all_records().await?;
-    if let Some(reason) = something_runs(&records).await {
+    // The way back (into Postgres) runs with every pageserver stopped; the move into Kubernetes
+    // runs with them up, which is safe with the controller stopped.
+    if let Some(reason) = something_may_run(&records, running, to == Store::Postgres).await {
         return Ok(Outcome::Refused(reason));
     }
+    if to == Store::Postgres {
+        let dest = stores.open(to, true).await?;
+        return write_checked(&dest, &records, replace, &BTreeMap::new()).await;
+    }
+
+    // Into Kubernetes: above the copy's revisions and the marks', checked against the copy's
+    // highest-ever values, and a new copy written of what was written.
+    if stores.records_copy_storage.is_none() {
+        return Ok(Outcome::Refused(
+            "copy --to kubernetes needs --records-copy-storage".to_string(),
+        ));
+    }
+    let bucket = stores.bucket().await?;
+    if let Some(w) = bucket.read_went_back().await? {
+        return Ok(Outcome::Refused(format!(
+            "a controller found the records went back at {} ({}): restore them, not copy over",
+            w.at, w.what
+        )));
+    }
+    let old = bucket.read().await?;
+    let marks = bucket.read_marks().await?;
+    if let Some(old) = &old {
+        let stale = below_highest(&records, old, accept_remade);
+        if !stale.is_empty() {
+            return Ok(Outcome::Refused(format!(
+                "the source holds generations below what the copy in the bucket has seen (a \
+                 source that went back, or a tenant remade under its id): {stale:?}; give \
+                 --accept-remade with those that were remade"
+            )));
+        }
+    }
     let dest = stores.open(to, true).await?;
-    write_checked(&dest, &records, replace).await
+    let floors = floors(old.as_ref(), &marks);
+    let (outcome, revisions) = write_checked_revisions(&dest, &records, replace, &floors).await?;
+    if outcome == Outcome::Done {
+        write_new_copy(&bucket, &records, revisions, old.as_ref()).await?;
+    }
+    Ok(outcome)
+}
+
+/// The tenants and timelines whose generations are below the copy's highest-ever values.
+fn below_highest(
+    records: &Records,
+    copy: &CopyDocument,
+    accept_remade: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, t) in &records.tenants {
+        let key = record_key(TenantSpec::KIND, name);
+        let highest = copy.highest_generations.get(&t.tenant_id).copied();
+        let here = t.shards.iter().filter_map(|s| s.generation).max();
+        if let (Some(h), Some(g)) = (highest, here) {
+            if g < h && !accept_remade.contains(&key) {
+                out.push(format!("{key}: generation {g}, the copy has seen {h}"));
+            }
+        }
+    }
+    for (name, t) in &records.timelines {
+        let key = record_key(TimelineSpec::KIND, name);
+        let highest = copy.highest_memberships.get(name).copied();
+        if let (Some(h), Some(m)) = (highest, &t.membership) {
+            if m.generation < h && !accept_remade.contains(&key) {
+                out.push(format!(
+                    "{key}: membership generation {}, the copy has seen {h}",
+                    m.generation
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Each name's revision floor: the copy's revision and the mark's.
+fn floors(copy: Option<&CopyDocument>, marks: &BTreeMap<String, Mark>) -> BTreeMap<String, u64> {
+    let mut out: BTreeMap<String, u64> = copy.map(|c| c.revisions.clone()).unwrap_or_default();
+    for (k, m) in marks {
+        let e = out.entry(k.clone()).or_insert(m.revision);
+        *e = (*e).max(m.revision);
+    }
+    out
+}
+
+async fn write_new_copy(
+    bucket: &BucketCopy,
+    records: &Records,
+    revisions: BTreeMap<String, u64>,
+    old: Option<&CopyDocument>,
+) -> anyhow::Result<()> {
+    let mut doc = CopyDocument::new(records.clone());
+    doc.revisions = revisions;
+    doc.merge_highest(old);
+    bucket.write(&doc).await
 }
 
 /// Write `records` into `dest` and read them back.
@@ -187,99 +301,355 @@ async fn write_checked(
     dest: &Persistence,
     records: &Records,
     replace: bool,
+    floors: &BTreeMap<String, u64>,
 ) -> anyhow::Result<Outcome> {
+    Ok(write_checked_revisions(dest, records, replace, floors)
+        .await?
+        .0)
+}
+
+async fn write_checked_revisions(
+    dest: &Persistence,
+    records: &Records,
+    replace: bool,
+    floors: &BTreeMap<String, u64>,
+) -> anyhow::Result<(Outcome, BTreeMap<String, u64>)> {
     if !replace {
         let held = dest.read_all_records().await?;
         if held != Records::empty() {
-            return Ok(Outcome::Refused(format!(
-                "the destination is not empty ({:?}): give --replace to replace what it holds",
-                held.counts()
-            )));
+            return Ok((
+                Outcome::Refused(format!(
+                    "the destination is not empty ({:?}): give --replace to replace what it holds",
+                    held.counts()
+                )),
+                BTreeMap::new(),
+            ));
         }
     }
-    dest.write_all_records(records, replace).await?;
+    let revisions = dest.write_all_records(records, replace, floors).await?;
     let written = dest.read_all_records().await?;
     let diff = records.diff(&written)?;
-    Ok(if diff.is_empty() {
-        Outcome::Done
-    } else {
-        Outcome::Differ(diff)
-    })
+    Ok((
+        if diff.is_empty() {
+            Outcome::Done
+        } else {
+            Outcome::Differ(diff)
+        },
+        revisions,
+    ))
+}
+
+/// What `scan-generations` found in the pageservers' store.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Scan {
+    /// The `remote_storage` setting scanned (it holds no secret).
+    pub storage: String,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+    /// The highest generation any object under each tenant shard's prefix was written with.
+    pub shards: BTreeMap<String, u32>,
+    /// The timelines found under each tenant.
+    pub timelines: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Scan {
+    /// The highest generation of any shard of each tenant.
+    fn by_tenant(&self) -> BTreeMap<TenantId, u32> {
+        let mut out: BTreeMap<TenantId, u32> = BTreeMap::new();
+        for (shard, g) in &self.shards {
+            if let Ok(id) = TenantShardId::from_str(shard) {
+                let e = out.entry(id.tenant_id).or_default();
+                *e = (*e).max(*g);
+            }
+        }
+        out
+    }
+}
+
+/// Read the pageservers' store: every object under `tenants/`, its generation suffix and its
+/// timeline. Run with the pageservers' credentials, after every pageserver is stopped.
+pub async fn scan_generations(config: &str) -> anyhow::Result<Scan> {
+    let storage =
+        GenericRemoteStorage::from_config(&RemoteStorageConfig::from_toml_str(config)?).await?;
+    let cancel = CancellationToken::new();
+    let prefix = RemotePath::from_string("tenants/")?;
+    let mut scan = Scan {
+        storage: config.to_string(),
+        scanned_at: chrono::Utc::now(),
+        ..Default::default()
+    };
+    let mut listing = std::pin::pin!(storage.list_streaming(
+        Some(&prefix),
+        ListingMode::NoDelimiter,
+        None,
+        &cancel
+    ));
+    while let Some(page) = listing.next().await {
+        for obj in page?.keys {
+            let key = obj.key.get_path().as_str().to_string();
+            if let Some((shard, generation)) = key_generation(&key) {
+                let e = scan.shards.entry(shard.to_string()).or_default();
+                *e = (*e).max(generation);
+            }
+            if let Some((tenant, timeline)) = key_timeline(&key) {
+                scan.timelines
+                    .entry(tenant.to_string())
+                    .or_default()
+                    .insert(timeline.to_string());
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// `tenants/<tenant shard>/.../<name>-<generation, 8 hex digits>[.json]`.
+pub(crate) fn key_generation(key: &str) -> Option<(TenantShardId, u32)> {
+    let mut parts = key.split('/');
+    if parts.next()? != "tenants" {
+        return None;
+    }
+    let shard = TenantShardId::from_str(parts.next()?).ok()?;
+    let name = key.rsplit('/').next()?;
+    let name = name.strip_suffix(".json").unwrap_or(name);
+    let (_, suffix) = name.rsplit_once('-')?;
+    if suffix.len() != 8 {
+        return None;
+    }
+    match Generation::parse_suffix(suffix)? {
+        Generation::Valid(g) => Some((shard, g)),
+        Generation::None => None,
+    }
+}
+
+/// `tenants/<tenant shard>/timelines/<timeline>/...`.
+fn key_timeline(key: &str) -> Option<(TenantId, TimelineId)> {
+    let parts: Vec<&str> = key.split('/').collect();
+    if parts.len() < 4 || parts[0] != "tenants" || parts[2] != "timelines" {
+        return None;
+    }
+    Some((
+        TenantShardId::from_str(parts[1]).ok()?.tenant_id,
+        TimelineId::from_str(parts[3]).ok()?,
+    ))
 }
 
 /// What a restore changed, for its report.
 #[derive(Debug, Default)]
 pub struct Restored {
     pub copy_written_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub scan_storage: String,
+    pub scanned_at: Option<chrono::DateTime<chrono::Utc>>,
     pub shards_raised: usize,
     pub timelines_read_from_safekeepers: usize,
-    pub timelines_no_safekeeper_answered: Vec<String>,
-    pub tenants_in_store_not_in_copy: Vec<String>,
+    pub timelines_kept_silent: Vec<String>,
+    pub left_out: Vec<String>,
 }
 
 /// How far above the highest generation seen a restore sets each shard's.
 pub const DEFAULT_GENERATION_MARGIN: u32 = 1000;
 
-/// Rebuild the records from the copy in the bucket, raising every shard's generation above
-/// anything the copy or the pageservers' store shows, and reading each timeline's safekeeper
-/// membership back from its safekeepers.
+/// What a restore may go on without.
+#[derive(Clone, Debug, Default)]
+pub struct RestoreOptions {
+    pub replace: bool,
+    pub margin: u32,
+    /// `--leave-out`: records the store shows and the copy lacks, by record key.
+    pub leave_out: BTreeSet<String>,
+    /// `--accept-silent-safekeepers`.
+    pub accept_silent_safekeepers: bool,
+    pub safekeeper_jwt: Option<String>,
+}
+
+/// Rebuild the records from the copy in the bucket (`storage_controller/kubernetes/README.md`,
+/// "restore").
 pub async fn restore(
     stores: &Stores,
     to: Store,
-    pageserver_storage: &str,
-    safekeeper_jwt: Option<String>,
-    replace: bool,
-    margin: u32,
+    scan: &Scan,
+    options: &RestoreOptions,
+    running: &Running,
 ) -> anyhow::Result<(Outcome, Restored)> {
-    let mut report = Restored::default();
+    let mut report = Restored {
+        scan_storage: scan.storage.clone(),
+        scanned_at: Some(scan.scanned_at),
+        ..Default::default()
+    };
     if to == Store::Bucket {
         return Ok((
             Outcome::Refused("restore writes into postgres or kubernetes".to_string()),
             report,
         ));
     }
-    let doc = stores.read_copy().await?;
-    let mut records = doc.records;
+    let bucket = stores.bucket().await?;
+    let doc = bucket
+        .read()
+        .await?
+        .context("the bucket holds no copy of the records")?;
+    let marks = bucket.read_marks().await?;
     report.copy_written_at = Some(doc.written_at);
-    if let Some(reason) = something_runs(&records).await {
+    let mut records = doc.records.clone();
+    if let Some(reason) = something_may_run(&records, running, true).await {
         return Ok((Outcome::Refused(reason), report));
     }
 
-    // Generations: above the highest the copy holds or has ever seen, and the highest any
-    // object in the pageservers' store was written with, for every shard of the tenant.
-    let in_store = generations_in_store(pageserver_storage).await?;
-    let mut seen = in_store.clone();
+    // The generations file: of the right storage, and made after the copy's last write.
+    if scan.scanned_at < doc.written_at {
+        return Ok((
+            Outcome::Refused(format!(
+                "the generations file was made at {}, before the copy's last write at {}: scan \
+                 again, with every pageserver stopped",
+                scan.scanned_at, doc.written_at
+            )),
+            report,
+        ));
+    }
+    let with_generation: Vec<String> = records
+        .tenants
+        .values()
+        .flat_map(|t| {
+            t.shards
+                .iter()
+                .filter(|s| s.generation.is_some())
+                .map(|s| s.to_row(&t.tenant_id))
+                .filter_map(|r| r.get_tenant_shard_id().ok())
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if !with_generation.is_empty() && !with_generation.iter().any(|s| scan.shards.contains_key(s)) {
+        return Ok((
+            Outcome::Refused(format!(
+                "none of the copy's {} shards with a generation is in the generations file of \
+                 {}: the wrong bucket or prefix?",
+                with_generation.len(),
+                scan.storage
+            )),
+            report,
+        ));
+    }
+
+    // What the store shows and the copy lacks, no mark covering it (an accepted mark does not).
+    let covered = |key: &str| marks.get(key).is_some_and(|m| !m.accepted);
+    let mut lacking = Vec::new();
+    let in_store = scan.by_tenant();
+    for tenant in in_store.keys() {
+        let key = record_key(TenantSpec::KIND, &tenant.to_string());
+        match records.tenants.get(&tenant.to_string()) {
+            None if !covered(&key) => lacking.push(key),
+            Some(t) => {
+                let copy_count = t.shards.iter().map(|s| s.shard_count).max().unwrap_or(0);
+                let store_count = scan
+                    .shards
+                    .keys()
+                    .filter_map(|s| TenantShardId::from_str(s).ok())
+                    .filter(|id| id.tenant_id == *tenant)
+                    .map(|id| id.shard_count.literal() as i32)
+                    .max()
+                    .unwrap_or(0);
+                if store_count > copy_count {
+                    lacking.push(format!(
+                        "{key} (split to {store_count} shards in the store)"
+                    ));
+                }
+            }
+            None => {}
+        }
+    }
+    let tracked: BTreeSet<&str> = records
+        .timelines
+        .values()
+        .filter(|t| t.membership.is_some())
+        .map(|t| t.tenant_id.as_str())
+        .collect();
+    for (tenant, timelines) in &scan.timelines {
+        if !tracked.contains(tenant.as_str()) {
+            continue;
+        }
+        for tl in timelines {
+            let name = timeline_object_name(tenant, tl);
+            let key = record_key(TimelineSpec::KIND, &name);
+            if !records.timelines.contains_key(&name) && !covered(&key) {
+                lacking.push(key);
+            }
+        }
+    }
+    let unaccounted: Vec<String> = lacking
+        .iter()
+        .filter(|k| {
+            let bare = k.split(" (").next().unwrap_or(k);
+            !options.leave_out.contains(bare)
+        })
+        .cloned()
+        .collect();
+    if !unaccounted.is_empty() {
+        return Ok((
+            Outcome::Refused(format!(
+                "the pageservers' store holds what the copy lacks (a copy behind while the \
+                 bucket was unreachable): {unaccounted:?}; give --leave-out with those to go on \
+                 without them"
+            )),
+            report,
+        ));
+    }
+    report.left_out = lacking;
+
+    // Generations: above the highest the copy holds or has seen, and the store's.
+    let mut seen = in_store;
     for (tenant, g) in &doc.highest_generations {
         if let Ok(t) = TenantId::from_str(tenant) {
             let e = seen.entry(t).or_default();
             *e = (*e).max(*g as u32);
         }
     }
-    for (tenant, g) in &in_store {
-        if !records.tenants.contains_key(&tenant.to_string()) {
-            report.tenants_in_store_not_in_copy.push(format!(
-                "{tenant} (generation {g} in the store, {} the highest ever seen)",
-                seen[tenant]
-            ));
-        }
-    }
-    report.shards_raised = raise_generations(&mut records, &seen, margin);
+    report.shards_raised = raise_generations(&mut records, &seen, options.margin);
 
-    // Safekeeper membership: the highest configuration any of the timeline's safekeepers holds.
-    let (read, silent) = read_membership(&mut records, safekeeper_jwt).await;
+    // Safekeeper membership: the highest configuration a member holds; every member answers.
+    let (read, silent) = read_membership(&mut records, &doc, options).await;
     report.timelines_read_from_safekeepers = read;
-    report.timelines_no_safekeeper_answered = silent;
+    if !silent.is_empty() && !options.accept_silent_safekeepers {
+        return Ok((
+            Outcome::Refused(format!(
+                "a safekeeper of these timelines did not answer, and may hold a higher \
+                 membership than the copy: {silent:?}; start it, or give \
+                 --accept-silent-safekeepers"
+            )),
+            report,
+        ));
+    }
+    report.timelines_kept_silent = silent;
 
     let dest = stores.open(to, true).await?;
-    Ok((write_checked(&dest, &records, replace).await?, report))
+    let floors = floors(Some(&doc), &marks);
+    let (outcome, revisions) =
+        write_checked_revisions(&dest, &records, options.replace, &floors).await?;
+    if outcome == Outcome::Done {
+        for key in &report.left_out {
+            let bare = key.split(" (").next().unwrap_or(key).to_string();
+            let revision = floors.get(&bare).copied().unwrap_or(0);
+            bucket
+                .write_mark(
+                    &bare,
+                    Mark {
+                        revision,
+                        accepted: false,
+                    },
+                )
+                .await?;
+        }
+        if to == Store::Kubernetes {
+            write_new_copy(&bucket, &records, revisions, Some(&doc)).await?;
+        }
+        bucket.clear_went_back().await?;
+    }
+    Ok((outcome, report))
 }
 
-/// Set every shard's generation above `margin` past the highest of the copy's and the store's,
-/// for that shard's tenant; a shard without a generation gets one only if the store shows one.
-/// How many shards were raised.
+/// Set every shard of a tenant to `margin` above the highest of the copy's generations for it
+/// and `seen` (the store's, and the copy's highest-ever); a shard without a generation gets one
+/// only if `seen` has one. How many shards were raised.
 pub(crate) fn raise_generations(
     records: &mut Records,
-    in_store: &BTreeMap<TenantId, u32>,
+    seen: &BTreeMap<TenantId, u32>,
     margin: u32,
 ) -> usize {
     let mut raised = 0;
@@ -287,7 +657,7 @@ pub(crate) fn raise_generations(
         let Ok(tenant) = TenantId::from_str(&t.tenant_id) else {
             continue;
         };
-        let stored = in_store.get(&tenant).copied();
+        let stored = seen.get(&tenant).copied();
         let highest_copy = t.shards.iter().filter_map(|s| s.generation).max();
         let highest = match (highest_copy, stored) {
             (None, None) => continue,
@@ -304,53 +674,15 @@ pub(crate) fn raise_generations(
     raised
 }
 
-/// The highest generation any object under `tenants/` in the pageservers' store was written
-/// with, per tenant (every key a pageserver writes carries its generation as a suffix).
-pub(crate) async fn generations_in_store(config: &str) -> anyhow::Result<BTreeMap<TenantId, u32>> {
-    let storage =
-        GenericRemoteStorage::from_config(&RemoteStorageConfig::from_toml_str(config)?).await?;
-    let cancel = CancellationToken::new();
-    let prefix = RemotePath::from_string("tenants/")?;
-    let mut out: BTreeMap<TenantId, u32> = BTreeMap::new();
-    let mut listing = std::pin::pin!(storage.list_streaming(
-        Some(&prefix),
-        ListingMode::NoDelimiter,
-        None,
-        &cancel
-    ));
-    while let Some(page) = listing.next().await {
-        for obj in page?.keys {
-            if let Some((tenant, generation)) = key_generation(obj.key.get_path().as_str()) {
-                let e = out.entry(tenant).or_default();
-                *e = (*e).max(generation);
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// `tenants/<tenant shard>/.../<name>-<generation, 8 hex digits>[.json]`.
-pub(crate) fn key_generation(key: &str) -> Option<(TenantId, u32)> {
-    let mut parts = key.split('/');
-    if parts.next()? != "tenants" {
-        return None;
-    }
-    let shard = TenantShardId::from_str(parts.next()?).ok()?;
-    let name = key.rsplit('/').next()?;
-    let name = name.strip_suffix(".json").unwrap_or(name);
-    let (_, suffix) = name.rsplit_once('-')?;
-    if suffix.len() != 8 {
-        return None;
-    }
-    match Generation::parse_suffix(suffix)? {
-        Generation::Valid(g) => Some((shard.tenant_id, g)),
-        Generation::None => None,
-    }
-}
-
-/// For each timeline with a membership, ask its safekeepers and keep the highest configuration
-/// any of them holds. Returns how many timelines were read, and those no safekeeper answered for.
-async fn read_membership(records: &mut Records, jwt: Option<String>) -> (usize, Vec<String>) {
+/// For each timeline with a membership, ask every member and keep the highest configuration
+/// any of them holds (at least the copy's highest-ever). Returns how many timelines were read,
+/// and those a member did not answer for; with `--accept-silent-safekeepers` those keep the
+/// copy's set with their generation raised by the margin.
+async fn read_membership(
+    records: &mut Records,
+    doc: &CopyDocument,
+    options: &RestoreOptions,
+) -> (usize, Vec<String>) {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -362,10 +694,13 @@ async fn read_membership(records: &mut Records, jwt: Option<String>) -> (usize, 
         .collect();
     let mut read = 0;
     let mut silent = Vec::new();
-    for t in records.timelines.values_mut() {
+    for (name, t) in records.timelines.iter_mut() {
         let Some(m) = t.membership.as_mut() else {
             continue;
         };
+        if let Some(h) = doc.highest_memberships.get(name) {
+            m.generation = m.generation.max(*h);
+        }
         let (Ok(tenant), Ok(timeline)) = (
             TenantId::from_str(&t.tenant_id),
             TimelineId::from_str(&t.timeline_id),
@@ -373,577 +708,137 @@ async fn read_membership(records: &mut Records, jwt: Option<String>) -> (usize, 
             continue;
         };
         let mut best: Option<safekeeper_api::membership::Configuration> = None;
-        let ids = m.sk_set.iter().chain(m.new_sk_set.iter().flatten());
-        for id in ids {
-            let Some(addr) = addresses.get(id) else {
-                continue;
-            };
-            let client = safekeeper_client::mgmt_api::Client::new(
-                http.clone(),
-                addr.clone(),
-                jwt.clone().map(SecretString::from),
-            );
-            let Ok(resp) = client.timeline_status(tenant, timeline).await else {
-                continue;
-            };
-            let Ok(status) = resp.json::<safekeeper_api::models::TimelineStatus>().await else {
-                continue;
-            };
-            if best
-                .as_ref()
-                .is_none_or(|b| status.mconf.generation > b.generation)
-            {
-                best = Some(status.mconf);
+        let mut all_answered = true;
+        let members: BTreeSet<i64> = m
+            .sk_set
+            .iter()
+            .chain(m.new_sk_set.iter().flatten())
+            .copied()
+            .collect();
+        for id in members {
+            let answer = async {
+                let addr = addresses.get(&id)?;
+                let client = safekeeper_client::mgmt_api::Client::new(
+                    http.clone(),
+                    addr.clone(),
+                    options.safekeeper_jwt.clone().map(SecretString::from),
+                );
+                let resp = client.timeline_status(tenant, timeline).await.ok()?;
+                resp.json::<safekeeper_api::models::TimelineStatus>()
+                    .await
+                    .ok()
+            }
+            .await;
+            match answer {
+                Some(status) => {
+                    if best
+                        .as_ref()
+                        .is_none_or(|b| status.mconf.generation > b.generation)
+                    {
+                        best = Some(status.mconf);
+                    }
+                }
+                None => all_answered = false,
             }
         }
-        match best {
-            Some(conf) => {
-                read += 1;
-                let g = conf.generation.into_inner() as i32;
-                if g > m.generation {
-                    m.generation = g;
-                    m.sk_set = conf.members.m.iter().map(|s| s.id.0 as i64).collect();
-                    m.new_sk_set = conf
-                        .new_members
-                        .map(|n| n.m.iter().map(|s| s.id.0 as i64).collect());
-                }
+        if let Some(conf) = best {
+            let g = conf.generation.into_inner() as i32;
+            if g > m.generation {
+                m.generation = g;
+                m.sk_set = conf.members.m.iter().map(|s| s.id.0 as i64).collect();
+                m.new_sk_set = conf
+                    .new_members
+                    .map(|n| n.m.iter().map(|s| s.id.0 as i64).collect());
             }
-            None => silent.push(format!("{}/{}", t.tenant_id, t.timeline_id)),
+        }
+        if all_answered {
+            read += 1;
+        } else {
+            silent.push(name.clone());
+            if options.accept_silent_safekeepers {
+                m.generation = m.generation.saturating_add(options.margin as i32);
+            }
         }
     }
     (read, silent)
 }
 
-/// The controller (at the leader's address) or a pageserver (at its HTTP port) that accepts a
-/// connection, named; `None` when nothing does.
-async fn something_runs(records: &Records) -> Option<String> {
+/// The controller (at the leader's address, or `--controller-address`) or, when
+/// `pageservers_too`, a pageserver (at its HTTP port) that runs or may run, named; `None` when
+/// everything checked is stopped. An address that accepts a connection runs; one that refuses it
+/// is stopped; one that does not resolve or answer within 5 seconds may run, and refuses.
+async fn something_may_run(
+    records: &Records,
+    running: &Running,
+    pageservers_too: bool,
+) -> Option<String> {
+    if running.assume_stopped {
+        eprintln!("--assume-stopped: not checking that the controller and pageservers are stopped");
+        return None;
+    }
     let mut targets = Vec::new();
-    if let Some(l) = &records.leader {
-        if let Ok(url) = reqwest::Url::parse(&l.address) {
-            if let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) {
-                targets.push((
-                    format!("the storage controller at {}", l.address),
+    let controller = running
+        .controller_address
+        .clone()
+        .or_else(|| records.leader.as_ref().map(|l| l.address.clone()));
+    match controller {
+        Some(address) => match reqwest::Url::parse(&address) {
+            Ok(url) => match (url.host_str(), url.port_or_known_default()) {
+                (Some(host), Some(port)) => targets.push((
+                    format!("the storage controller at {address}"),
                     host.to_string(),
                     port,
-                ));
+                )),
+                _ => return Some(format!("the controller's address {address} names no port")),
+            },
+            Err(e) => return Some(format!("the controller's address {address}: {e}")),
+        },
+        None => {
+            return Some(
+                "the records name no leader (the controller runs without --address-for-peers): \
+                 give --controller-address, or --assume-stopped once it is stopped"
+                    .to_string(),
+            );
+        }
+    }
+    if pageservers_too {
+        for p in records.pageservers.values() {
+            if p.lifecycle == "deleted" {
+                continue;
             }
+            targets.push((
+                format!(
+                    "pageserver {} at {}:{}",
+                    p.node_id, p.listen_http_addr, p.listen_http_port
+                ),
+                p.listen_http_addr.clone(),
+                p.listen_http_port as u16,
+            ));
         }
     }
-    for p in records.pageservers.values() {
-        if p.lifecycle == "deleted" {
-            continue;
-        }
-        targets.push((
-            format!(
-                "pageserver {} at {}:{}",
-                p.node_id, p.listen_http_addr, p.listen_http_port
-            ),
-            p.listen_http_addr.clone(),
-            p.listen_http_port as u16,
-        ));
-    }
-    let mut answered = Vec::new();
+    let mut runs = Vec::new();
+    let mut unknown = Vec::new();
     for (what, host, port) in targets {
         let connect = tokio::net::TcpStream::connect((host.as_str(), port));
-        if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), connect).await {
-            answered.push(what);
+        match tokio::time::timeout(Duration::from_secs(5), connect).await {
+            Ok(Ok(_)) => runs.push(what),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Ok(Err(e)) => unknown.push(format!("{what} ({e})")),
+            Err(_) => unknown.push(format!("{what} (no answer within 5 s)")),
         }
     }
-    (!answered.is_empty()).then(|| format!("still running, stop it first: {}", answered.join(", ")))
+    if !runs.is_empty() {
+        return Some(format!("still running, stop it first: {}", runs.join(", ")));
+    }
+    if !unknown.is_empty() {
+        return Some(format!(
+            "cannot tell whether these are stopped (run the tool inside the cluster's network, \
+             or check by hand and give --assume-stopped): {}",
+            unknown.join(", ")
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::persistence::kubernetes::objects::{ShardRecord, TenantSpec};
-    use crate::persistence::split_state::SplitState;
-
-    use std::sync::Arc;
-
-    use pageserver_api::shard::ShardCount;
-    use safekeeper_api::membership::SafekeeperGeneration;
-    use utils::id::NodeId;
-
-    use crate::persistence::tests::{
-        TENANT, TENANT_B, TIMELINE, node_row, op, safekeeper_upsert, shard_id, shard_row, tenant,
-        test_database, test_namespace, timeline, timeline_row,
-    };
-    use crate::persistence::{
-        ControllerPersistence, SafekeeperTimelineOpKind, TenantShardPersistence,
-        TimelineImportPersistence,
-    };
-
-    fn local_storage(dir: &camino::Utf8Path) -> String {
-        format!("local_path = '{dir}'")
-    }
-
-    /// Records of every kind, written through the controller's own operations.
-    async fn fill(p: &Persistence) {
-        let node = |id| crate::node::Node::from_persistent(node_row(id), false).unwrap();
-        p.insert_node(&node(1)).await.unwrap();
-        p.insert_node(&node(2)).await.unwrap();
-        p.set_tombstone(NodeId(2)).await.unwrap();
-        p.insert_tenant_shards(vec![shard_row(TENANT, 0, 0)])
-            .await
-            .unwrap();
-        p.insert_tenant_shards(vec![shard_row(TENANT_B, 0, 2), shard_row(TENANT_B, 1, 2)])
-            .await
-            .unwrap();
-        for _ in 0..3 {
-            p.increment_generation(shard_id(TENANT, 0, 0), NodeId(1))
-                .await
-                .unwrap();
-        }
-        p.increment_generation(shard_id(TENANT_B, 1, 2), NodeId(1))
-            .await
-            .unwrap();
-        let children = (0..2)
-            .map(|n| TenantShardPersistence {
-                splitting: crate::persistence::split_state::SplitState::Splitting,
-                ..shard_row(TENANT, n, 2)
-            })
-            .collect();
-        p.begin_shard_split(
-            ShardCount::new(0),
-            tenant(TENANT),
-            vec![(shard_id(TENANT, 0, 0), children)],
-        )
-        .await
-        .unwrap();
-        p.safekeeper_upsert(safekeeper_upsert(1, 1)).await.unwrap();
-        p.safekeeper_upsert(safekeeper_upsert(2, 1)).await.unwrap();
-        p.insert_timeline(timeline_row(TENANT, TIMELINE))
-            .await
-            .unwrap();
-        p.update_timeline_membership(
-            tenant(TENANT),
-            timeline(TIMELINE),
-            SafekeeperGeneration::new(2),
-            &[NodeId(1), NodeId(2)],
-            None,
-            &[op(
-                TENANT,
-                TIMELINE,
-                3,
-                2,
-                SafekeeperTimelineOpKind::Exclude,
-            )],
-        )
-        .await
-        .unwrap();
-        p.insert_pending_op(op(
-            TENANT_B,
-            "",
-            1,
-            i32::MAX,
-            SafekeeperTimelineOpKind::Delete,
-        ))
-        .await
-        .unwrap();
-        p.insert_timeline_import(TimelineImportPersistence {
-            tenant_id: TENANT_B.to_string(),
-            timeline_id: TIMELINE.to_string(),
-            shard_statuses: serde_json::json!({"0002": {"InProgress": null}, "0102": "Done"}),
-        })
-        .await
-        .unwrap();
-        p.update_leader(
-            None,
-            ControllerPersistence {
-                address: "http://controller-0.example.com:1234".to_string(),
-                started_at: chrono::Utc::now(),
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn wait_for_copy(
-        copy: &BucketCopy,
-        done: impl Fn(&Records) -> bool,
-    ) -> std::time::Duration {
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(doc) = copy.read().await.unwrap() {
-                if done(&doc.records) {
-                    return start.elapsed();
-                }
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "the copy did not follow"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    /// Both stores, or neither (the tests then pass without running, as persistence's do).
-    async fn both() -> Option<(Stores, String)> {
-        let (kubeconfig, namespace) = test_namespace().await?;
-        let url = test_database().await?;
-        Some((
-            Stores {
-                kubeconfig: Some(kubeconfig),
-                database_url: Some(url.clone()),
-                records_namespace: Some(namespace),
-                records_copy_storage: None,
-            },
-            url,
-        ))
-    }
-
-    #[tokio::test]
-    async fn the_copy_follows_the_records_within_a_second() {
-        let Some((kubeconfig, namespace)) = test_namespace().await else {
-            return;
-        };
-        let dir = camino_tempfile::tempdir().unwrap();
-        let config = RemoteStorageConfig::from_toml_str(&local_storage(dir.path())).unwrap();
-        let p =
-            Persistence::new_kubernetes(Some(&kubeconfig), Some(namespace), Some(config.clone()))
-                .await
-                .unwrap();
-        p.migration_run().await.unwrap();
-        let copy = BucketCopy::new(&config).await.unwrap();
-
-        fill(&p).await;
-        let expected = p.read_all_records().await.unwrap();
-        let took = wait_for_copy(&copy, |r| r.diff(&expected).unwrap().is_empty()).await;
-        eprintln!("the copy held every record {took:?} after the last write");
-
-        p.increment_generation(shard_id(TENANT_B, 1, 2), NodeId(1))
-            .await
-            .unwrap();
-        let took = wait_for_copy(&copy, |r| {
-            r.tenants[TENANT_B].shards[1].generation == Some(2)
-        })
-        .await;
-        assert!(took < Duration::from_secs(1), "{took:?}");
-        p.delete_tenant(tenant(TENANT_B)).await.unwrap();
-        let took = wait_for_copy(&copy, |r| !r.tenants.contains_key(TENANT_B)).await;
-        assert!(took < Duration::from_secs(1), "{took:?}");
-        // The copy keeps the highest generation it saw of a tenant that is gone
-        let doc = copy.read().await.unwrap().unwrap();
-        assert_eq!(doc.highest_generations.get(TENANT_B), Some(&2));
-        assert_eq!(doc.highest_generations.get(TENANT), Some(&3));
-
-        // Every object deleted under a running controller: the copy is not overwritten with
-        // nothing
-        p.write_all_records(&Records::empty(), true).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let doc = copy.read().await.unwrap().unwrap();
-        assert!(!doc.records.is_empty());
-
-        // A controller whose records are empty while the copy is not refuses to start.
-        let (kubeconfig, empty) = test_namespace().await.unwrap();
-        let fresh = Persistence::new_kubernetes(Some(&kubeconfig), Some(empty), Some(config))
-            .await
-            .unwrap();
-        let err = fresh.migration_run().await.unwrap_err();
-        assert!(err.to_string().contains("storcon_records restore"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn the_tool_copies_both_ways_and_refuses_what_it_must() {
-        let Some((stores, first_db)) = both().await else {
-            return;
-        };
-        let pg = stores.open(Store::Postgres, true).await.unwrap();
-        fill(&pg).await;
-
-        assert_eq!(
-            copy(&stores, Store::Postgres, Store::Kubernetes, false)
-                .await
-                .unwrap(),
-            Outcome::Done
-        );
-        let (cmp, counts) = compare(&stores, Store::Postgres, Store::Kubernetes)
-            .await
-            .unwrap();
-        assert_eq!(cmp, Outcome::Done);
-        assert_eq!(counts["shards"], (5, 5));
-        assert_eq!(counts["pendingOps"], (2, 2));
-        // A destination that holds records is not written without --replace
-        assert!(matches!(
-            copy(&stores, Store::Postgres, Store::Kubernetes, false)
-                .await
-                .unwrap(),
-            Outcome::Refused(_)
-        ));
-        assert_eq!(
-            copy(&stores, Store::Postgres, Store::Kubernetes, true)
-                .await
-                .unwrap(),
-            Outcome::Done
-        );
-
-        // And back, into another database
-        let second = Stores {
-            database_url: Some(test_database().await.unwrap()),
-            ..stores.clone()
-        };
-        assert_eq!(
-            copy(&second, Store::Kubernetes, Store::Postgres, false)
-                .await
-                .unwrap(),
-            Outcome::Done
-        );
-        let first = Stores {
-            database_url: Some(first_db),
-            ..stores.clone()
-        };
-        let (a, _) = first.read(Store::Postgres).await.unwrap();
-        let (b, _) = second.read(Store::Postgres).await.unwrap();
-        assert_eq!(a.diff(&b).unwrap(), Vec::<String>::new());
-
-        // A difference is found and named
-        pg.increment_generation(shard_id(TENANT_B, 1, 2), NodeId(1))
-            .await
-            .unwrap();
-        match compare(&stores, Store::Postgres, Store::Kubernetes)
-            .await
-            .unwrap()
-            .0
-        {
-            Outcome::Differ(d) => assert_eq!(
-                d,
-                vec![format!("tenants.{TENANT_B}.shards[1].generation: 2 != 1")]
-            ),
-            o => panic!("{o:?}"),
-        }
-
-        // Nothing is written while a pageserver of the records answers
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let k8s = stores.open(Store::Kubernetes, true).await.unwrap();
-        k8s.insert_node(
-            &crate::node::Node::from_persistent(
-                crate::persistence::NodePersistence {
-                    listen_http_addr: "127.0.0.1".to_string(),
-                    listen_http_port: port as i32,
-                    ..node_row(7)
-                },
-                false,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        match copy(&second, Store::Kubernetes, Store::Postgres, true)
-            .await
-            .unwrap()
-        {
-            Outcome::Refused(reason) => assert!(reason.contains("pageserver 7"), "{reason}"),
-            o => panic!("{o:?}"),
-        }
-        drop(listener);
-        assert_eq!(
-            copy(&second, Store::Kubernetes, Store::Postgres, true)
-                .await
-                .unwrap(),
-            Outcome::Done
-        );
-    }
-
-    #[tokio::test]
-    async fn a_restore_raises_every_generation_and_is_refused_while_a_pageserver_runs() {
-        let Some((kubeconfig, namespace)) = test_namespace().await else {
-            return;
-        };
-        let bucket = camino_tempfile::tempdir().unwrap();
-        let copy_config = local_storage(bucket.path());
-        let config = RemoteStorageConfig::from_toml_str(&copy_config).unwrap();
-        let p = Arc::new(
-            Persistence::new_kubernetes(
-                Some(&kubeconfig),
-                Some(namespace.clone()),
-                Some(config.clone()),
-            )
-            .await
-            .unwrap(),
-        );
-        p.migration_run().await.unwrap();
-        fill(&p).await;
-        let before = p.read_all_records().await.unwrap();
-        let copy_reader = BucketCopy::new(&config).await.unwrap();
-        wait_for_copy(&copy_reader, |r| r.diff(&before).unwrap().is_empty()).await;
-
-        // The pageservers' store saw a newer generation of TENANT_B than the copy holds
-        let store = camino_tempfile::tempdir().unwrap();
-        let index = store.path().join(format!(
-            "tenants/{TENANT_B}-0102/timelines/{TIMELINE}/index_part.json-00000009"
-        ));
-        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
-        std::fs::write(&index, b"{}").unwrap();
-
-        // The cluster loses every object, and its controller with it
-        p.stop_copy();
-        p.write_all_records(&Records::empty(), true).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let kept = copy_reader.read().await.unwrap().unwrap().records;
-        assert_eq!(kept.diff(&before).unwrap(), Vec::<String>::new());
-        let stores = Stores {
-            kubeconfig: Some(kubeconfig.clone()),
-            records_namespace: Some(namespace.clone()),
-            records_copy_storage: Some(copy_config.clone()),
-            ..Default::default()
-        };
-
-        // Refused while a pageserver of the copy answers
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut with_running = before.clone();
-        let ps = with_running.pageservers.get_mut("pageserver-1").unwrap();
-        ps.listen_http_addr = "127.0.0.1".to_string();
-        ps.listen_http_port = listener.local_addr().unwrap().port() as i32;
-        let running_bucket = camino_tempfile::tempdir().unwrap();
-        let running_config = local_storage(running_bucket.path());
-        BucketCopy::new(&RemoteStorageConfig::from_toml_str(&running_config).unwrap())
-            .await
-            .unwrap()
-            .write(&with_running, &BTreeMap::new())
-            .await
-            .unwrap();
-        let running = Stores {
-            records_copy_storage: Some(running_config),
-            ..stores.clone()
-        };
-        let (outcome, _) = restore(
-            &running,
-            Store::Kubernetes,
-            &local_storage(store.path()),
-            None,
-            false,
-            1000,
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(outcome, Outcome::Refused(ref r) if r.contains("pageserver 1")),
-            "{outcome:?}"
-        );
-        drop(listener);
-
-        let (outcome, report) = restore(
-            &stores,
-            Store::Kubernetes,
-            &local_storage(store.path()),
-            None,
-            false,
-            1000,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, Outcome::Done);
-        assert_eq!(report.shards_raised, 5);
-        // No safekeeper of these records runs, so each timeline keeps the copy's membership
-        assert_eq!(report.timelines_no_safekeeper_answered.len(), 1);
-        let after = p.read_all_records().await.unwrap();
-        let g = |r: &Records, t: &str| {
-            r.tenants[t]
-                .shards
-                .iter()
-                .map(|s| s.generation)
-                .collect::<Vec<_>>()
-        };
-        // TENANT: highest in the copy 3 (the parent and its children carry it); TENANT_B: the store's 9
-        assert_eq!(g(&before, TENANT), vec![Some(3), Some(3), Some(3)]);
-        assert_eq!(g(&after, TENANT), vec![Some(1003), Some(1003), Some(1003)]);
-        assert_eq!(g(&after, TENANT_B), vec![Some(1009), Some(1009)]);
-        // Everything but the generations is as the copy holds it
-        let mut same = after.clone();
-        for (name, t) in &mut same.tenants {
-            for (s, b) in t.shards.iter_mut().zip(&before.tenants[name].shards) {
-                s.generation = b.generation;
-            }
-        }
-        assert_eq!(same.diff(&before).unwrap(), Vec::<String>::new());
-
-        // The controller starts on the restored records
-        let restarted =
-            Persistence::new_kubernetes(Some(&kubeconfig), Some(namespace), Some(config))
-                .await
-                .unwrap();
-        restarted.migration_run().await.unwrap();
-    }
-
-    #[test]
-    fn a_key_names_the_generation_it_was_written_with() {
-        let t = "1f359dd625e519a1a4e8d7509690f6fc";
-        let tenant = TenantId::from_str(t).unwrap();
-        assert_eq!(
-            key_generation(&format!(
-                "tenants/{t}-0102/timelines/de200bd42b49cc1814412c7e592dd6e9/index_part.json-0000000a"
-            )),
-            Some((tenant, 10))
-        );
-        assert_eq!(
-            key_generation(&format!("tenants/{t}/tenant-manifest-0000002f.json")),
-            Some((tenant, 47))
-        );
-        assert_eq!(
-            key_generation(&format!(
-                "tenants/{t}/timelines/de200bd42b49cc1814412c7e592dd6e9/000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__0000000001696070-00000000016960E9-v1-00000003"
-            )),
-            Some((tenant, 3))
-        );
-        assert_eq!(
-            key_generation(&format!("tenants/{t}/heatmap-v1.json")),
-            None
-        );
-        assert_eq!(
-            key_generation("tenants/not-a-tenant/index_part.json-00000001"),
-            None
-        );
-        assert_eq!(key_generation(&format!("other/{t}/x-00000001")), None);
-    }
-
-    #[test]
-    fn a_restore_sets_every_shard_above_the_copy_and_the_store() {
-        let shard = |n: i32, generation: Option<i32>| ShardRecord {
-            shard_number: n,
-            shard_count: 2,
-            shard_stripe_size: 2048,
-            generation,
-            generation_pageserver: Some(1),
-            placement_policy: r#"{"Attached":1}"#.to_string(),
-            splitting: SplitState::Idle,
-            config: "{}".to_string(),
-            scheduling_policy: r#""Active""#.to_string(),
-            preferred_az_id: None,
-        };
-        let a = "1f359dd625e519a1a4e8d7509690f6fc";
-        let b = "2c4f2a6b8f1e4d0c9a7b6e5d4c3b2a19";
-        let c = "3d5a3b7c9f2e5d1cab8c7f6e5d4c3b2a";
-        let mut r = Records::empty();
-        for (t, shards) in [
-            (a, vec![shard(0, Some(7)), shard(1, Some(9))]),
-            (b, vec![shard(0, Some(4))]),
-            (c, vec![shard(0, None)]),
-        ] {
-            r.tenants.insert(
-                t.to_string(),
-                TenantSpec {
-                    tenant_id: t.to_string(),
-                    shards,
-                },
-            );
-        }
-        // The store saw a newer generation of a than the copy, and an older one of b.
-        let in_store = BTreeMap::from([
-            (TenantId::from_str(a).unwrap(), 12),
-            (TenantId::from_str(b).unwrap(), 2),
-        ]);
-        assert_eq!(raise_generations(&mut r, &in_store, 1000), 3);
-        let g = |t: &str| {
-            r.tenants[t]
-                .shards
-                .iter()
-                .map(|s| s.generation)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(g(a), vec![Some(1012), Some(1012)]);
-        assert_eq!(g(b), vec![Some(1004)]);
-        // A shard never attached, with nothing in the store, stays without a generation.
-        assert_eq!(g(c), vec![None]);
-    }
-}
+mod tests;

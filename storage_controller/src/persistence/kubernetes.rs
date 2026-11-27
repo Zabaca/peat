@@ -8,6 +8,7 @@
 //! controller relies on for generations (an increment, a split's begin, completion and abort,
 //! one tenant's part of a re-attach) is one write of one object.
 
+pub(crate) mod checks;
 pub(crate) mod copy;
 pub(crate) mod objects;
 
@@ -54,14 +55,34 @@ const RE_ATTACH_CONCURRENCY: usize = 32;
 /// The page size of a list.
 const LIST_PAGE: u32 = 500;
 
+/// The Kubernetes store's settings, beside its client and namespace.
+#[derive(Clone, Default)]
+pub(crate) struct Settings {
+    /// The copy in the bucket (`--records-copy-storage`); none only with `--dev`.
+    pub(crate) copy: Option<Arc<copy::BucketCopy>>,
+    /// This controller's `--address-for-peers`, which the Leader record names while it leads.
+    pub(crate) own_address: Option<String>,
+    /// A generation is not raised while the copy is further behind than this
+    /// (`--records-copy-max-lag`); none for no limit.
+    pub(crate) copy_max_lag: Option<std::time::Duration>,
+    /// `--records-accept-deleted`, by record key.
+    pub(crate) accept_deleted: std::collections::BTreeSet<String>,
+    /// `--records-start-without-copy`, still within its time.
+    pub(crate) start_without_copy: bool,
+}
+
 pub(crate) struct KubernetesStore {
     client: kube::Client,
     namespace: String,
-    /// The copy in the bucket, when one is configured; written from the start check on.
-    copy: Option<Arc<copy::BucketCopy>>,
-    /// Stops the copy's writing.
+    settings: Settings,
+    copy_state: Arc<copy::CopyState>,
+    /// Stops the copy's writing (on stepping down).
     copy_cancel: CancellationToken,
-    guard: Guard,
+    /// The copy's writer, while this controller leads.
+    writer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What the start found to do once this controller leads.
+    pending: std::sync::Mutex<checks::Verdict>,
+    guard: Arc<Guard>,
     /// One write at a time per object within this controller (`storage_controller/kubernetes/
     /// README.md`): a tenant with many shards reconciling at once queues here instead of
     /// spending its retries on conflicts with itself. The compare-and-swap still guards against
@@ -73,10 +94,14 @@ type Locks = std::sync::Mutex<HashMap<(&'static str, String), Arc<tokio::sync::M
 
 /// What this controller has seen of each object, so a read that finds one older than that (the
 /// cluster's store taken back under it) is caught before anything is written or answered from it.
-struct Guard {
+pub(crate) struct Guard {
     seen: std::sync::Mutex<HashMap<(&'static str, String), Seen>>,
     /// Exit the process when the records went back (the controller); tests only record it.
     exit: bool,
+    /// Set once the records went back: from then on nothing is read, written or answered.
+    halted: std::sync::atomic::AtomicBool,
+    /// Where the went-back record is written before the controller exits.
+    copy: Option<Arc<copy::BucketCopy>>,
 }
 
 #[derive(Clone, Copy)]
@@ -87,20 +112,107 @@ struct Seen {
 }
 
 impl Guard {
-    fn went_back(&self, what: String) -> DatabaseError {
-        tracing::error!(
-            "The records went back under this controller ({what}): the cluster's store was \
-             taken back, or lost objects. Writing nothing more and exiting; the next start \
-             checks every record against the copy."
-        );
-        if self.exit {
-            std::process::exit(1);
+    fn new(exit: bool, copy: Option<Arc<copy::BucketCopy>>) -> Self {
+        Guard {
+            seen: Default::default(),
+            exit,
+            halted: Default::default(),
+            copy,
+        }
+    }
+
+    fn halted(&self) -> DatabaseResult<()> {
+        if self.halted.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(DatabaseError::Logical(
+                "the records went back under this controller: it answers nothing until it has \
+                 recorded that in the bucket and exited"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The records went back: answer nothing from now on, write the went-back record to the
+    /// bucket (with every revision seen, so the next start refuses even if the copy is behind),
+    /// and exit once it is written; while the bucket cannot be written, stay up, answering
+    /// nothing.
+    pub(crate) fn went_back_now(&self, what: String) -> DatabaseError {
+        let first = !self.halted.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if first {
+            tracing::error!(
+                "The records went back under this controller ({what}): the cluster's store was \
+                 taken back, or lost objects. Writing nothing more; recording it in the bucket, \
+                 then exiting, so the next start refuses until a restore."
+            );
+            let record = copy::WentBack {
+                at: chrono::Utc::now(),
+                what: what.clone(),
+                seen: self.snapshot(),
+            };
+            let exit = self.exit;
+            match self.copy.clone() {
+                Some(bucket) => {
+                    tokio::spawn(async move {
+                        loop {
+                            match bucket.write_went_back(&record).await {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "writing the went-back record failed, retrying: {e:#}"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                }
+                            }
+                        }
+                        tracing::error!("the went-back record is written; exiting");
+                        if exit {
+                            std::process::exit(1);
+                        }
+                    });
+                }
+                None => {
+                    if exit {
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
         DatabaseError::Logical(format!("the records went back: {what}"))
     }
 
+    fn went_back(&self, what: String) -> DatabaseError {
+        self.went_back_now(what)
+    }
+
+    /// The highest revision seen of each record.
+    fn snapshot(&self) -> BTreeMap<String, u64> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((kind, name), s)| (copy::record_key(kind, name), s.revision))
+            .collect()
+    }
+
+    /// Take note of a revision (a watch event, or what the start read) without comparing it.
+    fn saw<S: Spec>(&self, name: &str, revision: u64, deleted: bool) {
+        self.saw_kind(S::KIND, name, revision, deleted);
+    }
+
+    fn saw_kind(&self, kind: &'static str, name: &str, revision: u64, deleted: bool) {
+        let mut seen = self.seen.lock().unwrap();
+        let e = seen
+            .entry((kind, name.to_string()))
+            .or_insert(Seen { revision, deleted });
+        if revision > e.revision || (revision == e.revision && deleted) {
+            *e = Seen { revision, deleted };
+        }
+    }
+
     /// Check an object read from the API server against what this controller has seen of it.
     fn observe<S: Spec>(&self, obj: &Object<S>) -> DatabaseResult<()> {
+        self.halted()?;
         let revision = obj.revision()?;
         let mut seen = self.seen.lock().unwrap();
         let key = (S::KIND, obj.name().to_string());
@@ -128,6 +240,7 @@ impl Guard {
 
     /// Check that an object found absent was not one this controller saw and did not delete.
     fn observe_absent<S: Spec>(&self, name: &str) -> DatabaseResult<()> {
+        self.halted()?;
         let seen = self
             .seen
             .lock()
@@ -183,20 +296,22 @@ enum Write<S> {
 }
 
 impl KubernetesStore {
-    pub(crate) fn new(
-        client: kube::Client,
-        namespace: String,
-        copy: Option<Arc<copy::BucketCopy>>,
-    ) -> Self {
+    pub(crate) fn new(client: kube::Client, namespace: String, settings: Settings) -> Self {
+        let guard = Arc::new(Guard::new(!cfg!(test), settings.copy.clone()));
+        let copy_state = copy::CopyState::new();
+        // With no copy (--dev) there is nothing to read before making things.
+        copy_state
+            .read
+            .store(settings.copy.is_none(), std::sync::atomic::Ordering::SeqCst);
         KubernetesStore {
             client,
             namespace,
-            copy,
+            settings,
+            copy_state: Arc::new(copy_state),
             copy_cancel: CancellationToken::new(),
-            guard: Guard {
-                seen: Default::default(),
-                exit: !cfg!(test),
-            },
+            writer: Default::default(),
+            pending: Default::default(),
+            guard,
             locks: Default::default(),
         }
     }
@@ -204,29 +319,35 @@ impl KubernetesStore {
     /// Return an error when the records went back, instead of exiting (tests).
     #[cfg(test)]
     pub(crate) fn do_not_exit(&mut self) {
-        self.guard.exit = false;
+        Arc::get_mut(&mut self.guard)
+            .expect("set before the store is shared")
+            .exit = false;
     }
 
     /// Another store on the same records, as a second controller would have.
     #[cfg(test)]
     pub(crate) fn second_client(&self) -> Self {
-        KubernetesStore {
-            client: self.client.clone(),
-            namespace: self.namespace.clone(),
-            copy: None,
-            copy_cancel: CancellationToken::new(),
-            guard: Guard {
-                seen: Default::default(),
-                exit: false,
-            },
-            locks: Default::default(),
-        }
+        KubernetesStore::new(
+            self.client.clone(),
+            self.namespace.clone(),
+            Settings::default(),
+        )
     }
 
     /// Stop writing the copy, as a controller lost with its cluster stops.
     #[cfg(test)]
     pub(crate) fn stop_copy(&self) {
         self.copy_cancel.cancel();
+    }
+
+    /// Stepping down: stop writing the copy, and let a write under way finish first, so the
+    /// controller taking over reads a copy no one is still writing.
+    pub(crate) async fn step_down(&self) {
+        self.copy_cancel.cancel();
+        let writer = self.writer.lock().unwrap().take();
+        if let Some(w) = writer {
+            let _ = w.await;
+        }
     }
 
     fn api<S: Spec>(&self) -> Api<Object<S>> {
@@ -347,6 +468,18 @@ impl KubernetesStore {
             let written = match (write, current) {
                 (Write::Keep, _) | (Write::Delete, None) => return Ok(result),
                 (Write::Put(spec), None) => {
+                    // A create starts above the name's mark and the copy's revision, so until
+                    // both are read (only under --records-start-without-copy) nothing is made.
+                    if !self
+                        .copy_state
+                        .read
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Err(DatabaseError::Logical(format!(
+                            "{} {name} is not made before the copy and its marks are read",
+                            S::KIND
+                        )));
+                    }
                     let obj = Object::new(name, spec, self.guard.next_revision::<S>(name));
                     match self.write_strict(None, &obj).await {
                         Ok(stored) => self.stored(name, &obj, &stored),
@@ -363,6 +496,8 @@ impl KubernetesStore {
                     }
                 }
                 (Write::Delete, Some(current)) => {
+                    // The mark first, at the revision read: the delete waits for it.
+                    self.write_mark::<S>(name, current.revision()?).await?;
                     let params = DeleteParams {
                         preconditions: Some(Preconditions {
                             resource_version: current.metadata.resource_version.clone(),
@@ -408,9 +543,11 @@ impl KubernetesStore {
         Ok(())
     }
 
-    /// The controller's check at start, in place of the Postgres store's migrations: every
-    /// kind is installed and readable in the records' namespace.
-    pub(crate) async fn migration_run(&self) -> DatabaseResult<()> {
+    pub(crate) async fn check_kinds(&self) -> DatabaseResult<()> {
+        self.kinds_readable().await
+    }
+
+    async fn kinds_readable(&self) -> DatabaseResult<()> {
         async fn readable<S: Spec>(store: &KubernetesStore) -> DatabaseResult<()> {
             match store.api::<S>().list(&ListParams::default().limit(1)).await {
                 Ok(_) => Ok(()),
@@ -428,45 +565,380 @@ impl KubernetesStore {
         readable::<TimelineSpec>(self).await?;
         readable::<PageserverSpec>(self).await?;
         readable::<SafekeeperSpec>(self).await?;
-        readable::<LeaderSpec>(self).await?;
+        readable::<LeaderSpec>(self).await
+    }
+
+    /// Every object's revision, by record key, read straight from the API server.
+    async fn object_revisions(&self) -> DatabaseResult<BTreeMap<String, u64>> {
+        async fn of<S: Spec>(
+            store: &KubernetesStore,
+            out: &mut BTreeMap<String, u64>,
+        ) -> DatabaseResult<()> {
+            let api = store.api::<S>();
+            let mut params = ListParams::default().limit(LIST_PAGE);
+            loop {
+                let page = api.list(&params).await?;
+                for o in &page.items {
+                    out.insert(copy::record_key(S::KIND, o.name()), o.revision()?);
+                }
+                match page.metadata.continue_ {
+                    Some(t) if !t.is_empty() => params = params.continue_token(&t),
+                    _ => return Ok(()),
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        of::<TenantSpec>(self, &mut out).await?;
+        of::<MetadataHealthSpec>(self, &mut out).await?;
+        of::<TimelineSpec>(self, &mut out).await?;
+        of::<PageserverSpec>(self, &mut out).await?;
+        of::<SafekeeperSpec>(self, &mut out).await?;
+        of::<LeaderSpec>(self, &mut out).await?;
+        Ok(out)
+    }
+
+    /// The checks at start (`storage_controller/kubernetes/README.md`, "At start"), run before
+    /// a controller started as a candidate asks the leader to step down. They only read: what
+    /// they find to do is done by [`Self::migration_run`], once this controller leads.
+    pub(crate) async fn start_checks(&self) -> DatabaseResult<()> {
+        self.kinds_readable().await?;
+        let Some(bucket) = self.settings.copy.clone() else {
+            // --dev with no copy: nothing to compare with.
+            self.copy_state
+                .read
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        };
+        match self.read_and_judge(&bucket).await {
+            Ok(()) => Ok(()),
+            Err(Unread(e)) if self.settings.start_without_copy => {
+                tracing::warn!(
+                    "starting without the copy (--records-start-without-copy): {e:#}; a store \
+                     taken back goes unseen until it is read, and no create is made until then"
+                );
+                let store_copy = bucket.clone();
+                let guard = self.guard.clone();
+                let state = self.copy_state.clone();
+                let client = self.client.clone();
+                let namespace = self.namespace.clone();
+                let settings = self.settings.clone();
+                tokio::spawn(async move {
+                    let later = KubernetesStore {
+                        client,
+                        namespace,
+                        settings,
+                        copy_state: state,
+                        copy_cancel: CancellationToken::new(),
+                        writer: Default::default(),
+                        pending: Default::default(),
+                        guard,
+                        locks: Default::default(),
+                    };
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        match later.read_and_judge(&store_copy).await {
+                            Ok(()) => {
+                                tracing::info!("the copy is read; its checks passed");
+                                return;
+                            }
+                            Err(Unread(e)) => tracing::warn!("the copy cannot be read yet: {e:#}"),
+                            Err(Refused(e)) => {
+                                let _ = later.guard.went_back_now(e.to_string());
+                                return;
+                            }
+                        }
+                    }
+                });
+                Ok(())
+            }
+            Err(Unread(e)) => Err(DatabaseError::Logical(format!(
+                "the copy of the records cannot be read, so whether they went back cannot be \
+                 told; starting refused (--records-start-without-copy overrides, at a risk): {e:#}"
+            ))),
+            Err(Refused(e)) => Err(e),
+        }
+    }
+
+    /// Read the copy, then the objects, then the marks, and judge every record; on success note
+    /// what was seen and what is to be done.
+    async fn read_and_judge(&self, bucket: &copy::BucketCopy) -> Result<(), StartError> {
+        if let Some(w) = bucket.read_went_back().await.map_err(Unread)? {
+            return Err(Refused(DatabaseError::Logical(format!(
+                "a controller found the records went back at {} ({}), and recorded it in the \
+                 bucket: restore them with `storcon_records restore` before starting",
+                w.at, w.what
+            ))));
+        }
+        let doc = bucket.read().await.map_err(Unread)?;
+        let objects = self.object_revisions().await.map_err(Refused)?;
+        let marks = bucket.read_marks().await.map_err(Unread)?;
+
+        let copy_revisions = doc
+            .as_ref()
+            .map(|d| d.revisions.clone())
+            .unwrap_or_default();
+        let objects_hold_any = objects.keys().any(|k| {
+            k.starts_with("Tenant/") || k.starts_with("Pageserver/") || k.starts_with("Safekeeper/")
+        });
+        if let Some(d) = &doc {
+            if !objects_hold_any && !d.records.is_empty() {
+                return Err(Refused(DatabaseError::Logical(format!(
+                    "the records in namespace {} are empty but the copy in the bucket (written \
+                     {}) holds {:?}: restore them with `storcon_records restore` before starting",
+                    self.namespace,
+                    d.written_at,
+                    d.records.counts()
+                ))));
+            }
+        }
+        let verdict = checks::classify(
+            &objects,
+            &copy_revisions,
+            &marks,
+            &self.settings.accept_deleted,
+        );
+        if verdict.refuses() {
+            return Err(Refused(DatabaseError::Logical(format!(
+                "records went back or went missing, compared with the copy in the bucket{}: \
+                 went back {:?}; missing {:?}; named by --records-accept-deleted but not \
+                 missing {:?}. Restore them with `storcon_records restore`, or, for records \
+                 deleted without a mark, name them in --records-accept-deleted",
+                doc.as_ref()
+                    .map(|d| format!(" (written {})", d.written_at))
+                    .unwrap_or_default(),
+                verdict.went_back,
+                verdict.missing,
+                verdict.wrongly_accepted
+            ))));
+        }
+
+        // What was seen: the marks (deleted at their revision), the copy's revisions, then the
+        // objects (a delete to finish stays live until it is done).
+        for (key, m) in &marks {
+            if let Some((kind, name)) = split_key(key) {
+                self.guard.saw_kind(kind, name, m.revision, true);
+            }
+        }
+        for (key, &c) in &copy_revisions {
+            if let Some((kind, name)) = split_key(key) {
+                self.guard.saw_kind(kind, name, c, false);
+            }
+        }
+        for (key, &r) in &objects {
+            if let Some((kind, name)) = split_key(key) {
+                self.guard
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .entry((kind, name.to_string()))
+                    .and_modify(|s| {
+                        if r >= s.revision {
+                            *s = Seen {
+                                revision: r,
+                                deleted: false,
+                            }
+                        }
+                    })
+                    .or_insert(Seen {
+                        revision: r,
+                        deleted: false,
+                    });
+            }
+        }
+        {
+            let mut held = self.copy_state.marks.lock().unwrap();
+            for (k, m) in marks {
+                let e = held.entry(k).or_insert(m);
+                if m.revision > e.revision {
+                    *e = m;
+                }
+            }
+        }
+        {
+            let mut last = self.copy_state.last.lock().unwrap();
+            let newer = match (&*last, &doc) {
+                (Some(l), Some(d)) => d.written_at >= l.written_at,
+                _ => true,
+            };
+            if newer {
+                if let Some(d) = doc {
+                    let mut d = d;
+                    d.merge_highest(last.as_ref());
+                    *last = Some(d);
+                }
+            }
+        }
+        *self.pending.lock().unwrap() = verdict;
+        self.copy_state
+            .read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Once this controller leads (after the leader stepped down, before the records are
+    /// loaded): read the copy and the marks again (another controller may have written them
+    /// since the start's checks), do what the checks found to do, and start writing the copy.
+    pub(crate) async fn migration_run(&self) -> DatabaseResult<()> {
+        self.kinds_readable().await?;
+        if let Some(bucket) = self.settings.copy.clone() {
+            if self
+                .copy_state
+                .read
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                match self.read_and_judge(&bucket).await {
+                    Ok(()) => {}
+                    Err(Unread(e)) => {
+                        return Err(DatabaseError::Logical(format!(
+                            "reading the copy again on taking over failed: {e:#}"
+                        )));
+                    }
+                    Err(Refused(e)) => return Err(e),
+                }
+            }
+            let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+            for key in &pending.unfinished {
+                self.finish_delete(key).await?;
+            }
+            for key in &pending.accepted {
+                let revision = self
+                    .copy_state
+                    .last
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|d| d.revisions.get(key).copied())
+                    .unwrap_or(0);
+                let mark = copy::Mark {
+                    revision,
+                    accepted: true,
+                };
+                bucket
+                    .write_mark(key, mark)
+                    .await
+                    .map_err(|e| DatabaseError::Logical(format!("writing a mark: {e:#}")))?;
+                self.copy_state
+                    .marks
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), mark);
+                if let Some((kind, name)) = split_key(key) {
+                    self.guard.saw_kind(kind, name, revision, true);
+                }
+                tracing::info!("{key} accepted as deleted (--records-accept-deleted)");
+            }
+        }
         self.sweep_orphaned_health().await?;
         tracing::info!(
             "Records are kept in Kubernetes objects in namespace {}",
             self.namespace
         );
-
-        if let Some(copy) = &self.copy {
-            // Records lost with their cluster would otherwise start again from nothing: every
-            // pageserver told to drop its tenants, and generations the store has seen handed
-            // out again. Only a restore from the copy goes on from here.
-            let empty = self.list::<TenantSpec>(None).await?.is_empty()
-                && self.list::<PageserverSpec>(None).await?.is_empty()
-                && self.list::<SafekeeperSpec>(None).await?.is_empty();
-            if empty {
-                let held = copy.read().await.map_err(|e| {
-                    DatabaseError::Logical(format!(
-                        "the records are empty, and the copy in the bucket cannot be read to \
-                         check that it is too: {e:#}"
-                    ))
-                })?;
-                if let Some(doc) = held.filter(|d| !d.records.is_empty()) {
-                    return Err(DatabaseError::Logical(format!(
-                        "the records in namespace {} are empty but the copy in the bucket \
-                         (written {}) holds {:?}: restore them with `storcon_records restore` \
-                         before starting the controller",
-                        self.namespace,
-                        doc.written_at,
-                        doc.records.counts()
-                    )));
-                }
-            }
-            copy::spawn(
-                self.client.clone(),
-                self.namespace.clone(),
-                copy.clone(),
+        if let Some(bucket) = self.settings.copy.clone() {
+            let handle = copy::spawn(
+                copy::Writer {
+                    client: self.client.clone(),
+                    namespace: self.namespace.clone(),
+                    copy: bucket,
+                    state: self.copy_state.clone(),
+                    guard: self.guard.clone(),
+                    own_address: self.settings.own_address.clone(),
+                },
                 self.copy_cancel.child_token(),
             );
+            *self.writer.lock().unwrap() = Some(handle);
             tracing::info!("Records are copied to the bucket within a second of each change");
+        }
+        Ok(())
+    }
+
+    /// Finish a delete decided and not done (an object exactly at its mark's revision).
+    async fn finish_delete(&self, key: &str) -> DatabaseResult<()> {
+        let Some((kind, name)) = split_key(key) else {
+            return Ok(());
+        };
+        let Some(mark) = self.copy_state.mark(kind, name) else {
+            return Ok(());
+        };
+        macro_rules! finish {
+            ($spec:ty) => {{
+                let api = self.api::<$spec>();
+                if let Some(o) = api.get_opt(name).await? {
+                    if o.revision()? == mark.revision {
+                        let params = DeleteParams {
+                            preconditions: Some(Preconditions {
+                                resource_version: o.metadata.resource_version.clone(),
+                                uid: o.metadata.uid.clone(),
+                            }),
+                            ..Default::default()
+                        };
+                        match api.delete(name, &params).await {
+                            Ok(_) => {}
+                            Err(e) if is_not_found(&e) => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                        self.guard.saw::<$spec>(name, mark.revision, true);
+                        tracing::info!("{key}: finished a delete decided before a restart");
+                    }
+                }
+            }};
+        }
+        match kind {
+            k if k == TenantSpec::KIND => finish!(TenantSpec),
+            k if k == MetadataHealthSpec::KIND => finish!(MetadataHealthSpec),
+            k if k == TimelineSpec::KIND => finish!(TimelineSpec),
+            k if k == PageserverSpec::KIND => finish!(PageserverSpec),
+            k if k == SafekeeperSpec::KIND => finish!(SafekeeperSpec),
+            k if k == LeaderSpec::KIND => finish!(LeaderSpec),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Write the deletion mark of an object about to be deleted, at the revision read.
+    async fn write_mark<S: Spec>(&self, name: &str, revision: u64) -> DatabaseResult<()> {
+        let Some(bucket) = &self.settings.copy else {
+            return Ok(());
+        };
+        let key = copy::record_key(S::KIND, name);
+        let mark = copy::Mark {
+            revision,
+            accepted: false,
+        };
+        bucket.write_mark(&key, mark).await.map_err(|e| {
+            DatabaseError::Logical(format!(
+                "the deletion mark of {key} cannot be written to the bucket, so it is not \
+                 deleted yet: {e:#}"
+            ))
+        })?;
+        let mut marks = self.copy_state.marks.lock().unwrap();
+        let e = marks.entry(key).or_insert(mark);
+        if mark.revision > e.revision {
+            *e = mark;
+        }
+        Ok(())
+    }
+
+    /// An object exactly at its mark is a delete under way (or one the start finished): never
+    /// listed into a re-attach or a validation.
+    fn pending_delete<S: Spec>(&self, obj: &Object<S>) -> bool {
+        self.copy_state
+            .mark(S::KIND, obj.name())
+            .is_some_and(|m| obj.revision().is_ok_and(|r| r == m.revision))
+    }
+
+    /// No generation is raised while the copy is further behind than `--records-copy-max-lag`:
+    /// a generation the copy does not hold, lost with the objects, could be issued again.
+    fn copy_current_enough(&self) -> DatabaseResult<()> {
+        if let (Some(_), Some(max)) = (&self.settings.copy, self.settings.copy_max_lag) {
+            let behind = self.copy_state.behind();
+            if behind > max {
+                return Err(DatabaseError::Logical(format!(
+                    "the copy of the records in the bucket is {}s behind (more than \
+                     --records-copy-max-lag, {}s): no generation is raised until it catches up",
+                    behind.as_secs(),
+                    max.as_secs()
+                )));
+            }
         }
         Ok(())
     }
@@ -740,9 +1212,13 @@ impl KubernetesStore {
             // One compare-and-swap per tenant with a shard on this node. Each is safe to repeat:
             // a controller that stops halfway is finished by the pageserver's retry, and a
             // generation may then skip a number, never repeat one.
-            let tenants = self
+            self.copy_current_enough()?;
+            let tenants: Vec<_> = self
                 .list::<TenantSpec>(Some(&generation_label(node)))
-                .await?;
+                .await?
+                .into_iter()
+                .filter(|t| !self.pending_delete(t))
+                .collect();
             let incremented: Vec<Vec<TenantShardPersistence>> =
                 futures::stream::iter(tenants.into_iter().map(|t| {
                     let name = t.metadata.name.clone().unwrap_or_default();
@@ -830,6 +1306,7 @@ impl KubernetesStore {
         node_id: NodeId,
     ) -> anyhow::Result<Generation> {
         let key = shard_key(&tenant_shard_id);
+        self.copy_current_enough()?;
         let generation = self
             .measured(
                 DatabaseOperation::IncrementGeneration,
@@ -926,6 +1403,7 @@ impl KubernetesStore {
                 .list::<TenantSpec>(Some(&generation_label(node_id.0 as i64)))
                 .await?
                 .into_iter()
+                .filter(|o| !self.pending_delete(o))
                 .map(|o| (o.spec.tenant_id.clone(), o.spec))
                 .collect();
             Ok(wanted
@@ -1968,80 +2446,124 @@ impl KubernetesStore {
     }
 }
 
-/// Every record at once, for the copy tool and the copy in the bucket.
+/// Every record at once, for the copy tool.
 impl KubernetesStore {
-    async fn all<S: Spec>(&self) -> DatabaseResult<BTreeMap<String, S>> {
-        Ok(self
-            .list::<S>(None)
-            .await?
-            .into_iter()
-            .map(|o| (o.metadata.name.unwrap_or_default(), o.spec))
-            .collect())
+    async fn all<S: Spec>(&self) -> DatabaseResult<BTreeMap<String, (S, u64)>> {
+        let mut out = BTreeMap::new();
+        for o in self.list::<S>(None).await? {
+            let rev = o.revision()?;
+            out.insert(o.name().to_string(), (o.spec, rev));
+        }
+        Ok(out)
+    }
+
+    /// Every record, and each one's revision by record key.
+    pub(crate) async fn read_all_with_revisions(
+        &self,
+    ) -> DatabaseResult<(super::records::Records, BTreeMap<String, u64>)> {
+        fn take<S: Spec>(
+            m: BTreeMap<String, (S, u64)>,
+            revisions: &mut BTreeMap<String, u64>,
+        ) -> BTreeMap<String, S> {
+            m.into_iter()
+                .map(|(name, (spec, rev))| {
+                    revisions.insert(copy::record_key(S::KIND, &name), rev);
+                    (name, spec)
+                })
+                .collect()
+        }
+        let mut revisions = BTreeMap::new();
+        let mut r = super::records::Records::empty();
+        r.tenants = take(self.all::<TenantSpec>().await?, &mut revisions);
+        r.metadata_health = take(self.all::<MetadataHealthSpec>().await?, &mut revisions);
+        r.timelines = take(self.all::<TimelineSpec>().await?, &mut revisions);
+        r.pageservers = take(self.all::<PageserverSpec>().await?, &mut revisions);
+        r.safekeepers = take(self.all::<SafekeeperSpec>().await?, &mut revisions);
+        r.leader = take(self.all::<LeaderSpec>().await?, &mut revisions).remove(LEADER_OBJECT_NAME);
+        r.drop_orphaned_health();
+        r.sort();
+        Ok((r, revisions))
     }
 
     pub(crate) async fn read_all(&self) -> DatabaseResult<super::records::Records> {
-        let mut r = super::records::Records::empty();
-        r.tenants = self.all().await?;
-        r.metadata_health = self.all().await?;
-        r.timelines = self.all().await?;
-        r.pageservers = self.all().await?;
-        r.safekeepers = self.all().await?;
-        r.leader = self.all::<LeaderSpec>().await?.remove(LEADER_OBJECT_NAME);
-        r.sort();
-        Ok(r)
+        Ok(self.read_all_with_revisions().await?.0)
     }
 
-    /// Write every record as a new object, first deleting every record object there is when
-    /// `replace`.
+    /// Write every record, each at a revision above `floors` (by record key: the copy's and the
+    /// marks' revisions) and above any this store has seen, replacing an object already there.
+    /// With `replace`, an object that is not among the records is removed, its mark written
+    /// first. The revisions written, by record key.
     pub(crate) async fn write_all(
         &self,
         records: &super::records::Records,
         replace: bool,
-    ) -> DatabaseResult<()> {
+        floors: &BTreeMap<String, u64>,
+    ) -> DatabaseResult<BTreeMap<String, u64>> {
         async fn put<S: Spec>(
             store: &KubernetesStore,
-            objects: impl Iterator<Item = (String, S)>,
+            objects: BTreeMap<String, S>,
             replace: bool,
-        ) -> DatabaseResult<()> {
+            floors: &BTreeMap<String, u64>,
+        ) -> DatabaseResult<BTreeMap<String, u64>> {
             let api = store.api::<S>();
+            let held = store.all::<S>().await?;
             if replace {
-                for name in store.all::<S>().await?.into_keys() {
-                    match api.delete(&name, &DeleteParams::default()).await {
-                        Ok(_) => {}
+                for (name, (_, rev)) in &held {
+                    if objects.contains_key(name) {
+                        continue;
+                    }
+                    store.write_mark::<S>(name, *rev).await?;
+                    match api.delete(name, &DeleteParams::default()).await {
+                        Ok(_) => store.guard.saw::<S>(name, *rev, true),
                         Err(e) if is_not_found(&e) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
             }
-            futures::stream::iter(objects.map(|(name, spec)| {
+            let written = futures::stream::iter(objects.into_iter().map(|(name, spec)| {
+                let floor = floors
+                    .get(&copy::record_key(S::KIND, &name))
+                    .copied()
+                    .unwrap_or(0);
+                let current = held.get(&name).map(|(_, rev)| *rev);
                 let api = api.clone();
                 async move {
-                    let obj = Object::new(&name, spec, store.guard.next_revision::<S>(&name));
-                    let stored = api.create(&PostParams::default(), &obj).await?;
-                    check_stored(&name, &obj.spec, &stored.spec)
+                    let revision = floor
+                        .max(current.unwrap_or(0))
+                        .max(store.guard.next_revision::<S>(&name).saturating_sub(1))
+                        + 1;
+                    let mut obj = Object::new(&name, spec, revision);
+                    let stored = match current {
+                        None => store.write_strict(None, &obj).await?,
+                        Some(_) => {
+                            let now = api.get(&name).await?;
+                            obj.metadata.resource_version = now.metadata.resource_version;
+                            store.write_strict(Some(&name), &obj).await?
+                        }
+                    };
+                    store.stored(&name, &obj, &stored)?;
+                    Ok::<_, DatabaseError>((copy::record_key(S::KIND, &name), revision))
                 }
             }))
             .buffer_unordered(RE_ATTACH_CONCURRENCY)
-            .try_collect::<Vec<()>>()
+            .try_collect::<Vec<_>>()
             .await?;
-            Ok(())
+            Ok(written.into_iter().collect())
         }
-        put(self, records.tenants.clone().into_iter(), replace).await?;
-        put(self, records.metadata_health.clone().into_iter(), replace).await?;
-        put(self, records.timelines.clone().into_iter(), replace).await?;
-        put(self, records.pageservers.clone().into_iter(), replace).await?;
-        put(self, records.safekeepers.clone().into_iter(), replace).await?;
-        put(
-            self,
-            records
-                .leader
-                .clone()
-                .map(|l| (LEADER_OBJECT_NAME.to_string(), l))
-                .into_iter(),
-            replace,
-        )
-        .await?;
-        Ok(())
+        let mut revisions = BTreeMap::new();
+        revisions.extend(put(self, records.tenants.clone(), replace, floors).await?);
+        revisions.extend(put(self, records.metadata_health.clone(), replace, floors).await?);
+        revisions.extend(put(self, records.timelines.clone(), replace, floors).await?);
+        revisions.extend(put(self, records.pageservers.clone(), replace, floors).await?);
+        revisions.extend(put(self, records.safekeepers.clone(), replace, floors).await?);
+        let leader: BTreeMap<String, LeaderSpec> = records
+            .leader
+            .clone()
+            .map(|l| (LEADER_OBJECT_NAME.to_string(), l))
+            .into_iter()
+            .collect();
+        revisions.extend(put(self, leader, replace, floors).await?);
+        Ok(revisions)
     }
 }
 
@@ -2073,6 +2595,30 @@ pub(crate) fn skip_proxy_where_excluded(config: &mut kube::Config) {
     if loopback || excluded {
         config.proxy_url = None;
     }
+}
+
+/// Why a start's checks did not pass: the copy or its marks could not be read, or a record
+/// went back or went missing.
+enum StartError {
+    Unread(anyhow::Error),
+    Refused(DatabaseError),
+}
+use StartError::{Refused, Unread};
+
+/// A record key's kind (as the kinds' own constant) and name.
+fn split_key(key: &str) -> Option<(&'static str, &str)> {
+    let (kind, name) = key.split_once('/')?;
+    let kind = [
+        TenantSpec::KIND,
+        MetadataHealthSpec::KIND,
+        TimelineSpec::KIND,
+        PageserverSpec::KIND,
+        SafekeeperSpec::KIND,
+        LeaderSpec::KIND,
+    ]
+    .into_iter()
+    .find(|k| *k == kind)?;
+    Some((kind, name))
 }
 
 /// Neon's upsert of a pending operation: keep at most one per safekeeper, and replace it only

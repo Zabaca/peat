@@ -1,9 +1,14 @@
 //! `storcon_records`: dump, compare and copy the storage controller's records between Postgres
-//! and Kubernetes objects, and rebuild them from the copy in a bucket, with the controller
-//! stopped. storage_controller/kubernetes/README.md, "The copy tool", is its manual.
+//! and Kubernetes objects, scan the pageservers' store for the generations it holds, and rebuild
+//! the records from the copy in a bucket, with the controller stopped.
+//! storage_controller/kubernetes/README.md, "The copy tool", is its manual.
 
-use clap::{Parser, Subcommand};
-use storage_controller::records_tool::{self, DEFAULT_GENERATION_MARGIN, Outcome, Store, Stores};
+use std::collections::BTreeSet;
+
+use clap::{Args, Parser, Subcommand};
+use storage_controller::records_tool::{
+    self, DEFAULT_GENERATION_MARGIN, Outcome, RestoreOptions, Running, Scan, Store, Stores,
+};
 use utils::logging::{self, LogFormat};
 
 #[derive(Parser)]
@@ -20,6 +25,26 @@ struct Cli {
     records_copy_storage: Option<String>,
     #[command(subcommand)]
     command: Command,
+}
+
+/// The check that nothing still runs, for every command that writes.
+#[derive(Args)]
+struct RunningArgs {
+    /// Where the controller is, when the records name no leader (no --address-for-peers)
+    #[arg(long)]
+    controller_address: Option<String>,
+    /// Skip the check that the controller (and pageservers) are stopped, having checked by hand
+    #[arg(long)]
+    assume_stopped: bool,
+}
+
+impl RunningArgs {
+    fn running(&self) -> Running {
+        Running {
+            controller_address: self.controller_address.clone(),
+            assume_stopped: self.assume_stopped,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -51,23 +76,48 @@ enum Command {
         /// Remove what the destination holds first
         #[arg(long)]
         replace: bool,
+        /// Tenants and timelines (`<Kind>/<name>`) remade under their id, whose generations are
+        /// below what the copy has seen
+        #[arg(long, value_delimiter = ',')]
+        accept_remade: Vec<String>,
+        #[command(flatten)]
+        running: RunningArgs,
+    },
+    /// Read the pageservers' store for the generation each tenant shard holds (with the
+    /// pageservers' credentials, after every pageserver is stopped)
+    ScanGenerations {
+        /// The pageservers' own remote_storage setting
+        #[arg(long)]
+        pageserver_storage: String,
+        /// The file to write, for `restore --generations`
+        #[arg(long)]
+        output: std::path::PathBuf,
     },
     /// Rebuild the records from the copy in the bucket, every generation raised
     Restore {
         #[arg(long, value_enum)]
         to: Store,
-        /// The pageservers' own remote_storage setting, to read the generations their store holds
+        /// The file `scan-generations` wrote
         #[arg(long)]
-        pageserver_storage: String,
+        generations: std::path::PathBuf,
         /// Remove what the destination holds first
         #[arg(long)]
         replace: bool,
         /// How far above the highest generation seen each shard's is set
         #[arg(long, default_value_t = DEFAULT_GENERATION_MARGIN)]
         generation_margin: u32,
+        /// Records the store shows and the copy lacks (`<Kind>/<name>`), to go on without
+        #[arg(long, value_delimiter = ',')]
+        leave_out: Vec<String>,
+        /// Go on for timelines a safekeeper did not answer for, their membership generation
+        /// raised by the margin
+        #[arg(long)]
+        accept_silent_safekeepers: bool,
         /// For safekeepers that need one
         #[arg(long, env = "SAFEKEEPER_JWT_TOKEN", hide_env_values = true)]
         safekeeper_jwt_token: Option<String>,
+        #[command(flatten)]
+        running: RunningArgs,
     },
 }
 
@@ -143,41 +193,74 @@ async fn run(stores: &Stores, command: Command) -> anyhow::Result<Outcome> {
             }
             Ok(outcome)
         }
-        Command::Copy { from, to, replace } => {
-            let outcome = records_tool::copy(stores, from, to, replace).await?;
+        Command::Copy {
+            from,
+            to,
+            replace,
+            accept_remade,
+            running,
+        } => {
+            let accept: BTreeSet<String> = accept_remade.into_iter().collect();
+            let outcome =
+                records_tool::copy(stores, from, to, replace, &running.running(), &accept).await?;
             if outcome == Outcome::Done {
                 println!("copied and compared: equal");
             }
             Ok(outcome)
         }
+        Command::ScanGenerations {
+            pageserver_storage,
+            output,
+        } => {
+            let scan = records_tool::scan_generations(&pageserver_storage).await?;
+            std::fs::write(&output, serde_json::to_vec_pretty(&scan)?)?;
+            println!(
+                "{} tenant shards and {} tenants' timelines found in {}, at {}",
+                scan.shards.len(),
+                scan.timelines.len(),
+                scan.storage,
+                scan.scanned_at
+            );
+            Ok(Outcome::Done)
+        }
         Command::Restore {
             to,
-            pageserver_storage,
+            generations,
             replace,
             generation_margin,
+            leave_out,
+            accept_silent_safekeepers,
             safekeeper_jwt_token,
+            running,
         } => {
-            let (outcome, report) = records_tool::restore(
-                stores,
-                to,
-                &pageserver_storage,
-                safekeeper_jwt_token,
+            let scan: Scan = serde_json::from_slice(&std::fs::read(&generations)?)?;
+            println!(
+                "generations from {}, scanned at {}",
+                scan.storage, scan.scanned_at
+            );
+            let options = RestoreOptions {
                 replace,
-                generation_margin,
-            )
-            .await?;
+                margin: generation_margin,
+                leave_out: leave_out.into_iter().collect(),
+                accept_silent_safekeepers,
+                safekeeper_jwt: safekeeper_jwt_token,
+            };
+            let (outcome, report) =
+                records_tool::restore(stores, to, &scan, &options, &running.running()).await?;
             if let Some(t) = report.copy_written_at {
                 println!("the copy was written at {t}");
             }
             println!(
-                "{} shards' generations raised; {} timelines' membership read from their safekeepers",
+                "{} shards' generations raised; {} timelines' membership read from every member",
                 report.shards_raised, report.timelines_read_from_safekeepers
             );
-            for t in &report.timelines_no_safekeeper_answered {
-                println!("no safekeeper answered for timeline {t}: its membership is the copy's");
+            for t in &report.timelines_kept_silent {
+                println!(
+                    "timeline {t}: a safekeeper did not answer; its membership is the copy's, its generation raised"
+                );
             }
-            for t in &report.tenants_in_store_not_in_copy {
-                println!("tenant {t} has data in the pageservers' store but no record in the copy");
+            for t in &report.left_out {
+                println!("left out (data in the store, no record): {t}");
             }
             if outcome == Outcome::Done {
                 println!("restored and compared: equal");

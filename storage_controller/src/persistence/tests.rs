@@ -60,12 +60,6 @@ pub(crate) async fn test_namespace_and_client() -> Option<(std::path::PathBuf, S
     Some((path, namespace, client))
 }
 
-/// A namespace of its own on the test API server, and the kubeconfig to reach it.
-pub(crate) async fn test_namespace() -> Option<(std::path::PathBuf, String)> {
-    let (path, namespace, _) = test_namespace_and_client().await?;
-    Some((path, namespace))
-}
-
 async fn kubernetes_store() -> Option<Persistence> {
     Some(kubernetes_store_and_client().await?.0)
 }
@@ -74,10 +68,14 @@ async fn kubernetes_store() -> Option<Persistence> {
 /// behind the store's back (as an etcd restore would).
 async fn kubernetes_store_and_client() -> Option<(Persistence, kube::Client, String)> {
     let (kubeconfig, namespace, client) = test_namespace_and_client().await?;
-    let p = Persistence::new_kubernetes(Some(&kubeconfig), Some(namespace.clone()), None)
-        .await
-        .expect("a Kubernetes store")
-        .do_not_exit();
+    let p = Persistence::new_kubernetes(
+        Some(&kubeconfig),
+        Some(namespace.clone()),
+        KubernetesRecords::default(),
+    )
+    .await
+    .expect("a Kubernetes store")
+    .do_not_exit();
     p.migration_run().await.expect("the kinds are installed");
     Some((p, client, namespace))
 }
@@ -1100,7 +1098,7 @@ async fn put_back<S: kubernetes::objects::Spec>(
 /// would exit), and nothing is written; so is a plain read, and a list that misses an object.
 #[tokio::test]
 async fn a_read_of_records_that_went_back_writes_nothing() {
-    use kubernetes::objects::{PageserverSpec, TenantSpec};
+    use kubernetes::objects::TenantSpec;
     let Some((p, client, ns)) = kubernetes_store_and_client().await else {
         return;
     };
@@ -1136,7 +1134,22 @@ async fn a_read_of_records_that_went_back_writes_nothing() {
             .is_err()
     );
 
-    // An object gone that this controller saw and did not delete
+    // From then on it answers nothing
+    let Err(err) = p.list_nodes().await else {
+        panic!("a halted store answers nothing");
+    };
+    assert!(err.to_string().contains("answers nothing"), "{err}");
+}
+
+/// An object gone that this controller saw and did not delete: the store went back under it.
+#[tokio::test]
+async fn a_list_missing_a_seen_object_writes_nothing() {
+    use kubernetes::objects::PageserverSpec;
+    let Some((p, client, ns)) = kubernetes_store_and_client().await else {
+        return;
+    };
+    p.insert_node(&node(1)).await.unwrap();
+    p.insert_node(&node(2)).await.unwrap();
     raw::<PageserverSpec>(&client, &ns)
         .delete("pageserver-2", &Default::default())
         .await
@@ -1145,6 +1158,10 @@ async fn a_read_of_records_that_went_back_writes_nothing() {
         panic!("a list that misses a seen object is refused");
     };
     assert!(err.to_string().contains("pageserver-2 is gone"), "{err}");
+    assert!(
+        p.insert_node(&node(3)).await.is_err(),
+        "and nothing is written after"
+    );
 }
 
 /// A tenant whose generation label went back (lost while its revision did not move) is left out

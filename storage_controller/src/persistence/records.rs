@@ -83,6 +83,21 @@ impl Records {
         self.tenants.is_empty() && self.pageservers.is_empty() && self.safekeepers.is_empty()
     }
 
+    /// Drop the health entries whose shard is gone (a removal whose second write has not
+    /// landed): they are not records, and Postgres, which removes them with their shard, would
+    /// refuse them.
+    pub(crate) fn drop_orphaned_health(&mut self) {
+        let tenants = &self.tenants;
+        for (name, h) in self.metadata_health.iter_mut() {
+            let keys: Vec<(i32, i32)> = tenants
+                .get(name)
+                .map(|t| t.shards.iter().map(|s| s.key()).collect())
+                .unwrap_or_default();
+            h.shards.retain(|s| keys.contains(&s.key()));
+        }
+        self.metadata_health.retain(|_, h| !h.shards.is_empty());
+    }
+
     /// Put every list in one order (the order a store returns rows or shards in means nothing).
     pub(crate) fn sort(&mut self) {
         for t in self.tenants.values_mut() {
