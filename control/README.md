@@ -170,21 +170,39 @@ What a move leaves out of the copy and the comparison, matched by exact name, ne
 A person's role granted to `app`, and a person's role's membership in `neon_superuser`, are copied.
 
 What guards it:
-- The control layer may exec only into a compute's container in a pod listed in the ConfigMap `peat-move-pods`, only `psql` or
-  `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). Two admission
-  rules enforce it: one the shape (namespace, container, command), one the list, which the operator makes empty and keeps. Neither
-  judges any account but the control layer's, whatever exists or is missing: an API server reads a rule's parameter before the rule's
-  own conditions, so the list's rule lets a missing list through. With the list deleted (by hand, or by the control layer's own account,
-  whose Role may delete ConfigMaps in the platform namespace), until the operator makes it again, the control layer is held to the shape
-  alone; a move that finds it missing fails, and goes on when asked again (a resumed attempt that finds it missing as it starts waits
-  instead, and goes on by itself once the operator has made it again). The list was `peat-move-execs` before, made by the control
-  layer: one an earlier release left behind is an orphan, read by nothing, and may be deleted.
-- The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-pods`
-  among them, so a control layer that misbehaves can list any compute. The list bounds what a move does, not what the account could do.
-- The rule does not bound `psql`'s arguments, so in a listed pod the control layer may run any SQL as the local superuser, and so any
+- The control layer's account holds no exec of its own. For a step of a move that needs one (the copy, the comparison, the switch, a
+  way back), it names the pods in the Database's `status.move.pods`; the operator, woken by its watch of the Databases, grants exec on
+  exactly those of them that are the database's own, by a Role `peat-move-<database>` in the compute namespace naming them, and takes
+  it back when the step ends, the move fails, or the Database goes. The control layer waits for the grant at most 60 s, then the move
+  fails and goes on when asked again. A pod is the database's own when it exists, is not on its way out, is a compute, and is the
+  database's compute, its move's target (a name `mv-<hex>` with the target label) or the old copy its last move left (by the name the
+  move gives it). A stale name (a compute restarted mid-move) names no pod and is never granted.
+- The grant is taken back by the operator: at the end of each pass, and also by a pass that stops early (a Platform not valid, the
+  keys, the placements). With the operator down (or the Platform suspended), a grant outlives its move until the operator's next pass;
+  after a failed move the source compute runs on under the same name, so the control layer can still run psql there until then.
+- A move under way on the old control layer while the platform is upgraded to this release fails safely: the new operator takes exec
+  out of the control layer's Role before the move asks the new way. Ask again with `requests.retryMove` once the upgrade is done.
+- What the control layer could still widen: it writes `status.move` (and so the target and old copy's names), and it makes the
+  computes' Deployments (and so their labels). A control layer that misbehaves could name, or relabel, another database's compute as
+  a move's target and be granted it. The check bounds a fault in the control layer (a pod of another database named by mistake is
+  refused), not one that sets out to reach another database.
+- One admission rule holds the shape, with no parameter: an exec, not an attach, only into a compute's container in the compute
+  namespace, only `psql` or `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer
+  cannot write). It judges no account but the control layer's. (An earlier release also read a list of pods from a ConfigMap as the
+  rule's parameter; an API server's copy of such an object can go stale until it restarts, kubernetes#141015, so no rule reads one now.
+  The operator removes that rule, its binding and its `peat-move-pods`; a `peat-move-execs` an earlier control layer or a person made is
+  left behind, read by nothing, and may be deleted.)
+- An upgrade from a release that had that rule removes its binding. On Kubernetes versions with kubernetes#141015 (before the v1.38
+  fix), a policy left without a binding freezes the API server's copy of every ConfigMap used as a policy parameter, for every policy in
+  the cluster, until the API server restarts. Affected: another policy of the cluster whose `paramKind` is a ConfigMap (or another
+  built-in kind) and that reads a parameter changed after the upgrade. To tell: such a policy goes on judging by an older value of its
+  ConfigMap, or answers "no params found" for one that exists. The policies it can touch are those with a `paramKind` (in
+  `kubectl get validatingadmissionpolicies -o yaml`).
+  Restarting the API server clears it. Peat itself reads no parameter, so it is not affected.
+- The rule does not bound `psql`'s arguments, so in a granted pod the control layer may run any SQL as the local superuser, and so any
   shell command in that container (`\!`, `-o '|command'`, `COPY ... TO PROGRAM`).
-- The rule is an admission policy and its binding: if either is missing (deleted, or a cluster without admission policies), nothing but
-  RBAC bounds the control layer's exec, which then reaches every pod in the compute namespace.
+- The rule is an admission policy and its binding: if either is missing (deleted, or a cluster without admission policies), RBAC alone
+  bounds the control layer's exec, to the pods granted.
 - The operator holds `pods/exec` in every namespace, only to grant it to the control layer (Kubernetes refuses a grant of a right the
   granter does not hold, and its check does not look at admission rules). A rule of the install file, `peat-operator-runs-no-exec`,
   refuses every exec and attach by the operator's account. Its reach: the operator may also change admission policies (it makes the

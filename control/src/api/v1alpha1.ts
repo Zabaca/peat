@@ -253,6 +253,7 @@ export const databaseStatus: Schema = obj('The database as it is.', {
     verify: str('How the copy was checked: counts (row counts) or full (every row).', { enum: ['counts', 'full'] }),
     oldDatabase: str('The old copy, kept stopped.'), deleteOldAfter: str('When the old copy is deleted (its data then held as any deleted database\'s).', { format: 'date-time' }),
     message: str('What it found.'),
+    pods: list("The pods the control layer asks to exec into for this step (its own compute, the move's target, the old copy): the operator grants exec on those of them that are this database's, while it needs them.", { type: 'string' }),
   }),
   record: obj("The control layer's own record of the database, written by it alone; it keeps a copy in the platform namespace and writes this again from it if it is lost.", {
     mode: str('primary, or replica (a read replica on its parent\'s timeline).', { enum: ['primary', 'replica'] }),
