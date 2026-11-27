@@ -64,3 +64,25 @@ test('with no read of the routes to ask for, a refused dial fails the caller at 
   while (front.counts.failed === 0 && Date.now() - t0 < 3000) await new Promise((res) => setTimeout(res, 20))
   expect(front.counts.failed).toBe(1)
 })
+
+test('a database that has just gone: the door asks its route again past the cache and refuses at once, not after the whole wait', async () => {
+  const [frontPort, dbPort] = [await freePort(), await freePort()]
+  const asked: (boolean | undefined)[] = []
+  // the cache still has the port; asked fresh, the database is gone
+  const front = startFront({ port: frontPort, routePort: async (_db, fresh) => { asked.push(fresh); return fresh ? null : dbPort }, refresh: async () => {}, dialWaitMs: 8000, log: () => {} })
+  closers.push(() => front.server.close())
+  await new Promise((res) => setTimeout(res, 50))
+  const raw = connect({ host: '127.0.0.1', port: frontPort })
+  closers.push(() => raw.destroy())
+  await new Promise<void>((resolve) => raw.once('connect', () => resolve()))
+  raw.write(SSL_REQUEST)
+  await new Promise<void>((resolve) => raw.once('data', () => resolve()))
+  const tls = tlsConnect({ socket: raw, servername: 'orders.db.example.com', rejectUnauthorized: false })
+  tls.on('error', () => {})
+  closers.push(() => tls.destroy())
+  const t0 = Date.now()
+  while (front.counts.refusedUnknown === 0 && Date.now() - t0 < 3000) await new Promise((res) => setTimeout(res, 20))
+  expect(front.counts.refusedUnknown).toBe(1)
+  expect(Date.now() - t0).toBeLessThan(2000)
+  expect(asked).toEqual([undefined, true])
+})

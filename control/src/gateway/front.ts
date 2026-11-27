@@ -101,8 +101,8 @@ class Reader {
 
 export interface FrontOptions {
   port: number
-  /** The local port of a database's own listener (the gateway program's), or null when there is no such database. */
-  routePort: (database: string) => Promise<number | null>
+  /** The local port of a database's own listener (the gateway program's), or null when there is no such database; `fresh` asks past any cache. */
+  routePort: (database: string, fresh?: boolean) => Promise<number | null>
   /** Reads the routes again now (the gateway program's refresh): a database made a moment ago has its listener only from the gateway's next
    * read of the routes (every few seconds), so a refused dial of a known database asks for that read and dials again, for up to dialWaitMs. */
   refresh?: () => Promise<void>
@@ -139,15 +139,18 @@ export function startFront(o: FrontOptions) {
       const name = serverNameOf(body)
       const database = name?.split('.')[0] ?? ''
       if (!name || !NAME.test(database)) { counts.refusedNoName++; c.end(ALERT_UNRECOGNIZED_NAME); return }
-      const port = await o.routePort(database)
+      let port = await o.routePort(database)
       if (port === null) { counts.refusedUnknown++; c.end(ALERT_UNRECOGNIZED_NAME); return }
-      const dial = () => new Promise<Socket>((resolve, reject) => { const s = connect({ host: o.upstreamHost ?? '127.0.0.1', port }); s.once('connect', () => resolve(s)); s.once('error', reject) })
+      const dial = () => new Promise<Socket>((resolve, reject) => { const s = connect({ host: o.upstreamHost ?? '127.0.0.1', port: port! }); s.once('connect', () => resolve(s)); s.once('error', reject) })
       const t0 = Date.now()
       let up: Socket
       for (;;) {
         try { up = await dial(); break } catch (e) {
           if (!o.refresh || Date.now() - t0 >= (o.dialWaitMs ?? 8000)) throw e
           await o.refresh().catch(() => {})
+          // a database that has just gone (closed, deleted) has no route now: it is refused at once, not dialed for the whole wait
+          port = await o.routePort(database, true)
+          if (port === null) { counts.refusedUnknown++; c.end(ALERT_UNRECOGNIZED_NAME); return }
           await new Promise((res) => setTimeout(res, 250))
         }
       }
