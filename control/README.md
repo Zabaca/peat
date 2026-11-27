@@ -177,6 +177,13 @@ What guards it:
   rule's parameter; an API server's copy of such an object can go stale until it restarts, kubernetes#141015, so no rule reads one now.
   The operator removes that rule, its binding and its `peat-move-pods`; a `peat-move-execs` an earlier control layer or a person made is
   left behind, read by nothing, and may be deleted.)
+- An upgrade from a release that had that rule removes its binding. On Kubernetes versions with kubernetes#141015 (before the v1.38
+  fix), a policy left without a binding freezes the API server's copy of every ConfigMap used as a policy parameter, for every policy in
+  the cluster, until the API server restarts. Affected: another policy of the cluster whose `paramKind` is a ConfigMap (or another
+  built-in kind) and that reads a parameter changed after the upgrade. To tell: such a policy goes on judging by an older value of its
+  ConfigMap, or answers "no params found" for one that exists; `kubectl get validatingadmissionpolicies -o
+  jsonpath='{range .items[?(@.spec.paramKind)]}{.metadata.name} {.spec.paramKind.kind}{"\n"}{end}'` lists the policies it can touch.
+  Restarting the API server clears it. Peat itself reads no parameter, so it is not affected.
 - The rule does not bound `psql`'s arguments, so in a granted pod the control layer may run any SQL as the local superuser, and so any
   shell command in that container (`\!`, `-o '|command'`, `COPY ... TO PROGRAM`).
 - The rule is an admission policy and its binding: if either is missing (deleted, or a cluster without admission policies), RBAC alone
