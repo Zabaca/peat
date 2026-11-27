@@ -1370,6 +1370,11 @@ def test_sharding_split_failures(
         # If we're using a failure that will panic the storage controller, all background
         # upcalls from the pageserver can fail
         ps.allowed_errors.append(".*calling control plane generation validation API failed.*")
+        # The storage controller's heatmap_upload call to a pageserver that is held by a failpoint
+        # or slow can time out; it drops the connection (a pageserver WARN) and retries, which
+        # then succeeds ("Call to node 1 ... management API failed, will retry ... deadline has
+        # elapsed", pre-hardlink case, 2026-11-27).
+        ps.allowed_errors.append(".*heatmap_upload.*request was dropped before completing")
 
     # Make sure the node we're failing has a shard on it, otherwise the test isn't testing anything
     assert (
