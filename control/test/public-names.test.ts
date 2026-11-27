@@ -22,6 +22,7 @@ describe('the rules', () => {
     expect(kinds('pod at 10.244.1.5')).toEqual(['address'])
     expect(kinds('the host 172.16.0.4')).toEqual(['address'])
     expect(kinds('version 1.2.3 and 1.2.3.4.5')).toEqual([])
+    expect(kinds("seq(oid('2.5.4.3'), name) // RFC 5280, 4.1.2.5")).toEqual([])
   })
 
   test('a host: reserved examples, the listed third parties and the API group pass; anything else is a finding', () => {
@@ -117,9 +118,35 @@ describe('the second review\'s holes, and attempts to break the check', () => {
     expect(code('// mail goes to "Ops" <ops@acme.health>')).toEqual(['email', 'host'])
   })
   test('what it lets through on purpose, with why: property chains, files, the listed third parties and the examples', () => {
-    expect(code('// o.metadata.name, Date.now(), status.host, images.storage, json.data')).toEqual([])
+    expect(code('// o.metadata.name, Date.now(), status.host, images.storage')).toEqual([])
     expect(code("const f = 'README.md', g = 'run.sh', h = 'control.ts'")).toEqual([])
     expect(code("const a = 'db.example.com', b = 'x.test', c = 'kubernetes.io/hostname'")).toEqual([])
+  })
+})
+
+describe('the third review\'s follow-ups', () => {
+  test('the exemptions are code\'s alone: in a document a name like a property chain is a host', () => {
+    expect(kinds('mail acme.name and see acme.host or x.acme-corp.com', 'README.md')).toEqual(['host', 'host', 'host'])
+    expect(kinds('endpoint: https://x.acme-corp.com', 'examples/a.yaml')).toEqual(['host'])
+    expect(kinds("const n = 'o.metadata.name'", 'src/a.ts')).toEqual([])
+    expect(kinds("const d = 'json.data'", 'src/a.ts')).toEqual(['host']) // data is no longer exempt
+  })
+  test('under amazonaws.com only the S3 API\'s hosts; an account\'s registry, load balancer or database is a finding', () => {
+    expect(kinds('the API at s3.us-west-2.amazonaws.com')).toEqual([])
+    for (const h of ['123456789012.dkr.ecr.us-east-1.amazonaws.com', 'my-lb-123.us-east-1.elb.amazonaws.com', 'abc.gr7.us-east-1.eks.amazonaws.com', 'db.abc.us-east-1.rds.amazonaws.com']) expect([h, kinds(`at ${h}`)]).toEqual([h, ['host']])
+  })
+  test('docker.io names its owner as ghcr.io does', () => {
+    expect(kinds('image docker.io/library/postgres:17')).toEqual([])
+    expect(kinds('image docker.io/acmecorp/private-image:1')).toEqual(['host'])
+  })
+  test('a store\'s own addresses: an S3 ARN, gs:// and r2://', () => {
+    expect(kinds('the bucket arn:aws:s3:::acme-backups')).toEqual(['host'])
+    expect(kinds('copy to gs://acme-backups/x and r2://acme-records')).toEqual(['host', 'host'])
+    expect(kinds('for example gs://example-bucket')).toEqual([])
+  })
+  test('private suffixes: .local (but the cluster\'s own), .internal, .lan, .corp', () => {
+    expect(kinds('the router at gw.home.lan, nas.local, db.acme.internal, ad.acme.corp')).toEqual(['host', 'host', 'host', 'host'])
+    expect(kinds('the service at storage-controller.peat.svc.cluster.local')).toEqual([])
   })
 })
 

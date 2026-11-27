@@ -64,6 +64,8 @@ export const GITHUB_OWNERS: Record<string, string> = {
   'cert-manager': 'cert-manager',
   oven: 'Bun',
   minio: 'MinIO',
+  library: "Docker Hub's official images (docker.io/library/postgres, busybox)",
+  bitnamilegacy: 'The MinIO image the install test runs as its store',
 }
 
 /** The maintainer's name, and the places it may stand: its public addresses. */
@@ -79,7 +81,7 @@ const reservedHost = (host: string) => /(?:^|\.)(?:example|test|invalid|localhos
 const realDomain = (host: string) => TLDS.has(host.split('.').pop()!)
 
 /**
- * The text of a TypeScript or JavaScript file where a host could be: its comments (less the code quoted in backticks inside them) and the
+ * The text of a TypeScript or JavaScript file where a host could be: its comments (all of them, backtick-quoted text included) and the
  * text of its strings (less the `${...}` of a template), every other character blanked, line breaks kept. A small reader of the language:
  * strings, templates nested in their expressions, comments and regular-expression literals (which are code).
  */
@@ -148,7 +150,6 @@ const CODE_PROPERTIES = new Set([
   'host', // a database's host (status.host)
   'storage', // the storage image (images.storage)
   'direct', // a wake's direct dial (wake.direct)
-  'data', // a ConfigMap's or Secret's data (json.data)
 ])
 
 /** The findings of one file. `path` is relative to the folder scanned; `exists` says whether a path relative to the repository's root is in it. */
@@ -177,15 +178,17 @@ export function publicNameHits(path: string, text: string, exists: (repoPath: st
     for (const m of said.matchAll(/(?<![A-Za-z0-9_-])((?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9])(?![A-Za-z0-9_-])/g)) {
       const host = m[1]!.toLowerCase()
       if (!realDomain(host) || reservedHost(host)) continue
-      // a name with a label of one letter (`d.name`, `i.data.pg`) is a property chain, not a host; so is one ending in a property name of this code
+      // in code, a name with a label of one letter (`d.name`, `i.data.pg`) is a property chain, not a host; so is one ending in a property
+      // name of this code. In a document or a configuration file (README, YAML, the examples) every host counts.
       const labels = host.split('.')
-      if (labels.some((l) => l.length === 1)) continue
-      if (CODE_PROPERTIES.has(labels.at(-1)!)) continue
+      if (CODE_FILE.test(path) && (labels.some((l) => l.length === 1) || CODE_PROPERTIES.has(labels.at(-1)!))) continue
       if (host === 'peat.zabaca.com' || host.endsWith('.peat.zabaca.com')) continue
       const third = Object.keys(THIRD_PARTY_DOMAINS).find((d) => endsWithDomain(host, d))
       if (!third) { add('host', host); continue }
+      // under amazonaws.com only the S3 API's own hosts are named here; any other host there is an account's (a registry, a load balancer, a database)
+      if (third === 'amazonaws.com' && !/^(?:[a-z0-9.-]+\.)?s3(?:[.-][a-z0-9-]+)*\.amazonaws\.com$/.test(host)) { add('host', `${host}: an account's host`); continue }
       const rest = said.slice((m.index ?? 0) + m[0].length)
-      if (third === 'github.com' || third === 'ghcr.io' || third === 'githubusercontent.com') {
+      if (third === 'github.com' || third === 'ghcr.io' || third === 'githubusercontent.com' || third === 'docker.io') {
         // the owner after the host: `/owner` in an address, `:owner` in git's own (git@github.com:owner/repository.git)
         const owner = /^[/:]([A-Za-z0-9_.-]+)/.exec(rest)?.[1]?.toLowerCase()
         if (owner && !(owner in GITHUB_OWNERS)) add('host', `${host}/${owner}`)
@@ -198,8 +201,14 @@ export function publicNameHits(path: string, text: string, exists: (repoPath: st
         if (bucket && !/^(?:example|my-bucket|bucket|your-bucket)(?:[.-]|$)/.test(bucket)) add('host', `${host}${inPath ? `/${inPath}` : ''}: a bucket`)
       }
     }
-    // a bucket in an s3:// address
-    for (const m of said.matchAll(/\bs3:\/\/([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])/g)) if (!/^(?:example|my-bucket|bucket|your-bucket)(?:[.-]|$)/.test(m[1]!)) add('host', `s3://${m[1]}: a bucket`)
+    // a bucket in a store's own address: s3://, gs://, r2://, an S3 ARN
+    for (const m of said.matchAll(/(?:\b(?:s3|gs|r2):\/\/|\barn:aws:s3:::)([a-z0-9][a-z0-9._-]{1,62}[a-z0-9])/g)) if (!/^(?:example|my-bucket|bucket|your-bucket)(?:[._-]|$)/.test(m[1]!)) add('host', `${m[0].slice(0, m[0].length - m[1]!.length)}${m[1]}: a bucket`)
+    // a host under a private suffix (.local, .internal, .lan, .corp), less the cluster's own names (svc.cluster.local)
+    for (const m of said.matchAll(/(?<![A-Za-z0-9_-])((?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+(?:local|internal|lan|corp))(?![A-Za-z0-9_-])/gi)) {
+      const host = m[1]!.toLowerCase()
+      if (host.endsWith('.cluster.local') || host === 'cluster.local' || (CODE_FILE.test(path) && host.split('.').some((l) => l.length === 1))) continue
+      add('host', `${host}: a private network's name`)
+    }
     // an IPv6 address: two or more groups of hex digits, with a :: or eight groups, and a letter or a :: (so a time of day is none)
     for (const m of line.matchAll(/(?<![\w:.])((?:[0-9a-fA-F]{1,4})?(?::[0-9a-fA-F]{0,4}){2,7})(?![\w:.])/g)) {
       const a = m[1]!.toLowerCase()

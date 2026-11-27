@@ -405,6 +405,73 @@ jobs:
       - name: Tests (the public-names check among them)
         run: bun test
 
+  # The install test (.github/peat/install-test.sh): a whole platform installed from the install
+  # file and one Platform on a throwaway kind cluster on the runner, a database made, written,
+  # read back with verify-full, put to sleep and woken by a connection. On a pull request it
+  # runs this change's control image against the storage and compute images of the newest
+  # commit of main that has them published; on main, a release tag or a manual run, against
+  # the images this run built (the job after the images job), and the publish job needs it.
+  install-test-pr:
+    name: install test (pull request)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+      - name: kind and psql
+        run: .github/peat/install-test-tools.sh
+      - name: The newest published images of main
+        id: published
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          for sha in $(git rev-list --first-parent -n 30 "$(git merge-base HEAD origin/main)"); do
+            # every image the test runs: the storage and both computes
+            if docker manifest inspect "ghcr.io/zabaca/peat/storage:$sha" > /dev/null 2>&1 && docker manifest inspect "ghcr.io/zabaca/peat/compute-pg18:$sha" > /dev/null 2>&1 && docker manifest inspect "ghcr.io/zabaca/peat/compute-pg19:$sha" > /dev/null 2>&1; then echo "sha=$sha" >> "$GITHUB_OUTPUT"; echo "images of $sha"; exit 0; fi
+          done
+          echo "::error::no commit of the last 30 on main has published images"; exit 1
+      - name: The control image of this change
+        run: docker build -f .github/peat/control.Dockerfile -t peat-control:ci control
+      - name: Install a platform and use it
+        env:
+          SHA: ${{ steps.published.outputs.sha }}
+        run: .github/peat/install-test.sh "ghcr.io/zabaca/peat/storage:$SHA" "ghcr.io/zabaca/peat/compute-pg18:$SHA" "ghcr.io/zabaca/peat/compute-pg19:$SHA" peat-control:ci
+
+  install-test:
+    name: install test (this run's images)
+    needs: [ images ]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+      - name: kind and psql
+        run: .github/peat/install-test-tools.sh
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: peat-images-docker-amd64
+          path: ${{ runner.temp }}/images
+      - name: Load this run's images
+        run: zstd -dc "$RUNNER_TEMP/images/peat-images.tar.zst" | docker load
+      - name: Install a platform and use it
+        env:
+          LOAD_IMAGES: peat-storage:ci-amd64 peat-compute:ci-amd64 peat-compute-pg19:ci-amd64
+        run: .github/peat/install-test.sh peat-storage:ci-amd64 peat-compute:ci-amd64 peat-compute-pg19:ci-amd64 peat-control:ci-amd64
+
   # The publish script, tried against a throwaway registry on the runner with stand-in
   # images: the cases are listed in .github/peat/test-push-images.sh. Every run, and the
   # publish job needs it.
@@ -448,6 +515,8 @@ jobs:
       storage-id-amd64: ${{ steps.ids.outputs.storage-id-amd64 }}
       compute-id-amd64: ${{ steps.ids.outputs.compute-id-amd64 }}
       compute19-id-amd64: ${{ steps.ids.outputs.compute19-id-amd64 }}
+      control-id-arm64: ${{ steps.ids.outputs.control-id-arm64 }}
+      control-id-amd64: ${{ steps.ids.outputs.control-id-amd64 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -473,10 +542,20 @@ jobs:
           done
           docker build --build-arg REVISION="$GITHUB_SHA" --build-arg PG_MAJOR=19 \
             -f .github/peat/compute.Dockerfile -t "peat-compute-pg19:ci-${{ matrix.arch }}" "$RUNNER_TEMP/ctx"
+          # the control image is the control folder's program on Bun, nothing of the build's
+          docker build --build-arg REVISION="$GITHUB_SHA" -f .github/peat/control.Dockerfile -t "peat-control:ci-${{ matrix.arch }}" control
           docker image ls 'peat-*'
 
       - name: Check the images
         run: .github/peat/check-images.sh peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }} peat-compute-pg19:ci-${{ matrix.arch }}
+
+      # The control image starts each role's program far enough to read its arguments: an image that cannot load the program fails here.
+      - name: Check the control image
+        run: |
+          out=$(docker run --rm "peat-control:ci-${{ matrix.arch }}" 2>&1 || true)
+          echo "$out"
+          [ "$out" = 'usage: main.ts <operator|control|gateway>' ] || { echo "::error::the control image did not start its program"; exit 1; }
+          docker run --rm --entrypoint bun "peat-control:ci-${{ matrix.arch }}" -e "await import('/app/src/operator/render.ts'); await import('/app/src/gateway/settings.ts'); console.log('loads')"
 
       - name: Record the checked images' IDs
         id: ids
@@ -484,10 +563,12 @@ jobs:
           storage=$(docker image inspect --format '{{.Id}}' peat-storage:ci-${{ matrix.arch }})
           compute=$(docker image inspect --format '{{.Id}}' peat-compute:ci-${{ matrix.arch }})
           compute19=$(docker image inspect --format '{{.Id}}' peat-compute-pg19:ci-${{ matrix.arch }})
+          control=$(docker image inspect --format '{{.Id}}' peat-control:ci-${{ matrix.arch }})
           {
             echo "storage-id-${{ matrix.arch }}=$storage"
             echo "compute-id-${{ matrix.arch }}=$compute"
             echo "compute19-id-${{ matrix.arch }}=$compute19"
+            echo "control-id-${{ matrix.arch }}=$control"
           } >> "$GITHUB_OUTPUT"
           {
             echo "### Checked images (${{ matrix.arch }})"
@@ -497,12 +578,13 @@ jobs:
             echo "| storage | $storage |"
             echo "| compute-pg18 | $compute |"
             echo "| compute-pg19 | $compute19 |"
+            echo "| control | $control |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save the images
         run: |
           mkdir -p "$RUNNER_TEMP/images"
-          docker save peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }} peat-compute-pg19:ci-${{ matrix.arch }} | zstd -T0 -3 -q -o "$RUNNER_TEMP/images/peat-images.tar.zst"
+          docker save peat-storage:ci-${{ matrix.arch }} peat-compute:ci-${{ matrix.arch }} peat-compute-pg19:ci-${{ matrix.arch }} peat-control:ci-${{ matrix.arch }} | zstd -T0 -3 -q -o "$RUNNER_TEMP/images/peat-images.tar.zst"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -523,7 +605,7 @@ jobs:
   # only, never moved); the job also refuses a commit that is not on main.
   publish-images:
     name: publish the images (arm64 and amd64)
-    needs: [ images, regress, regress-pg19, test-push-images, control ]
+    needs: [ images, regress, regress-pg19, test-push-images, control, install-test ]
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release-')) &&
@@ -559,23 +641,28 @@ jobs:
           STORAGE_ID_AMD64: ${{ needs.images.outputs.storage-id-amd64 }}
           COMPUTE_ID_AMD64: ${{ needs.images.outputs.compute-id-amd64 }}
           COMPUTE19_ID_AMD64: ${{ needs.images.outputs.compute19-id-amd64 }}
+          CONTROL_ID_ARM64: ${{ needs.images.outputs.control-id-arm64 }}
+          CONTROL_ID_AMD64: ${{ needs.images.outputs.control-id-amd64 }}
         run: |
           for arch in arm64 amd64; do
             zstd -dc "$RUNNER_TEMP/archives/peat-images-docker-$arch/peat-images.tar.zst" | docker load
           done
           for arch in arm64 amd64; do
             up=$(echo "$arch" | tr '[:lower:]' '[:upper:]')
-            want_s=STORAGE_ID_$up; want_c=COMPUTE_ID_$up; want_c19=COMPUTE19_ID_$up
+            want_s=STORAGE_ID_$up; want_c=COMPUTE_ID_$up; want_c19=COMPUTE19_ID_$up; want_ctl=CONTROL_ID_$up
             loaded_s=$(docker image inspect --format '{{.Id}}' "peat-storage:ci-$arch")
             loaded_c=$(docker image inspect --format '{{.Id}}' "peat-compute:ci-$arch")
             loaded_c19=$(docker image inspect --format '{{.Id}}' "peat-compute-pg19:ci-$arch")
+            loaded_ctl=$(docker image inspect --format '{{.Id}}' "peat-control:ci-$arch")
             # Not "test -n a && test -n b": a failed && list does not stop a bash -e script.
             [ -n "${!want_s}" ] || { echo "::error::no checked storage image ID ($arch)"; exit 1; }
             [ -n "${!want_c}" ] || { echo "::error::no checked compute image ID ($arch)"; exit 1; }
             [ -n "${!want_c19}" ] || { echo "::error::no checked compute 19 image ID ($arch)"; exit 1; }
+            [ -n "${!want_ctl}" ] || { echo "::error::no checked control image ID ($arch)"; exit 1; }
             [ "$loaded_s" = "${!want_s}" ] || { echo "::error::storage image ($arch) $loaded_s is not the checked ${!want_s}"; exit 1; }
             [ "$loaded_c" = "${!want_c}" ] || { echo "::error::compute image ($arch) $loaded_c is not the checked ${!want_c}"; exit 1; }
             [ "$loaded_c19" = "${!want_c19}" ] || { echo "::error::compute 19 image ($arch) $loaded_c19 is not the checked ${!want_c19}"; exit 1; }
+            [ "$loaded_ctl" = "${!want_ctl}" ] || { echo "::error::control image ($arch) $loaded_ctl is not the checked ${!want_ctl}"; exit 1; }
             echo "$arch: the loaded images are the checked ones"
           done
 
@@ -585,11 +672,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ghcr.io/zabaca/peat/storage, ghcr.io/zabaca/peat/compute-pg18 and
-      # ghcr.io/zabaca/peat/compute-pg19, tagged with the full commit hash on a merge to main,
+      # ghcr.io/zabaca/peat/storage, ghcr.io/zabaca/peat/compute-pg18,
+      # ghcr.io/zabaca/peat/compute-pg19 and ghcr.io/zabaca/peat/control, tagged with the full commit hash on a merge to main,
       # or with the release tag's name: each tag one multi-arch image (arm64 and amd64), made
-      # by .github/peat/push-images.sh (a second call for compute-pg19, so the first two are
-      # published exactly as before).
+      # by .github/peat/push-images.sh (a call each for compute-pg19 and control, so the first two
+      # are published exactly as before). A new package starts private on the registry: the
+      # maintainer makes control public by hand once, as was done for the others.
       - name: Push
         env:
           REPO: ghcr.io/${{ github.repository }}
@@ -598,3 +686,4 @@ jobs:
           lowercase_repo=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
           .github/peat/push-images.sh "$lowercase_repo" "$TAG"
           PEAT_IMAGE_NAMES=compute-pg19 .github/peat/push-images.sh "$lowercase_repo" "$TAG"
+          PEAT_IMAGE_NAMES=control .github/peat/push-images.sh "$lowercase_repo" "$TAG"

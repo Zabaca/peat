@@ -65,14 +65,14 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     control: str('The control image (the operator, the control layer and the gateways).'),
     compute: obj('The compute image of each Postgres version.', { '18': str('Postgres 18.'), '19': str('Postgres 19.') }),
   }, { default: { registry: 'ghcr.io/zabaca/peat' } }),
-  namespaces: obj('The namespaces the platform uses. They cannot change once the platform is made (its pieces and its data live in them), and none may be a namespace of the cluster\'s own.', {
+  namespaces: obj('The namespaces the platform uses (the status records them). They cannot change once the platform is made (its pieces and its data live in them), and none may be a namespace of the cluster\'s own.', {
     platform: str('The storage, the control layer and its records.', { default: 'peat' }),
     computes: str("The databases' computes.", { default: 'peat-compute' }),
     gateways: str('The gateways and the front door.', { default: 'peat-gateway' }),
     databases: str("Each database's name inside the cluster (an ExternalName Service per database), and the ConfigMap peat-ca: the authority's public certificate (ca.crt), which every namespace that holds a Database also gets.", { default: 'peat-db' }),
   }, { default: { platform: 'peat', computes: 'peat-compute', gateways: 'peat-gateway', databases: 'peat-db' }, ...rules(
     ['self == oldSelf', 'the namespaces cannot change: the platform\'s pieces and its data live in them'],
-    ["[self.platform, self.computes, self.gateways, self.databases].all(n, n != 'default' && !n.startsWith('kube-'))", 'a namespace of the platform may not be default or one of the kube- namespaces'],
+    ["[self.platform, self.computes, self.gateways, self.databases].all(n, n != 'default' && n != 'peat-system' && !n.startsWith('kube-'))", "a namespace of the platform may not be default, the operator's peat-system or one of the kube- namespaces"],
   ) }),
   machines: obj('The machines the platform runs on.', {
     label: label('The label that marks them: the operator places every piece on these and the control layer probes and taints these and no other.', { key: `${GROUP}/machine`, value: 'true' }),
@@ -124,7 +124,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     memory: memory('a gateway', '48Mi', '192Mi'),
   }, { default: {} }),
   certificates: obj("The databases' certificates.", {
-    issuer: obj('A cert-manager issuer to sign them; none (the default): the platform\'s own certificate authority signs them.', {
+    issuer: obj('A cert-manager issuer to sign them; none (the default): the platform\'s own certificate authority signs them. With an issuer, the ConfigMap peat-ca clients verify with carries the authority keys.caSecret names, or is not published (the platform\'s own authority would sign nothing).', {
       name: str('The issuer.'), kind: str('Issuer (in the compute namespace) or ClusterIssuer.', { enum: ['Issuer', 'ClusterIssuer'], default: 'Issuer' }),
     }, { required: ['name'] }),
   }, { default: {} }),
@@ -144,7 +144,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
   }, { default: {} }),
   keys: obj('The keys the platform signs with. None given: the operator makes them once and keeps them.', {
     authSecret: str("A Secret in the platform namespace holding the Ed25519 pair the storage's tokens are signed with (auth_private_key.pem, auth_public_key.pem)."),
-    caSecret: str("A Secret in the compute namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key)."),
+    caSecret: str("A Secret in the platform namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key): the platform namespace holds every key; clients get only its certificate (the ConfigMap peat-ca). With certificates.issuer, a Secret holding the issuer's certificate alone (tls.crt or ca.crt), so peat-ca carries the certificate that signs the databases': its key is never read, needed or kept."),
   }, { default: {} }),
   control: obj('The control layer.', {
     replicas: int('How many pods; one acts at a time.', { minimum: 1, maximum: 5, default: 2 }),
@@ -168,6 +168,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
   release: str('The release every piece runs, once they all run one.'),
   message: str('What a person reads first.'),
   survives: str("What the platform survives: one machine's loss, or none (spread none)."),
+  namespaces: obj('The namespaces the platform runs in, recorded: a Platform that names others is refused.', { platform: str('The platform namespace.'), computes: str('The computes\' namespace.'), gateways: str('The gateways\' namespace.'), databases: str('The database namespace.') }),
   pieces: list('Every piece and the release it runs.', obj('A piece.', {
     kind: str('Its kind.'), namespace: str('Its namespace.'), name: str('Its name.'),
     release: str('The release it runs.'), ready: bool('Whether it is ready.'), adopted: bool('Whether the operator took it over.'), message: str('Why not, when not.'),

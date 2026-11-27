@@ -2,20 +2,40 @@
 
 The program that runs a Peat platform on Kubernetes, beside the storage code it runs: one TypeScript program, run by Bun, in one image with
 an entry per role. It is the program that has run a production Peat platform since 2026-11-20, brought here with every name of that install
-made a setting; the operator that installs, keeps and upgrades a whole platform from one object is being built on it.
+made a setting, and the operator that installs and keeps a whole platform from one object.
 
 | Part | What it is | Where |
 |---|---|---|
 | The control layer | Turns "a database" into Neon's terms (tenant, timeline, compute); starts and stops computes; replaces a compute or a safekeeper that is lost; repoints computes when the storage controller moves a tenant; trims old WAL from the store. Two pods, one acting at a time. | `src/control.ts`, with its pure decisions in `src/storage-spec.ts` |
 | The gateways | The one front door: a client connects to `<database>.<domain>`, the gateway reads the name from TLS (without decrypting), wakes the database if it sleeps, and passes the bytes through. Puts a database to sleep after its idle time. | `src/gateway/` |
 | The drills | Failure drills runnable against an install: pods cut, disks wiped, machines cut (by a command the installer supplies), the store unreachable, the controller's records restored. Every cutting step goes through one guard. | `src/drills/` |
+| The operator | Reads the one Platform object and makes every piece of it: the namespaces, the keys and a certificate authority when none are given, the storage (pinned to machines by the spread rules), the control layer, the gateways and the admission rules that hold the control layer's account. Keeps each as declared, removes what it made and no longer renders, never touches what it did not make, and reports each piece and its release in the Platform's status. | `src/operator/` |
+| The install file | The kinds, the operator's namespace and account, and its Deployment. | `src/install/install.ts` |
 | The object kinds | `Platform` and `Database` in `peat.zabaca.com/v1alpha1`. | `src/api/v1alpha1.ts`, examples in `examples/` |
 | The storage's checks | What an upgrade reads between steps (every node active, every shard attached, every secondary warm) and a pageserver's drain and fill. | `src/storage/` |
 | Shared names | Namespaces, the machine label, the dead taint, the API group: neutral defaults, each a setting. | `src/names.ts` |
 
-Still to come in this folder: the operator (installing and keeping every piece from a Platform, keys and a certificate authority made
-when none are given, the ordered upgrade, adoption), the control layer's records as Database objects, the `peat` command, the move of a
-database to a newer Postgres major, the install file and the control image.
+Still to come in this folder: the ordered upgrade (today a changed release reaches every piece at once), adoption of a platform installed
+another way, the control layer's records as Database objects, the `peat` command and the move of a database to a newer Postgres major.
+
+## Installing
+
+The control image is `ghcr.io/zabaca/peat/control`, published with the storage and compute images on every merge to main, tagged with
+the commit (`.github/peat/control.Dockerfile`; one program, the role named by its first argument: `operator`, `control` or `gateway`).
+
+1. Apply the install file: `bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl apply --server-side -f -`.
+2. Label the machines the platform may use: `kubectl label node <node> peat.zabaca.com/machine=true` (three for the default spread; one
+   for a trial with `spread: none`).
+3. Make the platform namespace (`peat` by default) and put the store's Secret in it (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+4. Apply a Platform (`examples/platform.yaml`, or `examples/trial.yaml` for one machine) and read `kubectl get platform` until it says
+   Ready.
+
+`.github/peat/install-test.sh` does exactly this on a throwaway kind cluster (a one-machine trial with a MinIO store), then makes a
+database, writes and reads it through the front door with `sslmode=verify-full`, puts it to sleep and wakes it by connecting, and has
+the cluster's API server judge the admission rules as the control layer's account. CI runs it on every pull request (this change's
+control image against main's published storage images) and on every merge (that run's images), and publishes nothing a failed run
+built. It needs kind, kubectl, docker, bun and psql; locally, `KIND=<path to kind> .github/peat/install-test.sh <storage> <compute 18>
+<compute 19> <control>` with the control image built into the local Docker.
 
 ## The objects
 

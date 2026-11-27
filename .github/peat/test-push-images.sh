@@ -14,7 +14,7 @@ real_docker=$(command -v docker)
 cid=$(docker run -d --rm -p 127.0.0.1::5000 registry:2)
 cleanup() {
   docker rm -f "$cid" > /dev/null 2>&1 || true
-  docker image rm -f peat-storage:ci-arm64 peat-storage:ci-amd64 peat-compute:ci-arm64 peat-compute:ci-amd64 peat-compute-pg19:ci-arm64 peat-compute-pg19:ci-amd64 > /dev/null 2>&1 || true
+  docker image rm -f peat-storage:ci-arm64 peat-storage:ci-amd64 peat-compute:ci-arm64 peat-compute:ci-amd64 peat-compute-pg19:ci-arm64 peat-compute-pg19:ci-amd64 peat-control:ci-arm64 peat-control:ci-amd64 > /dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -24,9 +24,9 @@ for _ in $(seq 1 30); do curl -sf "http://localhost:$port/v2/" > /dev/null && br
 curl -sf "http://localhost:$port/v2/" > /dev/null
 
 printf 'FROM busybox:1.37\nARG N\nLABEL n=$N\n' > "$work/Dockerfile"
-# build_images <label> [amd64 image's platform]: the six local images, each its own content.
+# build_images <label> [amd64 image's platform]: the eight local images, each its own content.
 build_images() {
-  for img in peat-storage peat-compute peat-compute-pg19; do
+  for img in peat-storage peat-compute peat-compute-pg19 peat-control; do
     for arch in arm64 amd64; do
       plat=$arch; [ "$arch" = amd64 ] && plat=${2:-amd64}
       docker buildx build -q --platform "linux/$plat" --build-arg "N=$1-$img-$arch" --load -t "$img:ci-$arch" "$work" > /dev/null
@@ -105,4 +105,9 @@ if ! PEAT_IMAGE_NAMES=compute-pg19 run_push t6; then die "publish of compute-pg1
 [ "$(docker buildx imagetools inspect --raw "$reg/compute-pg19:t6" | jq '.manifests | length')" = 2 ] || die "compute-pg19:t6 is not two images"
 ! published storage t6 && ! published compute-pg18 t6 || die "a call for compute-pg19 published other images"
 pass "compute-pg19 on its own: two images under the tag, nothing else published"
+# The publish job's call for the control image: the same, for control.
+if ! PEAT_IMAGE_NAMES=control run_push t6; then die "publish of control alone"; fi
+[ "$(docker buildx imagetools inspect --raw "$reg/control:t6" | jq '.manifests | length')" = 2 ] || die "control:t6 is not two images"
+! published storage t6 && ! published compute-pg18 t6 || die "a call for control published other images"
+pass "control on its own: two images under the tag, nothing else published"
 echo "all cases passed"
