@@ -137,7 +137,8 @@ const privateIp = (ip: string) => { const [a, b] = ip.split('.').map(Number) as 
  */
 export function storeEgressExcept(endpoint: string, set?: string[]): string[] {
   if (set) return set
-  const host = new URL(endpoint).hostname.toLowerCase()
+  // one trailing dot (a fully qualified name, minio.store.svc.) is the same host
+  const host = new URL(endpoint).hostname.toLowerCase().replace(/\.$/, '')
   if (host.includes(':') || host.startsWith('[')) return []
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return privateIp(host) ? [] : PRIVATE_RANGES
   if (!host.includes('.') || /\.(svc|cluster\.local|local|internal|lan|home\.arpa|localhost)$/.test(host) || host === 'localhost') return []

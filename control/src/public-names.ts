@@ -84,7 +84,8 @@ const CREDIT = /(?:\b(?:maintained|made|built|published|developed|written)\s+by|
 const DOC_RANGES = [/^192\.0\.2\.\d+$/, /^198\.51\.100\.\d+$/, /^203\.0\.113\.\d+$/, /^127\.\d+\.\d+\.\d+$/, /^0\.0\.0\.0$/, /^255\.255\.255\.255$/, /^(10\.0\.0\.0|172\.16\.0\.0|192\.168\.0\.0|169\.254\.0\.0|100\.64\.0\.0)$/]
 
 const endsWithDomain = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`)
-const reservedHost = (host: string) => /(?:^|\.)(?:example|test|invalid|localhost|home\.arpa)$/.test(host) || ['example.com', 'example.org', 'example.net'].some((d) => endsWithDomain(host, d))
+// home.arpa (RFC 8375) as the bare suffix only: a host under it (a machine of someone's home network) is a real name
+const reservedHost = (host: string) => /(?:^|\.)(?:example|test|invalid|localhost)$/.test(host) || host === 'home.arpa' || ['example.com', 'example.org', 'example.net'].some((d) => endsWithDomain(host, d))
 const realDomain = (host: string) => TLDS.has(host.split('.').pop()!)
 
 /**

@@ -35,6 +35,9 @@ describe('the rules', () => {
     expect(kinds('image ghcr.io/other/thing')).toEqual(['host'])
     expect(kinds('the store at storage.acme-corp.com')).toEqual(['host'])
     expect(kinds('cfg.spec.pageserver_connstring = x; console.log(a.b)')).toEqual([])
+    // home.arpa (RFC 8375) as the bare suffix; a machine under it is someone's, and a finding
+    expect(kinds('a name under home.arpa')).toEqual([])
+    expect(kinds('the store at nas-of-someone.home.arpa')).toEqual(['host'])
   })
 
   test('an email: only at a reserved example domain', () => {
