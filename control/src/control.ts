@@ -22,7 +22,7 @@ import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
 import { DB_API, HELD_SELECTOR, beginMaking, knownDb, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 import { parseWindows, windowAt } from './quiet-hours'
-import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_EXECS_CONFIG_MAP, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, compareSides, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
+import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_EXECS_CONFIG_MAP, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, compareSides, endOutsideSessionsSql, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
 import { exec, type ExecDeps } from './exec'
 import { durationMs } from './api/schema'
 import { PG_VERSIONS } from './storage-spec'
@@ -1541,7 +1541,7 @@ async function runMove(ns: string, name: string): Promise<void> {
     if (!mv.rehearsal) {
       // the door: new connections refused (the routes and the starts read Moving as closed), open sessions ended by the stop
       await patchDbStatus(ns, name, { phase: 'Moving', message: `moving to Postgres ${mv.to}: every connection is refused until the copy is compared and switched` })
-      await new Promise((res) => setTimeout(res, CLOSE_SETTLE_MS))
+      await new Promise((res) => setTimeout(res, MOVE_SETTLE_MS))
       await stopCompute(name, true)
     }
     await startCompute(d, { evenClosed: true })
@@ -1572,8 +1572,18 @@ async function runMove(ns: string, name: string): Promise<void> {
         if (!(COMPUTE_DATABASES as readonly string[]).includes(db)) await script('shell', [db])
         await script('load', [db])
       }
+      // the settings the dumps leave out (the compute's own databases', and the platform login's), made on the new version as the source holds them
+      const settings = await localPsql(srcPod, 'postgres', SETTINGS_COPY_SQL, 'read the settings')
+      if (settings.trim()) await localPsql(tgtPod, 'postgres', settings, 'make the settings on the new version')
       seconds = Math.round((Date.now() - t0) / 1000)
       await write({ state: 'comparing', seconds })
+      // A session that got in after the door shut (a gateway whose read of the routes failed keeps the old route; a pooled client
+      // reconnects once the source is started for the copy) is ended before the comparison, so what it wrote is compared; one there again
+      // before the switch fails the move (below). Its writes are then on the old side, never lost under an "equal".
+      if (!mv.rehearsal) {
+        const ended = Number(lines(await localPsql(srcPod, 'postgres', endOutsideSessionsSql(role), 'end the sessions that got in after the door shut'))[0] ?? 0)
+        if (ended) console.log(`move ${ns}/${name}: ${ended} session(s) that got in after the door shut ended before the comparison`)
+      }
       // each side read on its own compute, by its own superuser: what the copy made against what it was made from
       const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(srcPod, db, sql, `read ${db} on the old version`), await localPsql(tgtPod, db, sql, `read ${db} on the new version`)]
       const sides: Sides = { databases: await both('postgres', DATABASES_SQL), roles: await both('postgres', ROLES_SQL), fingerprints: {} }
@@ -1584,6 +1594,10 @@ async function runMove(ns: string, name: string): Promise<void> {
     } finally {
       clearInterval(renew)
       await localPsql(srcPod, 'postgres', dropRolesSql([role]), 'drop the move role').catch((e) => console.log(`move ${ns}/${name}: drop ${role}: ${e}`))
+    }
+    if (!mv.rehearsal) {
+      const again = lines(await localPsql(srcPod, 'postgres', outsideSessionsSql(role), 'look for sessions on the old version'))
+      if (again.length) throw new Error(`a session got in after the door shut (${again.slice(0, 3).join(', ')}): what it wrote may not be in the copy`)
     }
     if (mv.rehearsal) {
       await cleanupMove(ns, name, mv, key)
@@ -1606,8 +1620,9 @@ async function finishSwitch(ns: string, name: string): Promise<void> {
   const mv: MoveStatus = o.status.move
   const d = recordOf(o)!
   if (d.timeline !== mv.toTimeline) {
-    await stopCompute(mv.target!, true)
+    // the source first: nothing it takes after the comparison is on the copy
     await stopCompute(name, true)
+    await stopCompute(mv.target!, true)
     const old = mv.oldDatabase!
     const oldRec: Db = { name: old, namespace: ns, tenant: d.tenant, timeline: d.timeline, parent: d.root ? d.name : d.parent, from: name, root: false, mode: 'primary', port: await claimPort(RECORDS, old, d.timeline, PORT_BASE, await usedPorts()), created: d.created, pg: d.pg, closed: false }
     // the old copy's object first, marked as being copied so the loop leaves it alone until its record is written
@@ -1646,16 +1661,24 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
   const doorBack = o.spec?.closed ? { phase: 'Closed' } : { phase: 'Ready' }
   try {
     await patchDbStatus(ns, name, { answered, phase: 'Moving', message: `going back to Postgres ${mv.from}: every connection is refused until it is compared` })
-    await new Promise((res) => setTimeout(res, CLOSE_SETTLE_MS))
+    await new Promise((res) => setTimeout(res, MOVE_SETTLE_MS))
     await stopCompute(name, true)
     await startCompute(d, { evenClosed: true })
     await startCompute(oldRec, { evenClosed: true })
     const cur = (await readyPod(name)).metadata.name, old = (await readyPod(oldRec.name)).metadata.name
     await listExecs(key, [cur, old])
+    // as for the move: a session on the database that got in after the door shut is ended before the comparison, and one there again
+    // before the switch back fails it (what it wrote would be on the timeline that is given up)
+    const ended = Number(lines(await localPsql(cur, 'postgres', endOutsideSessionsSql(''), 'end the sessions that got in after the door shut'))[0] ?? 0)
+    if (ended) console.log(`move back ${ns}/${name}: ${ended} session(s) that got in after the door shut ended before the comparison`)
     const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(old, db, sql, `read ${db} on the old copy`), await localPsql(cur, db, sql, `read ${db}`)]
     const sides: Sides = { databases: await both('postgres', DATABASES_SQL), roles: await both('postgres', ROLES_SQL), fingerprints: {} }
     for (const db of lines(sides.databases[1])) sides.fingerprints[db] = await both(db, fingerprintSql(db))
     const c = compareSides(sides)
+    if (c.same) {
+      const again = lines(await localPsql(cur, 'postgres', outsideSessionsSql(''), 'look for sessions'))
+      if (again.length) throw new Error(`a session got in after the door shut (${again.slice(0, 3).join(', ')}): what it wrote would not go back`)
+    }
     await listExecs(key, null)
     await stopCompute(name, true)
     await stopCompute(oldRec.name, true)
@@ -1697,6 +1720,8 @@ const unfinalize = (o: any) => kube('PATCH', dbObjectPath(o.metadata.namespace, 
 const working = new Set<string>()
 /** How long a close waits between refusing new starts and stopping the compute: longer than any control layer pod's cache of the records. */
 const CLOSE_SETTLE_MS = 1500
+/** How long a move's door waits before the source is stopped and started for the copy: longer than two of a gateway's reads of the routes (every 5 s), so every gateway whose reads go right has dropped the route. */
+const MOVE_SETTLE_MS = 12_000
 async function reconcileDatabases() {
   if (!isLeader) return
   forgetDbs()

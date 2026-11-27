@@ -3,7 +3,7 @@ import { X509Certificate } from 'node:crypto'
 import { ENTRIES, verifiedScope } from '../src/operator/keys'
 import { PLACEMENTS_CONFIG_MAP, reconcile } from '../src/operator/reconcile'
 import { KEYS_SECRET, MANAGED_BY } from '../src/operator/render'
-import { installManifests } from '../src/install/install'
+import { OPERATOR_EXEC_POLICY, installManifests } from '../src/install/install'
 import { FakeKube } from './fake-kube'
 
 // The operator as an installer meets it: a Platform declared on a cluster of labelled machines, one pass (or a few), and what the cluster
@@ -477,5 +477,11 @@ describe('the install file', () => {
     // it grants nothing it does not hold: no bind, no escalate; and it makes no pod
     for (const r of role.rules as any[]) { expect(r.verbs).not.toContain('bind'); expect(r.verbs).not.toContain('escalate') }
     expect(role.rules.find((r: any) => r.resources.includes('pods')).verbs).not.toContain('create')
+    // the exec it holds to grant is refused it by an admission rule of its own, whatever its RBAC
+    const noExec = m.find((x) => x.kind === 'ValidatingAdmissionPolicy' && x.metadata.name === OPERATOR_EXEC_POLICY)
+    expect(noExec.spec.matchConstraints.resourceRules[0]).toMatchObject({ operations: ['CONNECT'], resources: ['pods/exec', 'pods/attach'] })
+    expect(noExec.spec.matchConditions).toEqual([{ name: 'by-the-operator', expression: "request.userInfo.username == 'system:serviceaccount:peat-system:peat-operator'" }])
+    expect(noExec.spec.validations[0].expression).toBe('false')
+    expect(m.find((x) => x.kind === 'ValidatingAdmissionPolicyBinding' && x.metadata.name === OPERATOR_EXEC_POLICY).spec).toEqual({ policyName: OPERATOR_EXEC_POLICY, validationActions: ['Deny'] })
   })
 })

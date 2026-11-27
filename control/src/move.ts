@@ -11,7 +11,7 @@
 // pg_dump read the source over TLS as that role, verified against the platform's authority, and its psql loads locally as cloud_admin. The
 // dumps never pass through the control layer; the globals and the comparison's lines do (held in memory only: never logged or stored).
 
-/** The prefix of the temporary role a move makes on its source. The gateways refuse a login of a user named so. */
+/** The prefix of the temporary role a move makes on its source. The gateways cannot tell it from any login: they pass TLS through and never see a user's name. */
 export const MOVE_ROLE_PREFIX = 'peat_move_'
 /** The roles that are the platform's own, never copied or compared: the compute's superuser and its group, and the platform's login (the
  * compute's spec makes it on both sides, with a verifier of its own salt). */
@@ -56,6 +56,16 @@ export const MOVE_ROLES_SQL = `select rolname from pg_roles where rolname like '
 /** Drops move roles, ending their sessions first. */
 export const dropRolesSql = (roles: string[]) => roles.map((r) => `select pg_terminate_backend(pid) from pg_stat_activity where usename = ${lit(r)};\ndrop role if exists ${ident(r)};`).join('\n') + '\n'
 
+// ---- the door: the sessions that got in after it shut
+
+/** A compute's sessions that are neither its own (cloud_admin's) nor the move's role's: a client that got in after the door shut (a gateway
+ * whose read of the routes failed keeps the old route, and a pooled client reconnects as soon as the source is started again for the copy). */
+const outside = (role: string) => `from pg_stat_activity where backend_type = 'client backend' and pid <> pg_backend_pid() and usename is distinct from 'cloud_admin' and usename is distinct from ${lit(role)}`
+/** Who holds such a session, one a line (the user and the database, never what it runs). */
+export const outsideSessionsSql = (role: string) => `select coalesce(usename, '-') || ' on ' || coalesce(datname, '-') ${outside(role)} order by 1;\n`
+/** Ends every such session (waiting up to 5 s for each to go), and prints how many it ended. */
+export const endOutsideSessionsSql = (role: string) => `select count(pg_terminate_backend(pid, 5000)) ${outside(role)};\n`
+
 // ---- the globals
 
 const ROLE_NAME = String.raw`("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)`
@@ -91,10 +101,24 @@ export function filterGlobals(sql: string): { sql: string; roles: string[] } {
 const SYSTEM = `('pg_catalog', 'information_schema', 'pg_toast', ${PLATFORM_SCHEMAS.map(lit).join(', ')})`
 /** The non-template databases of a compute, one a line. */
 export const DATABASES_SQL = `select datname from pg_database where not datistemplate order by 1;\n`
-/** Every role but the platform's and the moves', with its attributes, the md5 of its password's verifier (never the verifier) and its memberships. */
+/** The settings of the platform's own roles (the compute's superuser and its group) and the moves' are the compute's: not copied or compared. */
+const SETTINGS_LEFT_OUT = `coalesce(r.rolname ~ '^pg_' or r.rolname like '${MOVE_ROLE_PREFIX}%' or r.rolname in ('cloud_admin', 'neon_superuser'), false)`
+/** The settings Postgres holds for a database, a role, or a role in a database (ALTER DATABASE ... SET, ALTER ROLE ... [IN DATABASE ...] SET), by name. */
+const SETTINGS_FROM = `from pg_db_role_setting s left join pg_database d on d.oid = s.setdatabase left join pg_roles r on r.oid = s.setrole`
+/** The settings whose value Postgres holds as a list, already quoted element by element: written as they are held (pg_dump does the same). */
+const LIST_SETTINGS = ['local_preload_libraries', 'search_path', 'session_preload_libraries', 'shared_preload_libraries', 'temp_tablespaces', 'unix_socket_directories']
+/** Every role but the platform's and the moves', with its attributes, the md5 of its password's verifier (never the verifier) and its memberships; and the settings of every database and role, by name (the md5 of each list, never a value). */
 export const ROLES_SQL = `select 'role ' || rolname || ' super=' || rolsuper || ' inherit=' || rolinherit || ' createrole=' || rolcreaterole || ' createdb=' || rolcreatedb || ' login=' || rolcanlogin || ' replication=' || rolreplication || ' bypassrls=' || rolbypassrls || ' limit=' || rolconnlimit || ' verifier=' || coalesce(md5(rolpassword), '-') || ' until=' || coalesce(rolvaliduntil::text, '-') from pg_authid where rolname !~ '^pg_' and rolname not like '${MOVE_ROLE_PREFIX}%' and rolname not in (${PLATFORM_ROLES.map(lit).join(', ')}) order by rolname;
 select 'member ' || m.rolname || ' in ' || g.rolname || ' admin=' || a.admin_option || ' inherit=' || a.inherit_option || ' set=' || a.set_option from pg_auth_members a join pg_roles m on m.oid = a.member join pg_roles g on g.oid = a.roleid where m.rolname !~ '^pg_' and m.rolname not like '${MOVE_ROLE_PREFIX}%' and m.rolname not in ('cloud_admin', 'neon_superuser') and not (m.rolname = 'app' and (g.rolname ~ '^pg_' or g.rolname in (${PLATFORM_ROLES.map(lit).join(', ')}))) order by 1;
+select 'setting ' || coalesce(d.datname, '*') || '/' || coalesce(r.rolname, '*') || ' md5=' || md5(array_to_string(array(select unnest(s.setconfig) order by 1), E'\\n')) ${SETTINGS_FROM} where not ${SETTINGS_LEFT_OUT} order by 1;
 `
+
+/**
+ * The settings the dumps do not carry, read on the source as statements for the target: those of the databases the compute makes itself
+ * (`postgres` and `app` are loaded into without -C, which is what carries a made database's settings and its roles' in it), and the
+ * platform login's own (the globals leave out every ALTER ROLE of app). A list setting is written as it is held; any other is quoted.
+ */
+export const SETTINGS_COPY_SQL = `select format('alter %s set %I to %s;', case when s.setrole = 0 then 'database ' || quote_ident(d.datname) when s.setdatabase = 0 then 'role ' || quote_ident(r.rolname) else 'role ' || quote_ident(r.rolname) || ' in database ' || quote_ident(d.datname) end, split_part(c, '=', 1), case when split_part(c, '=', 1) in (${LIST_SETTINGS.map(lit).join(', ')}) then (case when substr(c, strpos(c, '=') + 1) = '""' then '''''' else substr(c, strpos(c, '=') + 1) end) else quote_literal(substr(c, strpos(c, '=') + 1)) end) ${SETTINGS_FROM}, unnest(s.setconfig) c where (d.datname in (${COMPUTE_DATABASES.map(lit).join(', ')}) or (s.setdatabase = 0 and r.rolname = 'app')) and not ${SETTINGS_LEFT_OUT} order by 1;\n`
 
 /**
  * One database's fingerprint, read by psql in unaligned tuples-only mode (one `\gexec` per table): the database's owner and privileges;
@@ -138,7 +162,7 @@ export interface Sides { databases: [string, string]; roles: [string, string]; f
 export interface Compared { same: boolean; why: string; tables: number; rows: number; databases: number; roles: number }
 
 /**
- * Whether the two sides are the same: the same databases, the same roles (attributes, verifiers, memberships), and every database's
+ * Whether the two sides are the same: the same databases, the same roles (attributes, verifiers, memberships), the same settings, and every database's
  * fingerprint equal with no unsupported object. `why` names the first difference in a line (counts and names, never a row or a verifier).
  */
 export function compareSides(s: Sides): Compared {
@@ -149,8 +173,10 @@ export function compareSides(s: Sides): Compared {
   if (dd.onlyA.length || dd.onlyB.length) return fail(`the databases differ: only on the old side ${dd.onlyA.join(', ') || '-'}; only on the new ${dd.onlyB.join(', ') || '-'}`)
   const [rA, rB] = s.roles.map(lines) as [string[], string[]]
   const rd = diff(rA, rB)
+  const name = (l: string) => l.split(' ').slice(0, 2).join(' ')
+  const settings = [...rd.onlyA, ...rd.onlyB].filter((l) => l.startsWith('setting '))
+  if (settings.length) return fail(`the settings differ (a database's, a role's or a role's in a database, as database/role): ${[...new Set(settings.map((l) => l.split(' ')[1]))].slice(0, 6).join(', ')}`)
   if (rd.onlyA.length || rd.onlyB.length) {
-    const name = (l: string) => l.split(' ').slice(0, 2).join(' ')
     return fail(`the roles differ (their attributes, passwords or memberships): ${[...new Set([...rd.onlyA, ...rd.onlyB].map(name))].slice(0, 6).join(', ')}`)
   }
   for (const db of dbA) {

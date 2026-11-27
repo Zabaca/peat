@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exitCodeOf, execPath, frame } from '../src/exec'
-import { compareSides, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, rehearsalVersion, targetNameOf } from '../src/move'
+import { ROLES_SQL, SETTINGS_COPY_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, outsideSessionsSql, rehearsalVersion, targetNameOf } from '../src/move'
 
 // The move's pure parts: the globals filtered, the two sides compared, the decision of the database loop; and the exec's framing.
 
@@ -63,6 +63,36 @@ describe('the temporary role', () => {
     expect(sql).toContain(`create role "peat_move_ab12" superuser login connection limit 4 password 'p' valid until '`)
     expect(() => makeRoleSql('lake_writer', 'p', 10)).toThrow('not a move role')
     expect(dropRolesSql(['peat_move_ab12'])).toContain('pg_terminate_backend')
+  })
+})
+
+describe('the door', () => {
+  test('the sessions that got in after it shut are every client but the compute\'s own and the move\'s; ending them waits for each to go', () => {
+    for (const sql of [outsideSessionsSql('peat_move_ab12'), endOutsideSessionsSql('peat_move_ab12')]) {
+      expect(sql).toContain("backend_type = 'client backend' and pid <> pg_backend_pid() and usename is distinct from 'cloud_admin' and usename is distinct from 'peat_move_ab12'")
+    }
+    expect(endOutsideSessionsSql('')).toContain('pg_terminate_backend(pid, 5000)')
+    // who, never what it runs
+    expect(outsideSessionsSql('')).not.toContain('query')
+  })
+})
+
+describe('the settings (ALTER DATABASE ... SET, ALTER ROLE ... [IN DATABASE ...] SET)', () => {
+  test('compared for every database and role but the compute\'s own, by name, as the md5 of each list', () => {
+    expect(ROLES_SQL).toContain("select 'setting ' || coalesce(d.datname, '*') || '/' || coalesce(r.rolname, '*') || ' md5=' || md5(")
+    expect(ROLES_SQL).toContain("r.rolname in ('cloud_admin', 'neon_superuser')")
+  })
+  test('copied for the databases the compute makes and for the platform login, which the dumps leave out; a list setting as it is held', () => {
+    expect(SETTINGS_COPY_SQL).toContain("where (d.datname in ('postgres', 'app') or (s.setdatabase = 0 and r.rolname = 'app'))")
+    expect(SETTINGS_COPY_SQL).toContain("'search_path'")
+    expect(SETTINGS_COPY_SQL).toContain('quote_literal(')
+  })
+  test('a setting on one side only is never equal, said apart from the roles', () => {
+    const roles = (extra: string): [string, string] => ['role lake_reader verifier=1\nsetting app/* md5=a', `role lake_reader verifier=1${extra}`]
+    const sides = (r: [string, string]) => ({ databases: ['app', 'app'] as [string, string], roles: r, fingerprints: { app: ['', ''] as [string, string] } })
+    expect(compareSides(sides(roles(''))).why).toBe("the settings differ (a database's, a role's or a role's in a database, as database/role): app/*")
+    expect(compareSides(sides(roles('\nsetting app/* md5=b'))).same).toBe(false)
+    expect(compareSides(sides(roles('\nsetting app/* md5=a'))).same).toBe(true)
   })
 })
 

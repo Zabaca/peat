@@ -15,6 +15,7 @@ import { GROUP } from '../names'
 import { OPERATOR_NAMESPACE } from '../operator/render'
 
 export const OPERATOR_ACCOUNT = 'peat-operator'
+export const OPERATOR_EXEC_POLICY = 'peat-operator-runs-no-exec'
 const RECORDS_CRDS = join(import.meta.dir, '../../../storage_controller/kubernetes/crds.yaml')
 const labels = { 'app.kubernetes.io/name': 'peat', 'app.kubernetes.io/component': 'operator' }
 const ALL = ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete']
@@ -55,6 +56,18 @@ export function installManifests(image: string): Record<string, unknown>[] {
       ],
     },
     { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRoleBinding', metadata: meta(OPERATOR_ACCOUNT), roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: OPERATOR_ACCOUNT }, subjects: [{ kind: 'ServiceAccount', name: OPERATOR_ACCOUNT, namespace: OPERATOR_NAMESPACE }] },
+    // The operator holds exec only to grant it to the control layer (the API server refuses a grant of a right the granter does not hold,
+    // and does not look at admission rules), and runs none: this rule refuses every exec and attach by its account, in any namespace.
+    {
+      apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', metadata: meta(OPERATOR_EXEC_POLICY),
+      spec: {
+        failurePolicy: 'Fail',
+        matchConstraints: { resourceRules: [{ apiGroups: [''], apiVersions: ['v1'], operations: ['CONNECT'], resources: ['pods/exec', 'pods/attach'] }] },
+        matchConditions: [{ name: 'by-the-operator', expression: `request.userInfo.username == 'system:serviceaccount:${OPERATOR_NAMESPACE}:${OPERATOR_ACCOUNT}'` }],
+        validations: [{ expression: 'false', message: "the operator's account runs no exec and attaches to no pod: it holds pods/exec only to grant it to the control layer" }],
+      },
+    },
+    { apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicyBinding', metadata: meta(OPERATOR_EXEC_POLICY), spec: { policyName: OPERATOR_EXEC_POLICY, validationActions: ['Deny'] } },
     {
       apiVersion: 'apps/v1', kind: 'Deployment', metadata: meta(OPERATOR_ACCOUNT, OPERATOR_NAMESPACE),
       spec: {

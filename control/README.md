@@ -110,14 +110,19 @@ login. Neon has no in-place major upgrade, so a move is a copy, in the control l
 
 - A new timeline of the newer version is made in the database's own tenant, and a compute of its own (an internal name, `mv-...`) is
   started on it.
-- The door is shut (`phase: Moving`: new connections are refused, open sessions ended) for the copy's length.
+- The door is shut (`phase: Moving`: new connections are refused, open sessions ended) for the copy's length. The control layer waits
+  12 s (two of a gateway's reads of its routes) before it stops the old compute and starts it again for the copy. A gateway whose read
+  failed keeps the old route, so a client may still get in. Every session that is not the compute's own or the move's is then ended
+  before the comparison (what it wrote is compared), and the move fails if one is there again after the comparison. What is not covered:
+  a client that, through such a gateway, connects, writes and leaves in the seconds between the comparison and the old compute's stop.
 - A temporary superuser, `peat_move_<hex>`, is made on the old compute. The new compute reads the old one over TLS as that role,
   verified against the platform's authority:
-  - every role (its password's verifier, its attributes, its memberships), then every database (each object made by its own owner);
+  - every role (its password's verifier, its attributes, its memberships, its settings), then every database (each object made by
+    its own owner, and its settings and its roles' settings in it);
   - and loads it all locally.
-- Both sides are compared: the database list, the roles, and every database's tables (rows hashed), views, sequences, functions,
-  triggers, types, indexes, constraints, privileges and default privileges. A database holding what the comparison cannot read (a
-  foreign table) fails the move, and the message names it.
+- Both sides are compared: the database list, the roles, the settings (of each database, each role, and each role in a database), and
+  every database's tables (rows hashed), views, sequences, functions, triggers, types, indexes, constraints, privileges and default
+  privileges. A database holding what the comparison cannot read (a foreign table) fails the move, and the message names it.
 - Equal, the database's record is pointed at the new timeline and version, and the door opens. The old timeline is kept as a stopped
   database `<name>-pg<old>` for `keepOldFor` (30 days by default), then deleted, its data then held as any deleted database's.
 
@@ -138,11 +143,19 @@ What a move leaves out of the copy and the comparison, matched by exact name, ne
 A person's role granted to `app`, and a person's role's membership in `neon_superuser`, are copied.
 
 What guards it:
-- The control layer may exec only into the two pods a move lists in the ConfigMap `peat-move-execs`, only `psql` or
+- The control layer may exec only into a compute's container in a pod listed in the ConfigMap `peat-move-execs`, only `psql` or
   `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). An admission
   rule enforces it; with no list, no exec passes.
-- The rule does not bound `psql`'s arguments, so within a listed pod the control layer may run any SQL as its local superuser while the
-  move lasts.
+- The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-execs`
+  among them, so a control layer that misbehaves can list any compute. The list bounds what a move does, not what the account could do.
+- The rule does not bound `psql`'s arguments, so in a listed pod the control layer may run any SQL as the local superuser, and so any
+  shell command in that container (`\!`, `-o '|command'`, `COPY ... TO PROGRAM`).
+- The rule is an admission policy and its binding: if either is missing (deleted, or a cluster without admission policies), nothing but
+  RBAC bounds the control layer's exec, which then reaches every pod in the compute namespace.
+- The operator holds `pods/exec` in every namespace, only to grant it to the control layer (Kubernetes refuses a grant of a right the
+  granter does not hold, and its check does not look at admission rules). A rule of the install file, `peat-operator-runs-no-exec`,
+  refuses every exec and attach by the operator's account. Its reach: the operator may also change admission policies (it makes the
+  guards), so the rule bounds a fault in the operator, not an operator that sets out to remove it.
 - The temporary role is reachable through the gateways like any login (the front door passes TLS through and never sees a user's name).
   Its protection is its 256-bit random password, a validity of 10 minutes renewed every 3, a limit of four connections, and its drop on
   every exit: success, failure, and a control layer that restarted (the next attempt drops every `peat_move_` role it finds).

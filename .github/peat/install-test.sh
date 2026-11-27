@@ -412,6 +412,10 @@ refused_exec 'a command other than psql or the move script, in a listed pod' 'ma
 refused_exec 'bash with a script of its own, in a listed pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- bash -c id
 [ "$(k "${as_control[@]}" -n peat-compute exec "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1')" = 1 ] || fail 'the exec guard refused psql in a listed pod'
 echo "  allowed: psql in a listed pod"
+# the operator holds exec only to grant it: its own rule refuses it any, in a listed pod too
+if out=$(k --as=system:serviceaccount:peat-system:peat-operator -n peat-compute exec "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1' 2>&1); then fail "the operator's account was let exec"; fi
+grep -qF "runs no exec" <<< "$out" || fail "the operator's exec was refused, but not by its rule: $out"
+echo "  refused: an exec by the operator's account, into a listed pod"
 k -n peat delete configmap peat-move-execs >/dev/null
 
 step "a database moved from Postgres 18 to 19 under its own name (P2), with a second database and a second role of its own"
@@ -430,6 +434,13 @@ mvsql 'create database reports owner reporter'
 mvsql 'create table r (i int)' reports reporter-pw reporter
 mvsql 'insert into r select generate_series(1, 42)' reports reporter-pw reporter
 mvsql 'create view r_view as select i from r where i > 40' reports reporter-pw reporter
+# settings the dumps of the compute's own databases leave out: a database's, the platform login's, a role's in a database of its own
+mvsql 'alter database app set search_path = myapp, public'
+mvsql "alter role app set statement_timeout = '5min'"
+mvsql "alter role reporter in database reports set work_mem = '16MB'"
+settings_kept() { # settings_kept <when>
+  [ "$(mvsql 'show search_path')/$(mvsql 'show statement_timeout')/$(mvsql 'show work_mem' reports reporter-pw reporter)" = 'myapp, public/5min/16MB' ] || fail "the settings of app, its login or reporter in reports were lost $1"
+}
 move_done() { # move_done <seconds>: the move's state once it ends
   local t0 state; t0=$(date +%s)
   until state=$(k -n shop get database mv18 -o jsonpath='{.status.move.state}') && case "$state" in done|failed|refused) true;; *) false;; esac; do
@@ -454,9 +465,10 @@ t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -l
 case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but not on Postgres 19';; esac
 [ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all on 19'
 [ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'the second role, its password or its database did not come with the move'
+settings_kept 'in the move'
 [ "$(k -n shop get database mv18-pg18 -o jsonpath='{.status.pgVersion}')" = 18 ] || fail 'the old copy mv18-pg18 was not kept'
 if k -n peat get configmap peat-move-execs -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
-echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, its old copy mv18-pg18 kept on 18"
+echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, the settings, its old copy mv18-pg18 kept on 18"
 
 step "the way back from the move, while nothing was written since"
 k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
@@ -488,6 +500,7 @@ retunnel control 18080
 t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'mv18 did not answer after the resumed move'; sleep 3; done
 case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but not on Postgres 19';; esac
 [ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all on 19 after the resumed move'
+settings_kept 'in the resumed move'
 computes_now=$(k -n peat-compute get pods -l app=peat-compute -o name | wc -l | tr -d ' ')
 if k -n peat-compute get deployments -o name | grep -q 'compute-mv-'; then fail "the move left its own compute behind"; fi
 echo "  resumed and done on 19 (computes now: $computes_now); waiting for keepOldFor (30 s) to delete mv18-pg18"
@@ -495,6 +508,46 @@ t0=$(date +%s); while k -n shop get database mv18-pg18 >/dev/null 2>&1; do [ "$(
 held_old=$(k -n peat get configmap -l peat-held=true -o jsonpath='{range .items[?(@.data.name=="mv18-pg18")]}{.data.deleteAfter}{end}')
 [ -n "$held_old" ] || fail "the old copy's data was not held as a deleted database's"
 echo "  mv18-pg18 deleted after its keepOldFor; its data held until $held_old"
+
+step "a session that got in after a move's door shut (as through a gateway whose route is out of date) is ended, and what it wrote is never lost"
+dbobj ss18 'pgVersion: 18'
+phase_is ss18 Ready 120
+t0=$(date +%s); until k -n shop get secret ss18-login >/dev/null 2>&1; do [ "$(since "$t0")" -lt 60 ] || fail 'ss18 has no login'; sleep 2; done
+ss_password=$(k -n shop get secret ss18-login -o jsonpath='{.data.password}' | base64 -d)
+sssql() { PGPASSWORD="$ss_password" psql "host=ss18.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+t0=$(date +%s); until sssql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'ss18 did not answer'; sleep 3; done
+sssql 'create table w (id int primary key)'
+# stopped first, so the first compute of ss18 that is ready after the version is raised is its source, started again for the copy
+curl -fsS -X POST localhost:18080/db/ss18/stop >/dev/null || fail 'ss18 was not stopped'
+t0=$(date +%s); while k -n peat-compute get pods -l compute=ss18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'ss18 did not stop'; sleep 2; done
+k -n shop patch database ss18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
+t0=$(date +%s); until ss_pod=$(k -n peat-compute get pods -l compute=ss18 -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null) && [ -n "$ss_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
+[ "$(k -n shop get database ss18 -o jsonpath='{.status.phase}')" = Moving ] || fail 'the source was started, but the door is not shut'
+# straight to the source, a session that writes a row every 0.3 s and prints each one written (psql stops at the first error)
+k -n peat-compute port-forward "pod/$ss_pod" 25432:5432 >>"$work/tunnel-ss.log" 2>&1 &
+pids+=($!); ss_tunnel=$!
+tunnel_up 25432
+( i=0; while :; do i=$((i+1)); printf 'insert into w values (%d);\n\\echo ok %d\n' "$i" "$i"; sleep 0.3; done ) | psql "host=127.0.0.1 port=25432 user=app dbname=app sslmode=disable connect_timeout=10" -XAtq -v ON_ERROR_STOP=1 >"$work/ss-written" 2>"$work/ss-writer.err" &
+pids+=($!); ss_writer=$!
+t0=$(date +%s); until state=$(k -n shop get database ss18 -o jsonpath='{.status.move.state}') && case "$state" in done|failed|refused) true;; *) false;; esac; do
+  [ "$(since "$t0")" -lt 900 ] || fail "ss18's move did not end in 900 s: $state"
+  sleep 2
+done
+written=$(grep -c '^ok ' "$work/ss-written" || true)
+writer_left=no; kill -0 "$ss_writer" 2>/dev/null && writer_left=yes
+kill "$ss_writer" "$ss_tunnel" 2>/dev/null || true
+[ "$written" -gt 0 ] || fail "the session never wrote to the source: $(cat "$work/ss-writer.err")"
+[ "$writer_left" = no ] || fail "the session on the source was still open after the move ended ($state)"
+case "$state" in
+  done) want=19;;
+  failed) want=18; phase_is ss18 Ready 120;;
+  *) fail "ss18's move ended $state: $(k -n shop get database ss18 -o jsonpath='{.status.move.message}')";;
+esac
+t0=$(date +%s); until got=$(sssql "select count(*) from w where id <= $written") 2>/dev/null; do [ "$(since "$t0")" -lt 240 ] || fail 'ss18 did not answer after its move'; sleep 3; done
+case "$(sssql 'show server_version_num')" in "$want"*) ;; *) fail "ss18's move ended $state, but it is not on Postgres $want";; esac
+[ "$got" = "$written" ] || fail "the move ended $state and $((written - got)) of the $written rows the session wrote are lost"
+echo "  the session wrote $written rows and was ended; the move $state, and every row is on Postgres $want: $(k -n shop get database ss18 -o jsonpath='{.status.move.message}' | cut -c1-200)"
+k -n shop delete database ss18 --wait=false >/dev/null
 
 if [ -n "${UPGRADE_FROM:-}" ]; then
   step "the upgrade from $UPGRADE_FROM to this run's images, a writer and a reader running throughout"
