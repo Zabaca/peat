@@ -22,7 +22,7 @@ import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
 import { DB_API, HELD_SELECTOR, beginMaking, knownDb, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 import { parseWindows, windowAt } from './quiet-hours'
-import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_EXECS_CONFIG_MAP, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, writtenSince, endOutsideSessionsSql, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
+import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_EXECS_CONFIG_MAP, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, writtenSince, endOutsideSessionsSql, moveFailure, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
 import { exec, type ExecDeps } from './exec'
 import { durationMs } from './api/schema'
 import { PG_VERSIONS } from './storage-spec'
@@ -1628,7 +1628,7 @@ async function runMove(ns: string, name: string): Promise<void> {
   } catch (e) {
     console.log(`move ${ns}/${name}: ${e}`)
     await cleanupMove(ns, name, mv, key).catch((e2) => console.log(`move ${ns}/${name}: clean up: ${e2}`))
-    await write({ state: 'failed', message: `${String(e).slice(0, 400)}; nothing was switched (requests.retryMove asks again)` }, mv.rehearsal ? {} : doorBack())
+    await write({ state: 'failed', message: `${moveFailure(e).slice(0, 500)}; nothing was switched (requests.retryMove asks again)` }, mv.rehearsal ? {} : doorBack())
   }
 }
 
@@ -1725,7 +1725,7 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
     await patchDbStatus(ns, name, { ...doorBack, move: { ...mv, state: 'back', message: `back on Postgres ${mv.from}: the database equalled its old copy; the Postgres ${mv.to} timeline is held` }, message: `back on Postgres ${mv.from}` })
   } catch (e) {
     await listExecs(key, null).catch(() => {})
-    await patchDbStatus(ns, name, { ...doorBack, message: `the way back failed, nothing was switched: ${String(e).slice(0, 300)}` }).catch(() => {})
+    await patchDbStatus(ns, name, { ...doorBack, message: `the way back failed, nothing was switched: ${moveFailure(e).slice(0, 400)}` }).catch(() => {})
   }
 }
 /** Old copies whose keepOldFor is over are deleted (their data then held, as any deleted database's). */

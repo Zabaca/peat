@@ -214,6 +214,18 @@ export function compareSides(s: Sides): Compared {
   return { same: true, why: '', tables, rows, databases: dbA.length, roles: rA.filter((l) => l.startsWith('role ')).length }
 }
 
+/**
+ * A failure of a move said with its cause first when it is a size or a space the copy ran out of (Postgres's 1 GB limit on one value, a
+ * compute out of memory, its disk for temporary files full), which the tool's own words name only deep in the message.
+ */
+export function moveFailure(e: unknown): string {
+  const text = String(e)
+  const cause = /invalid memory alloc request size|string too long|out of memory/i.test(text) ? 'a value or a sort larger than a compute can hold (Postgres takes at most 1 GB in one value)'
+    : /No space left on device|could not extend file|could not write to (file|temporary file)/i.test(text) ? "the compute's disk for temporary files is full (an index or a sort of a large table)"
+    : ''
+  return cause ? `a size limit was reached: ${cause}: ${text}` : text
+}
+
 // ---- the script the target compute runs
 
 /**

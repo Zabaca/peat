@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exitCodeOf, execPath, frame } from '../src/exec'
-import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
+import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, moveFailure, oldNameOf, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
 
 // The move's pure parts: the globals filtered, the two sides compared, the decision of the database loop; and the exec's framing.
 
@@ -103,6 +103,14 @@ describe('the settings (ALTER DATABASE ... SET, ALTER ROLE ... [IN DATABASE ...]
     expect(compareSides(sides(roles(''))).why).toBe("the settings differ (a database's, a role's or a role's in a database, as database/role): app/*")
     expect(compareSides(sides(roles('\nsetting app/* md5=b'))).same).toBe(false)
     expect(compareSides(sides(roles('\nsetting app/* md5=a'))).same).toBe(true)
+  })
+})
+
+describe('a failure said', () => {
+  test('a size or a space the copy ran out of is named first; anything else as it was', () => {
+    expect(moveFailure(new Error('read app on the old version: ERROR:  invalid memory alloc request size 1073741824'))).toStartWith('a size limit was reached: a value or a sort larger than a compute can hold (Postgres takes at most 1 GB in one value): Error: read app')
+    expect(moveFailure(new Error('load app: pg_restore: error: could not write to file "base/pgsql_tmp/x": No space left on device'))).toStartWith("a size limit was reached: the compute's disk for temporary files is full")
+    expect(moveFailure(new Error('the copy is not the same: app differs'))).toBe('Error: the copy is not the same: app differs')
   })
 })
 
