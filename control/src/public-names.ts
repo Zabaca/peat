@@ -61,6 +61,7 @@ export const GITHUB_OWNERS: Record<string, string> = {
   neondatabase: 'Neon: the code Peat is forked from',
   'jclab-oss': 'the community fork Peat was forked at',
   'kubernetes-sigs': 'kind, the throwaway cluster of the install test',
+  'etcd-io': "etcd: the release whose etcdctl and etcdutl the storage controller's etcd restore test runs",
   'cert-manager': 'cert-manager',
   oven: 'Bun',
   minio: 'MinIO',
