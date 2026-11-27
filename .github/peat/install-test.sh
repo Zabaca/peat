@@ -10,6 +10,8 @@
 # in the cluster, the storage controller's records a Postgres in the cluster (records postgres: the Kubernetes records come with the
 # controller that keeps them). The platform is a one-machine trial (spread none) on the cluster's one node. Needs kind, kubectl, docker,
 # bun and psql on the PATH (KIND names another kind). KEEP=1 keeps the cluster afterwards; it is deleted otherwise, pass or fail.
+# UPGRADE_FROM=<a release in the registry> installs that release first (its storage and compute images, this control image) and, after
+# the databases' checks, upgrades the platform to the images given, with a writer and a reader running throughout.
 set -euo pipefail
 storage=${1:?storage image}; compute18=${2:?compute 18 image}; compute19=${3:?compute 19 image}; control=${4:?control image}
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../.." && pwd)
@@ -119,8 +121,8 @@ apiVersion: peat.zabaca.com/v1alpha1
 kind: Platform
 metadata: { name: peat }
 spec:
-  release: ci
-  images: { storage: "$storage", control: "$control", compute: { "18": "$compute18", "19": "$compute19" } }
+  release: ${UPGRADE_FROM:-ci}
+  images: $(if [ -n "${UPGRADE_FROM:-}" ]; then echo "{ control: \"$control\" }"; else echo "{ storage: \"$storage\", control: \"$control\", compute: { \"18\": \"$compute18\", \"19\": \"$compute19\" } }"; fi)
   spread: none
   objectStore: { endpoint: "http://minio.store.svc:9000", region: us-east-1, bucket: peat, credentialsSecret: peat-store }
   pageservers: { count: 1, storage: { hostPath: { path: /var/lib/peat/pageserver, create: true } } }
@@ -143,6 +145,19 @@ done
 ready_s=$(since "$t0")
 echo "  Ready $ready_s s after the Platform was applied; survives: $(k get platform peat -o jsonpath='{.status.survives}')"
 k get platform peat -o jsonpath='{range .status.pieces[*]}{.kind} {.name} {.release} {.ready}{"\n"}{end}'
+
+echo "== steady: the operator writes nothing to a settled platform"
+# the spec of every object it made (a generation where the kind has one, else the resourceVersion), read twice, three passes apart
+sel='app.kubernetes.io/managed-by=peat-operator'
+made_now() {
+  k get deploy,sts,job,networkpolicy -A -l "$sel" -o jsonpath='{range .items[*]}{.kind}/{.metadata.namespace}/{.metadata.name} {.metadata.generation}{"\n"}{end}'
+  k get validatingadmissionpolicy,validatingadmissionpolicybinding -l "$sel" -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.generation}{"\n"}{end}'
+  k get svc,configmap,secret,serviceaccount,role,rolebinding -A -l "$sel" -o jsonpath='{range .items[*]}{.kind}/{.metadata.namespace}/{.metadata.name} {.metadata.resourceVersion}{"\n"}{end}'
+}
+sleep 15; made_now | sort > "$work/steady-1"
+sleep 35; made_now | sort > "$work/steady-2"
+if ! diff -q "$work/steady-1" "$work/steady-2" >/dev/null; then diff "$work/steady-1" "$work/steady-2" | head -20; fail 'the operator changed objects of a settled platform'; fi
+echo "  $(wc -l < "$work/steady-1" | tr -d ' ') objects of the operator's unchanged over three of its passes"
 
 echo "== the guards, judged by the cluster's own API server, as the control layer's account"
 as=(--as=system:serviceaccount:peat:peat-control)
@@ -192,13 +207,30 @@ spec:
   namespaces: { platform: elsewhere }
   objectStore: { endpoint: "http://minio.store.svc:9000", bucket: peat, credentialsSecret: peat-store }
 EOF
+kind_refused 'adopt is not in this release' <<EOF
+apiVersion: peat.zabaca.com/v1alpha1
+kind: Platform
+metadata: { name: peat }
+spec:
+  release: ${UPGRADE_FROM:-ci}
+  objectStore: { endpoint: "http://minio.store.svc:9000", bucket: peat, credentialsSecret: peat-store }
+  adopt: [{ kind: Deployment, namespace: peat, name: storage-broker }]
+EOF
 
 # The tunnels to the control layer and the front door. kubectl port-forward ends when its stream is lost (seen under a client that
 # reconnects ten times a second), so each runs in a loop that starts it again, its errors kept for the failure dump, and every step
 # from here on first checks that both answer.
 tunnel() { # tunnel <name> <namespace> <service> <ports>
-  ( while :; do k -n "$2" port-forward "svc/$3" "$4" >>"$work/tunnel-$1.log" 2>&1; echo "$(date -u +%H:%M:%S) ended; started again" >>"$work/tunnel-$1.log"; sleep 1; done ) &
+  # (|| true: under set -e an ended kubectl would end the loop with it)
+  ( while :; do k -n "$2" port-forward "svc/$3" "$4" >>"$work/tunnel-$1.log" 2>&1 || true; echo "$(date -u +%H:%M:%S) ended; started again" >>"$work/tunnel-$1.log"; sleep 1; done ) &
   pids+=($!)
+  eval "tunnel_$1=$!"
+}
+# a port-forward is held to the one pod it picked: after that pod goes (a rollout), its kubectl is ended so the loop starts it on a new one
+retunnel() { # retunnel <name> <port>
+  local pid; eval "pid=\$tunnel_$1"
+  pkill -P "$pid" 2>/dev/null || true
+  sleep 2; tunnel_up "$2"
 }
 tunnel_up() { # tunnel_up <port>: it accepts a connection within 30 s
   local t0; t0=$(date +%s)
@@ -341,4 +373,51 @@ peatc delete cli-made -n shop --yes || fail 'peat delete failed'
 peatc status | grep -q '^peat: Ready' || fail 'peat status does not say Ready'
 echo "  the compiled command: make, list, url, ca, branch (30 rows), restore to a moment (10 rows), stop, close, open, delete and status, each through the kubeconfig"
 
-echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s"
+upgrade_s=''; max_gap=''
+if [ -n "${UPGRADE_FROM:-}" ]; then
+  step "the upgrade from $UPGRADE_FROM to this run's images, a writer and a reader running throughout"
+  curl -fsS -X POST localhost:18080/db -H 'content-type: application/json' -d '{"name":"upg"}' >/dev/null || fail 'the upgrade test database was not made'
+  upg_password=$(k -n peat get secret db-upg-login -o jsonpath='{.data.password}' | base64 -d)
+  upg() { PGPASSWORD="$upg_password" psql "host=upg.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/ca.crt connect_timeout=5" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+  t0=$(date +%s); until upg 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'upg did not answer'; sleep 3; done
+  upg 'create table w (id int primary key, at timestamptz default now())'
+  # a table larger than the compute's cache, so every read asks the pageservers for pages (a count of a small table would be served from memory)
+  upg "create table big as select g, repeat(md5(g::text), 8) as pad from generate_series(1, 400000) g"
+  : > "$work/acked"; : > "$work/acked-at"; : > "$work/reads"
+  ( i=0; while [ ! -f "$work/stop" ]; do i=$((i + 1)); if upg "insert into w (id) values ($i)" >/dev/null 2>&1; then echo "$i" >> "$work/acked"; date +%s >> "$work/acked-at"; fi; sleep 0.1; done ) & pids+=($!)
+  ( while [ ! -f "$work/stop" ]; do if upg "select count(*), sum(length(pad)) from big where g % 97 = $((RANDOM % 97))" >/dev/null 2>&1; then date +%s >> "$work/reads"; fi; sleep 1; done ) & pids+=($!)
+  sleep 10
+  t0=$(date +%s)
+  k patch platform peat --type merge -p "{\"spec\":{\"release\":\"ci\",\"images\":{\"storage\":\"$storage\",\"control\":\"$control\",\"compute\":{\"18\":\"$compute18\",\"19\":\"$compute19\"}}}}"
+  last=''
+  until [ "$(k get platform peat -o jsonpath='{.status.release}/{.status.phase}')" = 'ci/Ready' ]; do
+    [ "$(since "$t0")" -lt 900 ] || fail "the upgrade did not finish in 15 minutes: $(k get platform peat -o jsonpath='{.status.message}')"
+    msg=$(k get platform peat -o jsonpath='{.status.phase}: {.status.message}' 2>/dev/null | cut -c1-200)
+    [ "$msg" = "$last" ] || echo "  $(since "$t0") s: $msg"; last=$msg
+    case "$msg" in Halted*) fail "the upgrade halted: $msg";; esac
+    sleep 3
+  done
+  upgrade_s=$(since "$t0")
+  sleep 10; touch "$work/stop"; sleep 3
+  acked=$(wc -l < "$work/acked" | tr -d ' ')
+  stored=$(upg 'select count(*) from w')
+  missing=$(upg "select count(*) from unnest(array[$(paste -sd, "$work/acked")]::int[]) a(id) where not exists (select 1 from w where w.id = a.id)")
+  [ "$missing" = 0 ] || fail "$missing acknowledged inserts are missing after the upgrade ($acked acknowledged, $stored stored)"
+  max_gap=$(awk 'NR > 1 && $1 - p > m { m = $1 - p } { p = $1 } END { print m + 0 }' "$work/reads")
+  max_write_gap=$(awk 'NR > 1 && $1 - p > m { m = $1 - p } { p = $1 } END { print m + 0 }' "$work/acked-at")
+  # the proof's bound (P3): no gap a reader or a writer sees passes 30 seconds
+  [ "$max_gap" -le 30 ] || fail "a reader waited $max_gap s during the upgrade (the bound is 30)"
+  [ "$max_write_gap" -le 30 ] || fail "a writer waited $max_write_gap s during the upgrade (the bound is 30)"
+  k get platform peat -o jsonpath='{range .status.pieces[*]}  {.kind} {.name} {.release}{"\n"}{end}'
+  # a database woken after the upgrade runs the new compute image (the control layer and the gateways rolled: their tunnels start again)
+  retunnel control 18080; retunnel front 15432
+  curl -fsS -X POST localhost:18080/db/upg/stop >/dev/null || fail 'upg was not stopped'
+  t0=$(date +%s); while k -n peat-compute get pods -l compute=upg -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'upg did not go to sleep'; sleep 2; done
+  # the first start on the new compute image may pull it first
+  t0=$(date +%s); until upg 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'upg did not wake after the upgrade'; sleep 3; done
+  woke_on=$(k -n peat-compute get pods -l compute=upg -o jsonpath='{.items[0].spec.containers[0].image}')
+  [ "$woke_on" = "$compute19" ] || fail "upg woke on $woke_on, not the new compute image $compute19"
+  echo "  the upgrade took $upgrade_s s; $acked inserts acknowledged, none missing ($stored stored); the longest gaps: a reader's $max_gap s, a writer's $max_write_gap s; upg woke on the new compute image"
+fi
+
+echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s${upgrade_s:+, an upgrade in $upgrade_s s (the longest gaps: $max_gap s reading, $max_write_gap s writing)}"

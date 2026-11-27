@@ -1,5 +1,7 @@
 // An API server in memory, enough of one for the operator's tests: objects by path, lists by label (equality only), create, replace,
 // server-side apply (as a whole-object replace that keeps status and the server's metadata), merge patch, status patch, delete.
+import { check } from '../src/api/schema'
+import { KINDS } from '../src/api/v1alpha1'
 import { pluralOf, type Answer, type Kube } from '../src/kube'
 
 const clone = <T>(v: T): T => structuredClone(v)
@@ -8,6 +10,13 @@ function merge(into: any, patch: any): any {
   const out = into && typeof into === 'object' && !Array.isArray(into) ? { ...into } : {}
   for (const [k, v] of Object.entries(patch)) { if (v === null) delete out[k]; else out[k] = merge(out[k], v) }
   return out
+}
+
+/** An empty list is not stored, as a real API server stores none (its fields are omitempty): a test sees what a real one keeps. */
+function dropEmptyLists(v: any): any {
+  if (Array.isArray(v)) return v.map(dropEmptyLists)
+  if (!v || typeof v !== 'object') return v
+  return Object.fromEntries(Object.entries(v).filter(([, x]) => !(Array.isArray(x) && x.length === 0)).map(([k, x]) => [k, dropEmptyLists(x)]))
 }
 
 /** `/api/v1/namespaces/a/pods/b` into its parts. */
@@ -31,6 +40,7 @@ export class FakeKube implements Kube {
 
   private keyOf(group: string, ns: string | null, plural: string, name: string) { return `${group}|${ns ?? ''}|${plural}|${name}` }
   put(o: any) {
+    o = dropEmptyLists(o)
     const plural = pluralOf(o.kind)
     const group = o.apiVersion
     const stored = { ...clone(o), metadata: { creationTimestamp: new Date(1_800_000_000_000 + this.rv * 1000).toISOString(), uid: `uid-${this.rv}`, generation: 1, ...clone(o.metadata), resourceVersion: String(this.rv++) } }
@@ -50,7 +60,8 @@ export class FakeKube implements Kube {
     const q = new URLSearchParams(query ?? '')
     const { group, ns, plural, name, sub } = parse(bare)
     const k = name ? this.keyOf(group, ns, plural, name) : ''
-    const parsed = typeof body === 'string' ? JSON.parse(body) : body
+    // a body as the API server receives it: JSON (a field set to undefined is not sent at all)
+    const parsed = body === undefined ? undefined : typeof body === 'string' ? JSON.parse(body) : JSON.parse(JSON.stringify(body))
     if (method === 'GET' && !name) {
       const sel = (q.get('labelSelector') ?? '').split(',').filter(Boolean).map((x) => x.split('=') as [string, string])
       const items = [...this.objects.entries()].filter(([key]) => { const [g, n, pl] = key.split('|'); return g === group && pl === plural && (ns === null || n === ns) }).map(([, v]) => v)
@@ -73,15 +84,35 @@ export class FakeKube implements Kube {
     }
     if (method === 'PATCH' && sub === 'status') {
       if (!live) return { status: 404, json: { message: 'not found' } }
-      live.status = merge(live.status ?? {}, (parsed as any).status)
+      const next = merge(live.status ?? {}, (parsed as any).status)
+      // the API server keeps only the fields a kind's status schema names (it prunes the rest): here a field it would drop is an error, so a test sees it
+      const kind = KINDS[live.kind as keyof typeof KINDS]
+      if (kind) { const unknown = check(kind.status, next).filter((e) => e.endsWith('is not a field')); if (unknown.length) throw new Error(`the API server would drop these status fields of ${live.kind} ${live.metadata.name}: ${unknown.join(', ')}`) }
+      live.status = next
       return { status: 200, json: clone(live) }
     }
+    // a Job's pod template cannot change, as the API server has it (422)
+    const jobTemplateChanged = (o: any) => plural === 'jobs' && live && o?.spec?.template && JSON.stringify(dropEmptyLists(o.spec.template)) !== JSON.stringify(live.spec?.template)
+    if ((method === 'PUT' || (method === 'PATCH' && contentType === 'application/apply-patch+yaml')) && jobTemplateChanged(parsed)) return { status: 422, json: { message: 'spec.template: field is immutable' } }
     if (method === 'PATCH' && contentType === 'application/apply-patch+yaml') {
       const o = parsed as any
       const data = o.stringData ? { data: Object.fromEntries(Object.entries(o.stringData).map(([a, v]) => [a, Buffer.from(String(v)).toString('base64')])) } : {}
       const next = { ...o, ...data, stringData: undefined, metadata: { ...(live?.metadata ?? {}), ...o.metadata }, ...(live?.status ? { status: live.status } : {}) }
       if (live) next.metadata.generation = (live.metadata.generation ?? 1) + (JSON.stringify(live.spec) === JSON.stringify(o.spec) ? 0 : 1)
       return { status: live ? 200 : 201, json: clone(this.put(next)) }
+    }
+    if (method === 'PATCH' && contentType === 'application/json-patch+json') {
+      if (!live) return { status: 404, json: { message: 'not found' } }
+      const next = clone(live)
+      for (const op of parsed as { op: string; path: string; value: unknown }[]) {
+        const parts = op.path.split('/').slice(1)
+        let at: any = next
+        for (const part of parts.slice(0, -1)) at = at[part]
+        if (op.op !== 'replace' && op.op !== 'add') return { status: 422, json: { message: `${op.op} not handled` } }
+        at[parts.at(-1)!] = op.value
+      }
+      next.metadata.generation = (live.metadata.generation ?? 1) + (JSON.stringify(live.spec) === JSON.stringify(next.spec) ? 0 : 1)
+      return { status: 200, json: clone(this.put(next)) }
     }
     if (method === 'PATCH') {
       if (!live) return { status: 404, json: { message: 'not found' } }

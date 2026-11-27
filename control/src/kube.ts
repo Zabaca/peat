@@ -97,7 +97,8 @@ export function fromKubeconfig(opts: { path?: string; context?: string; namespac
     key: b64(user['client-key-data']) ?? file(user['client-key'], base),
     insecure: cluster['insecure-skip-tls-verify'] === true,
     token,
-    namespace: opts.namespace ?? ctx.namespace ?? 'default',
+    // an empty namespace (a context's "") is unset, as kubectl reads it
+    namespace: opts.namespace || ctx.namespace || 'default',
     where: `context ${ctxName} at ${String(cluster.server).replace(/\/$/, '')}`,
   })
 }

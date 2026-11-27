@@ -21,6 +21,7 @@ import { GROUP, controlUrl, fromEnv, frontDoor, parseLabel, placement } from './
 import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
 import { DB_API, HELD_SELECTOR, beginMaking, knownDb, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
+import { parseWindows, windowAt } from './quiet-hours'
 
 const NAMES = fromEnv()
 const NS = NAMES.namespace // the control layer, the storage, the records, the leases
@@ -85,6 +86,9 @@ const S3_PREFIX = (process.env['S3_PREFIX'] || 'safekeeper').replace(/\/+$/, '')
 const CERT_ISSUER = process.env['CERT_ISSUER'] ?? ''
 const CA_DIR = process.env['CA_DIR'] ?? '/ca'
 const DB_DOMAIN = process.env['DB_DOMAIN'] ?? ''
+// The windows in which an awake database whose compute runs an image the platform no longer names is restarted onto the current one (the
+// Platform's upgrades.restartHours, as JSON): one at a time, a minute apart. Outside them it takes the new image at its next sleep and wake.
+const RESTART_HOURS = parseWindows(process.env['RESTART_HOURS'])
 
 // ---- Kubernetes, as the pod sees it
 const API = `https://${process.env['KUBERNETES_SERVICE_HOST'] ?? 'kubernetes.default.svc'}:${process.env['KUBERNETES_SERVICE_PORT'] ?? '443'}`
@@ -441,7 +445,12 @@ async function startCompute(d: Db, opts: { evenClosed?: boolean } = {}): Promise
   // created once and left to cert-manager to renew: `apply` replaces on a conflict, and a replace of a custom resource needs its resourceVersion (found 2026-11-19, the first wake: 422), so an existing one is not touched
   await ensureCertificate(d.name)
   await writeSpec(d)
-  if (dep.status === 200) ok(await kube('PATCH', depPath(d.name), { spec: { replicas: 1 } }, 'application/merge-patch+json'), `scale compute-${d.name} up`)
+  // a compute takes the platform's current image for its version at its next start (an upgrade changes the image; an awake compute keeps its own until it sleeps, or the restart hours)
+  if (dep.status === 200) {
+    const image = computeImageFor(d.pg, COMPUTE_IMAGES)
+    const stale = dep.json.spec?.template?.spec?.containers?.[0]?.image !== image
+    ok(await kube('PATCH', depPath(d.name), stale ? [{ op: 'replace', path: '/spec/template/spec/containers/0/image', value: image }, { op: 'replace', path: '/spec/replicas', value: 1 }] : [{ op: 'replace', path: '/spec/replicas', value: 1 }], 'application/json-patch+json'), `scale compute-${d.name} up`)
+  }
   else {
     ok(await kube('POST', `/apis/apps/v1/namespaces/${CNS}/deployments`, {
       apiVersion: 'apps/v1', kind: 'Deployment',
@@ -1409,6 +1418,23 @@ async function deleteDb(d: Db, holdData: boolean): Promise<void> {
 /** Every database whose object is not being deleted: what the purge must never take data from. */
 const notDeleting = async (): Promise<Db[]> => (await dbObjects()).filter((o) => !o.metadata.deletionTimestamp).map(recordOf).filter((d): d is Db => d !== null)
 
+// ---- an awake compute on an image the platform no longer names, restarted onto the current one inside the restart hours
+async function restartStaleComputes() {
+  if (!isLeader || !windowAt(RESTART_HOURS, new Date())) return
+  const deps = ok(await kube('GET', `/apis/apps/v1/namespaces/${CNS}/deployments?labelSelector=peat-compute-deploy`), 'list computes').json.items as any[]
+  for (const dep of deps) {
+    if ((dep.spec?.replicas ?? 0) < 1) continue
+    const d = await getDb(String(dep.metadata.labels?.compute ?? ''))
+    if (!d || d.closed) continue
+    if (dep.spec.template.spec.containers[0].image === computeImageFor(d.pg, COMPUTE_IMAGES)) continue
+    console.log(`restart hours: ${d.name} restarted onto the current compute image`)
+    bump('compute_image_restarts_total')
+    await stopCompute(d.name, true)
+    await startCompute(d)
+    return // one a minute
+  }
+}
+
 // ---- the Database objects: made, closed, opened, stopped and deleted as they ask (databaseAction, databases.ts, decides)
 const finalize = (o: any) => kube('PATCH', dbObjectPath(o.metadata.namespace, o.metadata.name), { metadata: { finalizers: [...(o.metadata.finalizers ?? []), FINALIZER] } }, 'application/merge-patch+json')
 const unfinalize = (o: any) => kube('PATCH', dbObjectPath(o.metadata.namespace, o.metadata.name), { metadata: { finalizers: (o.metadata.finalizers ?? []).filter((f: string) => f !== FINALIZER) } }, 'application/merge-patch+json')
@@ -2066,6 +2092,7 @@ void loop('reconcile computes', PROBE_EVERY_MS + 1000, reconcileComputes)
 void loop('reload renewed certificates', 300_000, reloadRenewedCerts)
 void loop('renew the certificates this layer signs', 3_600_000, renewOwnCerts)
 void loop('databases', 2000, reconcileDatabases)
+void loop('restart hours', 60_000, restartStaleComputes)
 void loop('remove held data whose hold is over', 3_600_000, async () => { if (isLeader) await purgeHeld(RECORDS, await notDeleting()) })
 // JavaScriptCore collects lazily and does not know the container's memory limit: run in the pod, the garbage of the loops and of every call piled up until the kernel killed the process at 256 MiB (read 2026-11-21: with the
 // program's own loops and calls, a local run of the same Bun held 1.6 MiB of heap with a full collection every 30 s and grew its live promises and closures without one). A full collection of a heap this small takes

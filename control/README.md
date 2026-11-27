@@ -15,8 +15,36 @@ made a setting, and the operator that installs and keeps a whole platform from o
 | The storage's checks | What an upgrade reads between steps (every node active, every shard attached, every secondary warm) and a pageserver's drain and fill. | `src/storage/` |
 | Shared names | Namespaces, the machine label, the dead taint, the API group: neutral defaults, each a setting. | `src/names.ts` |
 
-Still to come in this folder: the ordered upgrade (today a changed release reaches every piece at once), adoption of a platform installed
-another way, and the move of a database to a newer Postgres major (`peat move` and `pgVersion` raised are refused until then).
+Still to come in this folder: the move of a database to a newer Postgres major (`peat move` and `pgVersion` raised are refused until then).
+
+## Upgrades
+
+Changing the Platform's `release` (and its `images`, for an install that pins them) moves the platform one piece at a time: the storage
+controller and the broker; each pageserver, drained first (its shards moved to the others), restarted and filled again; each safekeeper; the
+gateways; the control layer. The whole platform is checked before and after every step (every piece ready, every pageserver Active, every
+shard attached, nothing reconciling, every secondary copy warm, every safekeeper answering). A check that does not pass within
+`upgrades.checkTimeout` (a duration, `10m` by default) halts the upgrade with the step and the reason in the status (`peat status`); it stays halted until `peat retry`
+(it goes on from that step) or until the earlier release is set back (only what had moved goes back, last first, with the same checks,
+except that the check before each step back leaves out that step's own piece and its own storage readings: it is the broken piece the way
+back mends). With two pieces broken at once the way back halts at the first it reaches: for the keepers this is the safe side (a write needs
+two of three); the way out is `suspend: true` on the Platform and a fix by hand. Changing the target's images while an upgrade is under way
+(the release kept, its images pinned anew to mend a bad one) takes back what moved and then runs the upgrade again to the new images. No
+upgrade starts from pieces that do not all run the same images (one changed by hand while no release is recorded), nor from images no
+release records (pieces without the operator's release stamp): the status says which, and nothing is recorded or started until they
+agree (pinning `spec.images` to what runs records the release under the spec's name). A drain asked again when its node reads Active also
+restarts one a person cancelled, until `upgrades.checkTimeout` halts it.
+No step starts inside `upgrades.quietHours`: an upgrade under way waits at the next step boundary. A compute takes the new image at its
+next start, or, awake, inside `upgrades.restartHours`, one at a time. The state is in `status.upgrade`, so a restarted operator goes on.
+
+## What the operator does not take over
+
+Adoption, taking over a platform installed another way, is not in this release: a Platform that names `adopt` or `requests.applyPending`
+is refused. An existing object of a piece's name that the operator did not make is refused and left alone (the Platform reads Installing,
+naming it); the operator's record of what it made, in its own namespace, decides what is its own, and it never applies over, nor deletes,
+an object outside it. A lost record (its ConfigMap deleted, a cluster restored with new UIDs) has no way back in this release: every piece
+is then refused and left alone, the status says the record was made new, and the recovery is by hand (the record rebuilt from the objects'
+UIDs, or the objects removed so the operator makes them again). Once any piece runs, a changed release goes through the ordered steps,
+from the images the live pieces run when no release has been recorded yet.
 
 ## Databases
 
@@ -64,8 +92,8 @@ platform.spec` and `kubectl explain database.spec` print the same text. In short
   per piece), `pageservers`, `safekeepers` (three or five, their zone label, `outside` machines that may hold one member), `controller`
   (`records: kubernetes` or `postgres`), `gateways` (count, `domain`, how the front door is exposed), `certificates` (a cert-manager issuer,
   or the platform's own authority), `computes` (default Postgres version, `idleAfter`, memory), `databases.deleteHold`, `upgrades`
-  (`quietHours`, `restartHours`, `checkTimeout`), `keys` (given, or made), `control`, `adopt`, `suspend`, `requests.retry`,
-  `requests.applyPending`. Every duration is a number and a unit (`30m`, `7d`). Rules across fields (a namespace never changes; a
+  (`quietHours`, `restartHours`, `checkTimeout`), `keys` (given, or made), `control`, `suspend`, `requests.retry` (`adopt` and
+  `requests.applyPending` are refused: not in this release). Every duration is a number and a unit (`30m`, `7d`). Rules across fields (a namespace never changes; a
   version never lowered; `parent`, `at` and `replicaOf` fixed once made) are the API server's, in the CustomResourceDefinitions.
 - **Database** `spec`: `pgVersion` (raising it moves the database to the newer major under its own name), `parent` and `at` (a branch, or
   a restore to a moment as a new database), `replicaOf`, `idleAfter`, `memory`, `closed`, `keepOldFor`, `requests.stop`,

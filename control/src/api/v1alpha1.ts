@@ -55,6 +55,12 @@ const condition: Schema = obj('A condition, as Kubernetes objects report them.',
 
 // ---- Platform
 
+const imagesSchema = (description: string): Schema => obj(description, {
+  release: str('The release these images are.'),
+  storage: str('The storage image.'), control: str('The control image.'),
+  compute: obj('The compute image of each Postgres version.', { '18': str('Postgres 18.'), '19': str('Postgres 19.') }),
+})
+
 export const DATABASE_NAME = '^[a-z][a-z0-9-]{0,30}$'
 
 export const platformSpec: Schema = obj('One Peat platform: its storage, its control layer, its gateways and how its databases run. One per cluster.', {
@@ -150,15 +156,16 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     replicas: int('How many pods; one acts at a time.', { minimum: 1, maximum: 5, default: 2 }),
     memory: memory('a control layer pod', '64Mi', '256Mi'),
   }, { default: {} }),
-  adopt: list('Objects the operator may take over by name from an install made another way. It compares each with what it would make: one it would not change is taken over as it is; one it would change is taken over and left as it is, the difference listed in status.pendingChanges, until requests.applyPending asks for it to be applied.', obj('An object.', {
-    kind: str('Its kind.'), namespace: str('Its namespace (none: cluster-scoped).'), name: str('Its name.'),
-  }, { required: ['kind', 'name'] })),
-  suspend: bool('True: the operator changes nothing (it reports, and lets go of nothing it adopted). The way to hand the platform back to another way of running it.', { default: false }),
+  // the fields of adoption, not in this release: kept in the kind so that a Platform naming them is refused, never stripped in silence
+  adopt: list('Not in this release: a Platform that names it is refused (the operator takes over nothing it did not make).', obj('An object.', { kind: str('Its kind.'), namespace: str('Its namespace.'), name: str('Its name.') })),
+  suspend: bool('True: the operator changes nothing (it reports). The way to hand the platform back to another way of running it.', { default: false }),
   requests: obj('One-off requests: set a new value to ask again.', {
     retry: str('Go on with a halted upgrade from the step that halted.'),
-    applyPending: str('Apply the changes listed in status.pendingChanges to the adopted objects (each may restart its pods).'),
+    applyPending: str('Not in this release (it belonged to adoption): a Platform that names it is refused.'),
   }),
 }, { required: ['release', 'objectStore'], ...rules(
+  ['!has(self.adopt)', 'adopt is not in this release: the operator takes over nothing it did not make; an existing object it did not make is refused and left alone'],
+  ['!has(self.requests) || !has(self.requests.applyPending)', 'requests.applyPending is not in this release (it belonged to adoption)'],
   ["!has(self.spread) || self.spread != 'none' || !has(self.pageservers) || !has(self.pageservers.count) || self.pageservers.count == 1", 'spread none runs one pageserver: two would share one machine and its directory'],
 ) })
 
@@ -166,24 +173,29 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
   observedGeneration: int('The generation of the spec this status is about.'),
   phase: str('Installing, Ready, Upgrading, Paused (quiet hours), Halted (a check failed: waiting for a person), Suspended or Failed.', { enum: ['Installing', 'Ready', 'Upgrading', 'Paused', 'Halted', 'Suspended', 'Failed'] }),
   release: str('The release every piece runs, once they all run one.'),
+  images: imagesSchema('The images of that release: what the next upgrade starts from.'),
   message: str('What a person reads first.'),
   survives: str("What the platform survives: one machine's loss, or none (spread none)."),
   namespaces: obj('The namespaces the platform runs in, recorded: a Platform that names others is refused.', { platform: str('The platform namespace.'), computes: str('The computes\' namespace.'), gateways: str('The gateways\' namespace.'), databases: str('The database namespace.') }),
   pieces: list('Every piece and the release it runs.', obj('A piece.', {
     kind: str('Its kind.'), namespace: str('Its namespace.'), name: str('Its name.'),
-    release: str('The release it runs.'), ready: bool('Whether it is ready.'), adopted: bool('Whether the operator took it over.'), message: str('Why not, when not.'),
+    release: str('The release it runs.'), ready: bool('Whether it is ready.'), message: str('Why not, when not.'),
   })),
   upgrade: obj('The upgrade under way, or the last one.', {
     from: str('The release it started from.'), to: str('The release it goes to.'),
     direction: str('forward, or back (the earlier release set again: only what had moved goes back, in reverse order).', { enum: ['forward', 'back'] }),
-    step: str('The step it is on.'), steps: list('Every step, in order.', str('A step.')), moved: list('The steps done.', str('A step.')),
+    step: str('The step it is on.'), steps: list('Every step, in order.', str('A step.')), moved: list('The pieces on the release it goes to, in the order they moved.', str('A step.')),
+    phase: str('Where the step is: precheck, draining, applying, restarting, waiting, filling, postcheck.', { enum: ['precheck', 'draining', 'applying', 'restarting', 'waiting', 'filling', 'postcheck'] }),
+    since: str('When the step\'s phase began: its wait is bounded by upgrades.checkTimeout.', { format: 'date-time' }),
+    fromImages: imagesSchema('The images it started from.'), toImages: imagesSchema('The images it goes to.'),
+    complete: bool('Whether it is done.'),
     startedAt: str('When it started.', { format: 'date-time' }),
     lastCheck: obj('The last check between steps.', { at: str('When.', { format: 'date-time' }), passed: bool('Whether it passed.'), message: str('What it found.') }),
     halted: obj('Where and why it halted.', { at: str('When.', { format: 'date-time' }), step: str('The step.'), reason: str('Why.') }),
     retried: str('The last retry request answered.'),
+    refill: int('A pageserver whose drain the way back dropped: filled again before the next step.'),
+    reason: str('Why the way back was taken without the earlier release being set.'),
   }),
-  answered: obj('The requests answered, by the value that was asked (the retry an upgrade answered is upgrade.retried).', { applyPending: str('The applyPending answered.') }),
-  pendingChanges: list('Differences between an adopted object and what the operator would make, not applied (requests.applyPending applies them).', obj('A difference.', { kind: str('Kind.'), namespace: str('Namespace.'), name: str('Name.'), change: str('What would change.') })),
   conditions: list('Conditions.', condition),
 })
 
@@ -265,7 +277,7 @@ export interface PlatformSpec {
   upgrades: { quietHours: Window[]; restartHours: Window[]; checkTimeout: string }
   keys: { authSecret?: string; caSecret?: string }
   control: { replicas: number; memory: Memory }
-  adopt?: { kind: string; namespace?: string; name: string }[]
+  adopt?: unknown[]
   suspend: boolean
   requests?: { retry?: string; applyPending?: string }
 }
