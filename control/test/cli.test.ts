@@ -144,6 +144,28 @@ describe('which database a name means', () => {
   })
 })
 
+describe('the options a user types', () => {
+  test('an unknown option is refused, never ignored; -n<value> is read as kubectl reads it; an empty namespace is refused', async () => {
+    made('orders', 'prod')
+    expect(await peat('delete', 'orders', '--namespcae', 'prod', '--yes')).toBe(2)
+    expect(lines.at(-1)).toBe('unknown option --namespcae (peat help lists them)')
+    expect(await peat('delete', 'orders', '-nprod', '--yes')).toBe(0)
+    expect(k.get(DB, 'databases', 'prod', 'orders')).toBeUndefined()
+    expect(await peat('list', '-n', '')).toBe(2)
+    expect(lines.at(-1)).toBe('-n needs a namespace, not an empty one')
+    expect(await peat('show', 'x', '--yes=1')).toBe(2)
+  })
+  test('list -A -n prod lists prod only, as the other verbs take -n over -A', async () => {
+    made('orders', 'prod'); made('lake', 'staging')
+    expect(await peat('list', '-A', '-n', 'prod')).toBe(0)
+    expect(lines).toEqual(['prod/orders  Ready  pg19  asleep  orders.db.example.com'])
+  })
+  test('a kubeconfig that cannot be read is said in one line', async () => {
+    expect(await run(['list', '--kubeconfig', '/nowhere/at/all'], { out, everyMs: 5 })).toBe(1)
+    expect(lines).toEqual(['peat: no kubeconfig at /nowhere/at/all: set KUBECONFIG, or log in to the cluster as kubectl would'])
+  })
+})
+
 describe('reading', () => {
   test('list, show, url and ca', async () => {
     made('orders')

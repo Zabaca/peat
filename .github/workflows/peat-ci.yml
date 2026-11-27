@@ -20,8 +20,9 @@ on:
 
 # The token has no permission unless a job asks for one. Pull requests from other
 # repositories get a read-only token and no secrets (GitHub's rule for the pull_request
-# event); nothing here uses pull_request_target, and only the image job, which never runs
-# for a pull request, can write anything.
+# event); nothing here uses pull_request_target, and only two jobs, which never run for a
+# pull request, can write anything: the image job (packages) and, on a release tag, the
+# command's release job (the release's files), which runs only after the image job.
 permissions: {}
 
 concurrency:
@@ -425,11 +426,13 @@ jobs:
           retention-days: 7
 
   # A release tag gets the peat command's four files and their SHA256SUMS on its GitHub release (made if there is none). The only
-  # job with write access to the repository's contents, and only on a release-* tag, which only admins create. (No such tag exists yet.)
+  # job with write access to the repository's contents, and only on a pushed release-* tag (which only admins create) after the
+  # images are published: so after every check the publish waits for, and after its check that the commit is on main. (No such tag
+  # exists yet.)
   command-release:
     name: the peat command on the release
-    if: startsWith(github.ref, 'refs/tags/release-')
-    needs: control
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-')
+    needs: [ control, publish-images ]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
