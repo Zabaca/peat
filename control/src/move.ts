@@ -65,6 +65,18 @@ const outside = (role: string) => `from pg_stat_activity where backend_type = 'c
 export const outsideSessionsSql = (role: string) => `select coalesce(usename, '-') || ' on ' || coalesce(datname, '-') ${outside(role)} order by 1;\n`
 /** Ends every such session (waiting up to 5 s for each to go), and prints how many it ended. */
 export const endOutsideSessionsSql = (role: string) => `select count(pg_terminate_backend(pid, 5000)) ${outside(role)};\n`
+/**
+ * Each database's count of rows inserted, updated and deleted so far (pg_stat_database; `-` is the shared catalogs'). A session's counts
+ * reach it when the session ends, or at the end of a transaction a second after its last report: a session still open is looked for
+ * apart (`outsideSessionsSql`). Reads do not move it, nor does anything the move does on the source once its role is dropped.
+ */
+export const WRITES_SQL = `select coalesce(datname, '-') || ' ' || (tup_inserted + tup_updated + tup_deleted) from pg_stat_database order by 1;\n`
+/** The databases written between two readings of `WRITES_SQL`: a count that grew, or a database that is new. */
+export function writtenSince(before: string, after: string): string[] {
+  const read = (s: string) => new Map(lines(s).map((l) => { const i = l.lastIndexOf(' '); return [l.slice(0, i), Number(l.slice(i + 1))] as [string, number] }))
+  const a = read(before)
+  return [...read(after)].filter(([db, n]) => !(a.has(db) && a.get(db)! >= n)).map(([db]) => db)
+}
 
 // ---- the globals
 
