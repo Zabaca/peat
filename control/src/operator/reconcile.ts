@@ -6,6 +6,7 @@
 // What it never does: change an object it did not make (one already there, of the same name, is reported and left alone; a namespace the
 // Platform names is the one exception, as a person makes it first to hold the store's Secret), delete an object it did not make, delete a
 // namespace, or copy the Platform's labels onto anything.
+import { X509Certificate } from 'node:crypto'
 import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
 import { ok, pathOf, serverApply, type Kube } from '../kube'
 import { NONCE_ANNOTATION, Owned } from './owned'
@@ -62,8 +63,11 @@ async function readPlacements(k: Kube, ns: string): Promise<Partial<Placements>>
   try { return JSON.parse(r.json.data?.['placements.json'] ?? '{}') } catch { return {} }
 }
 
-/** The keys as kept, with any the install gives in place of the operator's own. */
-async function readKeys(k: Kube, r: Resolved): Promise<Record<string, string>> {
+/**
+ * The keys as kept, with any the install gives in place of the operator's own; and, with an issuer, the issuer's certificate alone
+ * (`issuerCa`), which is published and never kept: an issuer's authority may be trusted far beyond the platform, so its key is never read.
+ */
+async function readKeys(k: Kube, r: Resolved): Promise<{ kept: Record<string, string>; issuerCa?: string }> {
   const n = r.names
   const secretData = async (ns: string, name: string, what: string): Promise<Record<string, string> | null> => {
     const s = await k.request('GET', `/api/v1/namespaces/${ns}/secrets/${name}`)
@@ -78,13 +82,19 @@ async function readKeys(k: Kube, r: Resolved): Promise<Record<string, string>> {
     kept[AUTH_PRIVATE] = given[AUTH_PRIVATE]
     if (given[AUTH_PUBLIC]) kept[AUTH_PUBLIC] = given[AUTH_PUBLIC]
   }
+  if (r.spec.keys.caSecret && r.spec.certificates.issuer) {
+    const given = await secretData(n.namespace, r.spec.keys.caSecret, `read ${r.spec.keys.caSecret}`)
+    const cert = given?.['tls.crt'] || given?.['ca.crt']
+    if (!cert) throw new Error(`keys.caSecret: ${n.namespace}/${r.spec.keys.caSecret} holds no tls.crt or ca.crt`)
+    return { kept, issuerCa: cert }
+  }
   if (r.spec.keys.caSecret) {
     const given = await secretData(n.namespace, r.spec.keys.caSecret, `read ${r.spec.keys.caSecret}`)
     if (!given?.['tls.crt'] || !given?.['tls.key']) throw new Error(`keys.caSecret: ${n.namespace}/${r.spec.keys.caSecret} holds no tls.crt and tls.key`)
     kept[CA_CERT] = given['tls.crt']
     kept[CA_KEY] = given['tls.key']
   }
-  return kept
+  return { kept }
 }
 
 async function writeKeys(k: Kube, r: Resolved, kept: Record<string, string>): Promise<void> {
@@ -130,6 +140,9 @@ export async function reconcile(k: Kube): Promise<PassResult> {
   const checked = specOf(p)
   if ('errors' in checked) return done('Failed', `the Platform is not valid: ${checked.errors.join('; ')}`)
   const spec = checked.spec
+  // the operator's own namespace holds its record of what it made: none of the platform's may be it
+  const mine = Object.entries(spec.namespaces).find(([, ns]) => ns === k.namespace)
+  if (mine) return done('Failed', `the Platform is not valid: namespaces.${mine[0]}: ${k.namespace} is the operator's own namespace; the platform needs namespaces of its own`)
   // the namespaces are where the platform's pieces and data are: once recorded they never change (the kind's rule says so too, on a cluster that judges it)
   const recordedNs = (p.status as any)?.namespaces
   const sameNamespaces = (a: Record<string, string>, b: Record<string, string>) => (['platform', 'computes', 'gateways', 'databases'] as const).every((f) => a[f] === b[f])
@@ -155,7 +168,7 @@ export async function reconcile(k: Kube): Promise<PassResult> {
     if (live.status === 200) {
       // a namespace the Platform names is the platform's, made by the operator or beforehand by a person (to hold the store's Secret)
       if (m.kind !== 'Namespace' && !(await owned.ours(key(m), live.json))) {
-        refused.push(`${key(m)} exists and was not made by the operator: left alone`)
+        refused.push(`${key(m)} exists and was not made by the operator: left alone${owned.fresh ? " (the operator's record was made new on this pass: if the operator made it before, list it under adopt to take it back)" : ''}`)
         return
       }
       ok(await serverApply(k, m, FIELD_MANAGER), `apply ${key(m)}`)
@@ -164,21 +177,34 @@ export async function reconcile(k: Kube): Promise<PassResult> {
       // the intent first, then the object stamped with its nonce, then its UID: a pass that dies between them is recognised by the next
       const nonce = await owned.intend(key(m))
       const a = ok(await serverApply(k, { ...m, metadata: { ...m.metadata, annotations: { ...(m.metadata.annotations ?? {}), [NONCE_ANNOTATION]: nonce } } } as Manifest, FIELD_MANAGER), `make ${key(m)}`)
-      await owned.made(key(m), String(a.json?.metadata?.uid ?? ''))
+      // an apply that made nothing answers 200, not 201: someone made the object between the read and the apply, so it is not recorded
+      if (a.status === 200) {
+        await owned.forget(key(m))
+        refused.push(`${key(m)} was made by someone else as the operator made it: applied over once, left out of the record`)
+        return
+      }
+      // an answer without a UID records nothing: the intent stays, and the next pass knows the object by its nonce
+      if (a.json?.metadata?.uid) await owned.made(key(m), String(a.json.metadata.uid))
     }
     applied.push(key(m))
   }
   const rendered0 = render(r, {})
   for (const m of rendered0.filter((x) => x.kind === 'Namespace')) await applyOne(m)
 
-  let keys = await readKeys(k, r)
+  const read = await readKeys(k, r)
+  let keys = read.kept
   const missing = makeMissing(keys)
   if (Object.keys(missing).length) {
     keys = { ...keys, ...missing }
     await writeKeys(k, r, keys)
   }
   const problems = keyProblems(keys)
+  if (read.issuerCa) {
+    try { if (new X509Certificate(read.issuerCa).validToDate.getTime() < Date.now()) problems.push(`keys.caSecret: the issuer's certificate has expired`) } catch { problems.push(`keys.caSecret: the issuer's certificate is not a certificate`) }
+  }
   if (problems.length) return done('Failed', `the keys: ${problems.join('; ')}`)
+  // what is published from here on: the issuer's certificate in peat-ca, in place of the operator's own (which then signs nothing)
+  if (read.issuerCa) keys = { ...keys, [CA_CERT]: read.issuerCa }
   if (JSON.stringify(kept) !== JSON.stringify(r.placements)) {
     const cm = { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: PLACEMENTS_CONFIG_MAP, namespace: r.names.namespace, labels: { [MANAGED_BY]: OPERATOR } }, data: { 'placements.json': JSON.stringify(r.placements) } }
     ok(await serverApply(k, cm, FIELD_MANAGER), 'keep the placements')

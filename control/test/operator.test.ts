@@ -212,6 +212,22 @@ describe('a given authority, and an issuer', () => {
     await reconcile(k)
     expect(k.get('v1', 'configmaps', 'peat-db', 'peat-ca')).toBeUndefined()
   })
+  test('with an issuer, keys.caSecret needs the issuer\'s certificate alone: peat-ca carries it, and its key is never kept', async () => {
+    const { newCa } = await import('../src/operator/keys')
+    const issuer = newCa()
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'corp-ca', namespace: 'peat' }, data: { 'ca.crt': Buffer.from(issuer.certPem).toString('base64') } })
+    k.put(platform({ certificates: { issuer: { name: 'corp-ca', kind: 'ClusterIssuer' } }, keys: { caSecret: 'corp-ca' } }))
+    const r = await reconcile(k)
+    expect(r.phase).not.toBe('Failed')
+    expect(k.get('v1', 'configmaps', 'peat-db', 'peat-ca').data['ca.crt']).toBe(issuer.certPem)
+    const kept = k.get('v1', 'secrets', 'peat', KEYS_SECRET).data
+    expect(Buffer.from(kept['ca.crt'], 'base64').toString()).not.toBe(issuer.certPem) // the operator's own, which signs nothing here
+    // given the key too, it is not read
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'corp-ca', namespace: 'peat' }, data: { 'tls.crt': Buffer.from(issuer.certPem).toString('base64'), 'tls.key': Buffer.from(issuer.keyPem).toString('base64') } })
+    await reconcile(k)
+    expect(Object.values(k.get('v1', 'secrets', 'peat', KEYS_SECRET).data).map((v: any) => Buffer.from(v, 'base64').toString())).not.toContain(issuer.keyPem)
+    expect([...k.objects.values()].filter((o) => o.kind === 'Secret' && o.metadata.name !== 'corp-ca' && Object.values(o.data ?? {}).some((v: any) => Buffer.from(v, 'base64').toString() === issuer.keyPem))).toEqual([])
+  })
 })
 
 describe('what is the operator\'s: its record of the objects it made, never a label', () => {
@@ -291,6 +307,38 @@ describe('what is the operator\'s: its record of the objects it made, never a la
     k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'x', namespace: 'peat' }, data: {} })
     expect((await k.request('DELETE', '/api/v1/namespaces/peat/configmaps/x', { preconditions: { uid: 'other' } })).status).toBe(409)
     expect(k.get('v1', 'configmaps', 'peat', 'x')).toBeDefined()
+  })
+  test('an object someone else makes between the read and the apply is not recorded; an answer without a UID records nothing', async () => {
+    k.put(platform())
+    const path = '/apis/apps/v1/namespaces/peat/deployments/storage-broker'
+    // the read finds nothing; by the apply someone has made it (the apply answers 200, not 201)
+    k.forcedOnce.set(`GET ${path}`, { status: 404, json: { message: 'not found' } })
+    k.put({ apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name: 'storage-broker', namespace: 'peat' }, spec: { template: { spec: { containers: [{ image: 'someone-else' }] } } } })
+    const r = await reconcile(k)
+    expect(r.refused).toContain('Deployment/peat/storage-broker was made by someone else as the operator made it: applied over once, left out of the record')
+    expect(record()['Deployment.peat.storage-broker']).toBeUndefined()
+    const control = 'PATCH /apis/apps/v1/namespaces/peat/deployments/peat-control'
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|deployments|peat-control'))!)
+    delete k.get('v1', 'configmaps', 'peat-system', 'peat-owned').data['Deployment.peat.peat-control']
+    k.forcedOnce.set(control, { status: 201, json: {} })
+    await reconcile(k)
+    expect(record()['Deployment.peat.peat-control']).toMatch(/^nonce:/)
+  })
+  test('a record made new while the platform\'s objects exist says so, naming adopt; a record another pass made first is read, not taken as empty', async () => {
+    k.put(platform())
+    await reconcile(k)
+    const before = { ...record() }
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|configmaps|peat-owned'))!)
+    const r = await reconcile(k)
+    expect(r.refused[0]).toContain('list it under adopt to take it back')
+    k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'peat-owned', namespace: 'peat-system' }, data: before })
+    k.forcedOnce.set('GET /api/v1/namespaces/peat-system/configmaps/peat-owned', { status: 404, json: { message: 'not found' } })
+    const again = await reconcile(k)
+    expect(again.refused).toEqual([])
+  })
+  test('none of the platform\'s namespaces may be the operator\'s own', async () => {
+    k.put(platform({ namespaces: { platform: 'peat-system' } }))
+    expect((await reconcile(k)).message).toContain("peat-system is the operator's own namespace")
   })
 })
 
