@@ -43,7 +43,7 @@ describe('a first install from one Platform', () => {
     expect(k.get('apps/v1', 'deployments', 'peat', 'peat-control').spec.replicas).toBe(2)
     expect(k.get('apps/v1', 'deployments', 'peat-gateway', 'peat-gateway').spec.replicas).toBe(2)
     expect(k.get('v1', 'services', 'peat-gateway', 'pg-front')).toBeDefined()
-    expect(k.all('validatingadmissionpolicies').map((p) => p.metadata.name).sort()).toEqual(['peat-control-computes-of-the-compute-images', 'peat-control-exec-only-for-a-move', 'peat-control-exec-only-psql-in-a-compute', 'peat-control-keeps-to-peat-nodes', 'peat-control-services-stay-inside', 'peat-control-statefulsets-keep-to-the-safekeeper'])
+    expect(k.all('validatingadmissionpolicies').map((p) => p.metadata.name).sort()).toEqual(['peat-control-computes-of-the-compute-images', 'peat-control-exec-only-psql-in-a-compute', 'peat-control-keeps-to-peat-nodes', 'peat-control-services-stay-inside', 'peat-control-statefulsets-keep-to-the-safekeeper'])
     // the machine not labelled is never used
     expect(JSON.stringify([...k.objects.values()].filter((o) => o.kind !== 'Node'))).not.toContain('other-work')
   })

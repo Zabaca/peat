@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exitCodeOf, execPath, frame } from '../src/exec'
-import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
+import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
 
 // The move's pure parts: the globals filtered, the two sides compared, the decision of the database loop; and the exec's framing.
 
@@ -103,6 +103,33 @@ describe('the settings (ALTER DATABASE ... SET, ALTER ROLE ... [IN DATABASE ...]
     expect(compareSides(sides(roles(''))).why).toBe("the settings differ (a database's, a role's or a role's in a database, as database/role): app/*")
     expect(compareSides(sides(roles('\nsetting app/* md5=b'))).same).toBe(false)
     expect(compareSides(sides(roles('\nsetting app/* md5=a'))).same).toBe(true)
+  })
+})
+
+describe('the exec a move is granted', () => {
+  const pod = (name: string, compute: string, more: Record<string, string> = {}, deleting = false) => ({ name, labels: { app: 'peat-compute', compute, ...more }, deleting })
+  const pods = [pod('src-1', 'orders'), pod('tgt-1', 'mv-0123456789ab', { 'peat-move': 'target' }), pod('old-1', 'orders-pg18'), pod('other-1', 'shop'), pod('gone-1', 'orders', {}, true), pod('fake-tgt', 'mv-0123456789ab')]
+  const db = (move: Record<string, unknown>, phase = 'Moving') => ({ metadata: { name: 'orders' }, status: { phase, move: { from: 18, to: 19, target: 'mv-0123456789ab', oldDatabase: 'orders-pg18', ...move } } })
+  test('the database\'s own compute and its move\'s target, while the move execs', () => {
+    expect(moveExecPods(db({ state: 'copying', pods: ['tgt-1', 'src-1'] }), pods)).toEqual(['src-1', 'tgt-1'])
+    expect(moveExecPods(db({ state: 'switching', pods: ['src-1'] }), pods)).toEqual(['src-1'])
+    // a rehearsal keeps the door open: its state is what asks
+    expect(moveExecPods(db({ state: 'comparing', rehearsal: true, pods: ['src-1', 'tgt-1'] }, 'Ready'), pods)).toEqual(['src-1', 'tgt-1'])
+    // the way back: the door shut, the database and its old copy
+    expect(moveExecPods(db({ state: 'done', pods: ['src-1', 'old-1'] }), pods)).toEqual(['old-1', 'src-1'])
+  })
+  test('a pod of another database, a pod on its way out, one not there, a target without its label: never granted', () => {
+    expect(moveExecPods(db({ state: 'copying', pods: ['src-1', 'other-1', 'gone-1', 'nowhere', 'fake-tgt'] }), pods)).toEqual(['src-1'])
+    // a target that is not a move's name (it could name another database's compute) grants nothing for it
+    expect(moveExecPods(db({ state: 'copying', target: 'shop', pods: ['other-1'] }), pods)).toEqual([])
+    // an old copy named otherwise than the move names it
+    expect(moveExecPods(db({ state: 'done', oldDatabase: 'shop', pods: ['other-1'] }), pods)).toEqual([])
+  })
+  test('nothing outside a step that execs, for a database on its way out, or with nothing asked', () => {
+    expect(moveExecPods(db({ state: 'failed', pods: ['src-1'] }, 'Ready'), pods)).toEqual([])
+    expect(moveExecPods(db({ state: 'done', pods: ['src-1'] }, 'Ready'), pods)).toEqual([])
+    expect(moveExecPods({ ...db({ state: 'copying', pods: ['src-1'] }), metadata: { name: 'orders', deletionTimestamp: '2026-11-27T00:00:00Z' } }, pods)).toEqual([])
+    expect(moveExecPods(db({ state: 'copying', pods: null }), pods)).toEqual([])
   })
 })
 

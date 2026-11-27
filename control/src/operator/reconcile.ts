@@ -15,7 +15,8 @@ import { storageOf, type Storage } from './storage'
 import { UNRECORDED, decide, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
 import { piecesOf, runStep } from './upgrade-run'
 import { differences } from './differences'
-import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, render, type Manifest } from './render'
+import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, moveExecGrant, render, type Manifest } from './render'
+import { moveExecPods } from '../move'
 
 export const FIELD_MANAGER = OPERATOR
 /** The operator's record of where each pinned piece runs, in the platform namespace. */
@@ -167,6 +168,13 @@ async function published(k: Kube, r: Resolved, keys: Record<string, string>, caP
       username: 'app', password, dbname: 'app', host, serviceHost, port: '5432',
       url: `postgresql://app:${encodeURIComponent(password)}@${host}:5432/app?sslmode=verify-full`,
     } })
+  }
+  // a move's own pods, granted for exec while the move needs them (move.ts, moveExecPods): the computes are read only when a Database asks
+  const asking = dbs.filter((d) => Array.isArray(d.status?.move?.pods) && d.status.move.pods.length > 0)
+  if (asking.length) {
+    const pods = (ok(await k.request('GET', `/api/v1/namespaces/${r.names.computeNamespace}/pods?labelSelector=app%3Dpeat-compute`), 'list the computes').json.items as any[])
+      .map((p) => ({ name: String(p.metadata.name), labels: (p.metadata.labels ?? {}) as Record<string, string>, deleting: Boolean(p.metadata.deletionTimestamp) }))
+    for (const d of asking) out.push(...moveExecGrant(r, String(d.metadata.name), moveExecPods(d, pods)))
   }
   return { manifests: out, dbs, keep }
 }

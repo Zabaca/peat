@@ -22,7 +22,7 @@ import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
 import { DB_API, HELD_SELECTOR, beginMaking, knownDb, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 import { parseWindows, windowAt } from './quiet-hours'
-import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_EXECS_CONFIG_MAP, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, writtenSince, endOutsideSessionsSql, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
+import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, writtenSince, endOutsideSessionsSql, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
 import { exec, type ExecDeps } from './exec'
 import { durationMs } from './api/schema'
 import { PG_VERSIONS } from './storage-spec'
@@ -1447,7 +1447,7 @@ async function restartStaleComputes() {
 // One procedure per database, run in the background of the acting layer and checkpointed in status.move, so a long copy blocks nothing
 // and a layer that restarts goes on: a move found under way starts its copy again from a fresh timeline (or, past the switch, finishes
 // it). Every exit takes back what it made for the copy: the temporary role, the target compute, the target timeline when it was not
-// switched to, the pods listed for exec.
+// switched to, the exec it asked for (status.move.pods).
 const MOVE_STATES_DONE = ['done', 'failed', 'back', 'refused']
 const movesRunning = new Map<string, Promise<void>>()
 const execDeps = (): ExecDeps => ({ server: API, token: () => readFileSync(`${SA}/token`, 'utf8').trim(), ca: readFileSync(`${SA}/ca.crt`, 'utf8') })
@@ -1461,16 +1461,30 @@ async function inCompute(pod: string, command: string[], stdin: string, what: st
   return r.stdout
 }
 const localPsql = (pod: string, db: string, sql: string, what: string) => inCompute(pod, ['psql', '-h', '127.0.0.1', '-U', 'cloud_admin', '-d', db, '-X', '-At', '-v', 'ON_ERROR_STOP=1', '-f', '-'], sql, what)
-/** The pods a move may exec into, listed under its database for the exec guard (none: its entry removed). */
-async function listExecs(key: string, pods: string[] | null): Promise<void> {
-  const path = `/api/v1/namespaces/${NS}/configmaps/${MOVE_EXECS_CONFIG_MAP}`
-  const r = await kube('PATCH', path, { data: { [key]: pods ? pods.join(' ') : null } }, 'application/merge-patch+json')
-  // the list is the operator's (made empty and kept): one this layer made would be an object the operator did not make, which it leaves
-  // alone and reports, keeping the Platform Installing. A list that is missing (deleted, the operator not yet past it) fails this step:
-  // the move fails, and goes on when asked again
-  if (r.status === 404 && pods) throw new Error(`the exec guard's list ${MOVE_EXECS_CONFIG_MAP} is missing (the operator makes it again at its next pass): ask again with requests.retryMove`)
-  else ok(r, 'list the move\'s pods', [404])
+/** How long a move waits for the operator to grant it exec on its pods (the operator reacts to the status at once; this bounds an operator that is not there). */
+const GRANT_WAIT_MS = 60_000
+/** Whether this account may exec into a pod of the compute namespace now (its own access review). */
+async function mayExec(pod: string): Promise<boolean> {
+  const r = await kube('POST', '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews', { apiVersion: 'authorization.k8s.io/v1', kind: 'SelfSubjectAccessReview', spec: { resourceAttributes: { namespace: CNS, verb: 'create', resource: 'pods', subresource: 'exec', name: pod } } })
+  return r.status < 300 && r.json?.status?.allowed === true
 }
+/**
+ * The pods a step of a move asks to exec into, named in the database's status.move.pods (none: the ask taken back). The control layer's
+ * account holds no exec of its own: the operator grants it, by a Role naming exactly these pods, those of them that are this database's own
+ * while it is in a step that execs (move.ts, moveExecPods). A grant not there within GRANT_WAIT_MS fails the step.
+ */
+async function grantExecs(ns: string, name: string, pods: string[] | null): Promise<void> {
+  await patchDbStatus(ns, name, { move: { pods } })
+  if (!pods) return
+  const t0 = Date.now()
+  for (;;) {
+    if ((await Promise.all(pods.map(mayExec))).every(Boolean)) { console.log(`move ${ns}/${name}: exec on ${pods.join(', ')} granted in ${Date.now() - t0} ms`); return }
+    if (Date.now() - t0 > GRANT_WAIT_MS) throw new Error(`the operator did not grant exec on ${pods.join(', ')} in ${GRANT_WAIT_MS / 1000} s (it grants only this database's own pods, while the move needs them; is the operator running?): ask again with requests.retryMove`)
+    await new Promise((res) => setTimeout(res, 300))
+  }
+}
+/** A move's status as the control layer writes it, without the pods it asks to exec into (written by grantExecs alone, so an older copy never names them again). */
+const withoutPods = (m: MoveStatus): MoveStatus => { const { pods: _, ...rest } = m; return rest }
 /** The ready compute pod of a database, waited for (a start may pull the image first). */
 async function readyPod(name: string, waitS = 300): Promise<any> {
   for (let i = 0; i < waitS; i += 2) {
@@ -1487,7 +1501,7 @@ const moveTargets = (objects: any[]): Map<string, Db> => new Map(objects.flatMap
   const mv: MoveStatus | undefined = o.status?.move, d = recordOf(o)
   return d && mv?.target && mv.toTimeline && mv.state && !MOVE_STATES_DONE.includes(mv.state) ? [[mv.target, targetOf(d, mv)] as [string, Db]] : []
 }))
-/** Drops every move role left on a compute (an attempt that ended without its own cleanup); the pod must be listed for exec. */
+/** Drops every move role left on a compute (an attempt that ended without its own cleanup); exec on the pod must be granted first (grantExecs). */
 async function dropMoveRoles(pod: string): Promise<void> {
   const roles = lines(await localPsql(pod, 'postgres', MOVE_ROLES_SQL, 'list the move roles'))
   if (roles.length) await localPsql(pod, 'postgres', dropRolesSql(roles), 'drop the move roles')
@@ -1502,8 +1516,8 @@ async function cleanupMove(ns: string, name: string, mv: MoveStatus, key: string
   if (d && mv.toTimeline && d.timeline !== mv.toTimeline) ok(await storcon('DELETE', `/v1/tenant/${d.tenant}/timeline/${mv.toTimeline}`), 'remove the copy\'s timeline', [404])
   // a role left on the source (an attempt the layer's restart cut short) is dropped there: it is a superuser login
   const src = await livePod(name)
-  if (src && podReady(src)) { await listExecs(key, [src.metadata.name]); await dropMoveRoles(src.metadata.name).catch((e) => console.log(`move ${ns}/${name}: drop the move roles: ${e}`)) }
-  await listExecs(key, null)
+  if (src && podReady(src)) { await grantExecs(ns, name, [src.metadata.name]); await dropMoveRoles(src.metadata.name).catch((e) => console.log(`move ${ns}/${name}: drop the move roles: ${e}`)) }
+  await grantExecs(ns, name, null)
 }
 
 /** Runs (or goes on with) the move of one database. */
@@ -1514,7 +1528,7 @@ async function runMove(ns: string, name: string): Promise<void> {
   let mv: MoveStatus = o.status?.move ?? {}
   const write = async (m: Partial<MoveStatus>, more: Record<string, unknown> = {}) => {
     mv = { ...mv, ...m }
-    await patchDbStatus(ns, name, { move: mv, ...more })
+    await patchDbStatus(ns, name, { move: withoutPods(mv), ...more })
   }
   const doorBack = () => (o.spec?.closed ? { phase: 'Closed', message: 'closed: every connection is refused until it is opened' } : { phase: 'Ready', message: 'ready: it sleeps until a client connects' })
   if (!mv.state || MOVE_STATES_DONE.includes(mv.state)) {
@@ -1555,7 +1569,7 @@ async function runMove(ns: string, name: string): Promise<void> {
     const t = targetOf(d, mv)
     await startCompute(t, { evenClosed: true, moveTarget: true })
     const tgtPod = (await readyPod(t.name)).metadata.name
-    await listExecs(key, [srcPod, tgtPod])
+    await grantExecs(ns, name, [srcPod, tgtPod])
     // the temporary role on the source: a superuser login of four connections, valid for minutes and renewed
     role = `${MOVE_ROLE_PREFIX}${randomBytes(6).toString('hex')}`
     const password = randomBytes(32).toString('hex')
@@ -1653,7 +1667,7 @@ async function finishSwitch(ns: string, name: string): Promise<void> {
   await cleanupMove(ns, name, { ...mv, toTimeline: undefined }, key)
   const keep = durationMs(String(o.spec?.keepOldFor ?? '30d'))
   const at = new Date()
-  await patchDbStatus(ns, name, { move: { ...mv, state: 'done', switchedAt: at.toISOString(), deleteOldAfter: new Date(at.getTime() + keep).toISOString(), message: `moved to Postgres ${mv.to} under its own name: ${mv.message ?? ''}; the old copy is ${mv.oldDatabase}` }, ...(o.spec?.closed ? { phase: 'Closed', message: 'closed: every connection is refused until it is opened' } : { phase: 'Ready', message: `ready on Postgres ${mv.to}: it sleeps until a client connects` }) })
+  await patchDbStatus(ns, name, { move: { ...withoutPods(mv), state: 'done', switchedAt: at.toISOString(), deleteOldAfter: new Date(at.getTime() + keep).toISOString(), message: `moved to Postgres ${mv.to} under its own name: ${mv.message ?? ''}; the old copy is ${mv.oldDatabase}` }, ...(o.spec?.closed ? { phase: 'Closed', message: 'closed: every connection is refused until it is opened' } : { phase: 'Ready', message: `ready on Postgres ${mv.to}: it sleeps until a client connects` }) })
   console.log(`move ${ns}/${name}: on Postgres ${mv.to}; the old copy is ${mv.oldDatabase}`)
 }
 
@@ -1682,7 +1696,7 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
     await startCompute(d, { evenClosed: true })
     await startCompute(oldRec, { evenClosed: true })
     const cur = (await readyPod(name)).metadata.name, old = (await readyPod(oldRec.name)).metadata.name
-    await listExecs(key, [cur, old])
+    await grantExecs(ns, name, [cur, old])
     // as for the move: a session on the database that got in after the door shut is ended before the comparison, and one there again
     // before the switch back fails it (what it wrote would be on the timeline that is given up)
     const ended = Number(lines(await localPsql(cur, 'postgres', endOutsideSessionsSql(''), 'end the sessions that got in after the door shut'))[0] ?? 0)
@@ -1699,7 +1713,7 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
       if (written.length) throw new Error(`the database was written during the comparison (${written.slice(0, 3).join(', ')}), by a client that got in after the door shut: what it wrote would not go back`)
     }
     await stopCompute(name, true)
-    await listExecs(key, null)
+    await grantExecs(ns, name, null)
     await stopCompute(oldRec.name, true)
     if (!c.same) {
       await patchDbStatus(ns, name, { ...doorBack, message: `the way back was refused: the database was written since the move (${c.why}). To go back by hand: copy it into ${mv.oldDatabase} with pg_dump, then ask again` })
@@ -1717,9 +1731,9 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
     await hold(RECORDS, { ...d, name: `${name}`, timeline: d.timeline, root: false, port: 0 }, deleteAfter(DELETE_HOLD))
     await saveDb({ ...d, timeline: oldRec.timeline, pg: oldRec.pg })
     await del(depPath(name))
-    await patchDbStatus(ns, name, { ...doorBack, move: { ...mv, state: 'back', message: `back on Postgres ${mv.from}: the database equalled its old copy; the Postgres ${mv.to} timeline is held` }, message: `back on Postgres ${mv.from}` })
+    await patchDbStatus(ns, name, { ...doorBack, move: { ...withoutPods(mv), state: 'back', message: `back on Postgres ${mv.from}: the database equalled its old copy; the Postgres ${mv.to} timeline is held` }, message: `back on Postgres ${mv.from}` })
   } catch (e) {
-    await listExecs(key, null).catch(() => {})
+    await grantExecs(ns, name, null).catch(() => {})
     await patchDbStatus(ns, name, { ...doorBack, message: `the way back failed, nothing was switched: ${String(e).slice(0, 300)}` }).catch(() => {})
   }
 }

@@ -4,7 +4,7 @@ import { controlUser, frontDoor } from '../src/names'
 import { AUTH_PRIVATE, makeMissing } from '../src/operator/keys'
 import { storageOf } from '../src/operator/storage'
 import { choosePlacements, resolve, specOf, type Resolved } from '../src/operator/platform'
-import { COMPUTE_POLICY, CONTROL_ACCOUNT, EXEC_POLICY, EXEC_SHAPE_POLICY, NODE_POLICY, SECRETS, SERVICE_POLICY, STATEFULSET_POLICY, render, type Manifest } from '../src/operator/render'
+import { COMPUTE_POLICY, CONTROL_ACCOUNT, EXEC_SHAPE_POLICY, NODE_POLICY, SECRETS, SERVICE_POLICY, STATEFULSET_POLICY, moveExecGrant, render, type Manifest } from '../src/operator/render'
 
 // What the operator renders for a platform: where each pod runs, what it mounts and reads, what each account may do, what may reach each
 // pod, and the admission rules that hold the control layer's account. Read from the objects, as the API server would receive them.
@@ -79,7 +79,7 @@ describe('where the pods run', () => {
     for (const m of all) if (m.metadata.namespace) expect([m.kind, m.metadata.name, nss.has(m.metadata.namespace)]).toEqual([m.kind, m.metadata.name, true])
     expect(all.filter((m) => !m.metadata.namespace).map((m) => m.kind).sort()).toEqual([
       'ClusterRole', 'ClusterRole', 'ClusterRoleBinding', 'ClusterRoleBinding', 'Namespace', 'Namespace', 'Namespace', 'Namespace',
-      ...Array(6).fill('ValidatingAdmissionPolicy'), ...Array(6).fill('ValidatingAdmissionPolicyBinding'),
+      ...Array(5).fill('ValidatingAdmissionPolicy'), ...Array(5).fill('ValidatingAdmissionPolicyBinding'),
     ])
   })
   test('the namespaces\' pod security: the platform\'s privileged (host directories), the computes\' baseline, the gateways\' and the databases\' restricted', () => {
@@ -166,7 +166,6 @@ describe('the control layer\'s account', () => {
     ],
     'peat-compute': [
       { group: '', resource: 'pods', verbs: ['get', 'list', 'delete'] },
-      { group: '', resource: 'pods/exec', verbs: ['create', 'get'] },
       { group: '', resource: 'secrets', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },
       { group: 'apps', resource: 'deployments', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },
       { group: 'cert-manager.io', resource: 'certificates', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },
@@ -311,24 +310,25 @@ describe('the storage pieces', () => {
 describe('the guards', () => {
   const policies = all.filter((m) => m.kind === 'ValidatingAdmissionPolicy')
   const bindings = all.filter((m) => m.kind === 'ValidatingAdmissionPolicyBinding')
-  test('six policies, each bound and denying; the exec guard\'s list rule reads the pods a move lists, and a missing list never denies anyone', () => {
-    expect(policies.map((p) => p.metadata.name).sort()).toEqual([NODE_POLICY, SERVICE_POLICY, STATEFULSET_POLICY, COMPUTE_POLICY, EXEC_SHAPE_POLICY, EXEC_POLICY].sort())
-    for (const p of policies.filter((x) => x.metadata.name !== EXEC_POLICY)) expect(bindings.find((b) => b.metadata.name === p.metadata.name)!.spec).toEqual({ policyName: p.metadata.name, validationActions: ['Deny'] })
-    // the only parameter: an API server reads it before the matchConditions, so a missing one must let every request through (a Deny
-    // refused every account's exec in the cluster, seen on v1.37.1); the shape rule, with no parameter, holds the control layer meanwhile
-    expect(bindings.find((b) => b.metadata.name === EXEC_POLICY)!.spec).toEqual({ policyName: EXEC_POLICY, validationActions: ['Deny'], paramRef: { name: 'peat-move-pods', namespace: 'peat', parameterNotFoundAction: 'Allow' } })
-    for (const b of bindings.filter((x) => x.spec.paramRef)) expect(b.spec.paramRef.parameterNotFoundAction).toBe('Allow')
-    const list = JSON.stringify(policies.find((p) => p.metadata.name === EXEC_POLICY))
-    expect(list).toContain("has(params.data) && params.data.exists(m, request.name in params.data[m].split(' '))")
+  test('five policies, each bound and denying, none with a parameter; which pods the control layer may exec into is RBAC\'s, per move', () => {
+    expect(policies.map((p) => p.metadata.name).sort()).toEqual([NODE_POLICY, SERVICE_POLICY, STATEFULSET_POLICY, COMPUTE_POLICY, EXEC_SHAPE_POLICY].sort())
+    for (const p of policies) expect(bindings.find((b) => b.metadata.name === p.metadata.name)!.spec).toEqual({ policyName: p.metadata.name, validationActions: ['Deny'] })
+    // a parameter object's copy in the API server can go stale for good (kubernetes#141015): no policy reads one
+    for (const p of policies) expect(p.spec.paramKind).toBeUndefined()
     const shape = JSON.stringify(policies.find((p) => p.metadata.name === EXEC_SHAPE_POLICY))
     expect(shape).not.toContain('params')
     for (const k of ["object.command[0] == 'psql'", "object.command[0] == 'bash' && object.command[1] == '/move/copy.sh'", "object.container == 'compute'", "request.namespace == 'peat-compute'"]) expect(shape).toContain(k)
-    // the list is the operator's, made empty and before the binding that reads it
-    const cm = all.findIndex((m) => m.kind === 'ConfigMap' && m.metadata.name === 'peat-move-pods')
-    expect(cm).toBeGreaterThan(-1)
-    expect(all[cm]!.metadata.namespace).toBe('peat')
-    expect((all[cm] as any).data).toBeUndefined()
-    expect(cm).toBeLessThan(all.findIndex((m) => m.kind === 'ValidatingAdmissionPolicyBinding' && m.metadata.name === EXEC_POLICY))
+    expect(all.some((m) => m.kind === 'ConfigMap' && /^peat-move-(pods|execs)$/.test(m.metadata.name))).toBe(false)
+    // the control layer's own Roles hold no exec anywhere
+    for (const role of all.filter((m) => m.kind === 'Role' && m.metadata.name === CONTROL_ACCOUNT)) expect(JSON.stringify(role.rules)).not.toContain('pods/exec')
+  })
+  test('a move\'s grant: a Role of exactly the pods named, get and create on pods/exec, bound to the control layer\'s account, in the compute namespace', () => {
+    expect(moveExecGrant(r, 'orders', [])).toEqual([])
+    const [role, binding] = moveExecGrant(r, 'orders', ['compute-orders-a', 'compute-mv-0123456789ab-b']) as any[]
+    expect(role).toMatchObject({ kind: 'Role', metadata: { name: 'peat-move-orders', namespace: 'peat-compute' }, rules: [{ apiGroups: [''], resources: ['pods/exec'], resourceNames: ['compute-orders-a', 'compute-mv-0123456789ab-b'], verbs: ['create', 'get'] }] })
+    expect(binding).toMatchObject({ kind: 'RoleBinding', metadata: { name: 'peat-move-orders', namespace: 'peat-compute' }, roleRef: { kind: 'Role', name: 'peat-move-orders' }, subjects: [{ kind: 'ServiceAccount', name: CONTROL_ACCOUNT, namespace: 'peat' }] })
+  })
+  test('the compute guard names the platform\'s compute images, and judges a change that keeps a compute\'s images apart', () => {
     const compute = JSON.stringify(policies.find((p) => p.metadata.name === COMPUTE_POLICY))
     expect(compute).toContain('compute-pg18:release-2026-12-01')
     expect(compute).toContain('compute-pg19:release-2026-12-01')

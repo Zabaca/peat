@@ -13,6 +13,8 @@ export interface Kube {
   namespace: string
   /** Where it acts, for a person to read: the kubeconfig context and its server. */
   where?: string
+  /** A watch (`?watch=1` on a list path): each event as it comes, until the server ends the stream or the call fails. */
+  watch?(path: string, onEvent: (event: { type: string; object: any }) => void): Promise<void>
 }
 
 const SA = '/var/run/secrets/kubernetes.io/serviceaccount'
@@ -36,6 +38,27 @@ function client(c: Conn): Kube {
       let json: any = {}
       try { json = text ? JSON.parse(text) : {} } catch { json = { message: text } }
       return { status: r.status, json }
+    },
+    async watch(path, onEvent) {
+      const token = c.token()
+      const r = await fetch(`${c.server}${path}`, {
+        headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), accept: 'application/json' },
+        tls: { ...(c.ca ? { ca: c.ca } : {}), ...(c.cert ? { cert: c.cert, key: c.key } : {}), ...(c.insecure ? { rejectUnauthorized: false } : {}) },
+      } as RequestInit)
+      if (r.status >= 300 || !r.body) throw new Error(`watch ${path}: ${r.status}`)
+      const reader = r.body.getReader()
+      const text = new TextDecoder()
+      let buf = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) return
+        buf += text.decode(value, { stream: true })
+        for (let i = buf.indexOf('\n'); i >= 0; i = buf.indexOf('\n')) {
+          const line = buf.slice(0, i).trim()
+          buf = buf.slice(i + 1)
+          if (line) { try { onEvent(JSON.parse(line)) } catch { /* not an event */ } }
+        }
+      }
     },
   }
 }
