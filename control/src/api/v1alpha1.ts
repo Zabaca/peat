@@ -150,7 +150,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
   }, { default: {} }),
   keys: obj('The keys the platform signs with. None given: the operator makes them once and keeps them.', {
     authSecret: str("A Secret in the platform namespace holding the Ed25519 pair the storage's tokens are signed with (auth_private_key.pem, auth_public_key.pem)."),
-    caSecret: str("A Secret in the platform namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key): the platform namespace holds every key; clients get only its certificate (the ConfigMap peat-ca). With certificates.issuer, a Secret holding the issuer's certificate alone (tls.crt or ca.crt), so peat-ca carries the certificate that signs the databases': its key is never read, needed or kept."),
+    caSecret: str("A Secret in the platform namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key): the platform namespace holds every key; clients get only its certificate (the ConfigMap peat-ca). With certificates.issuer, a Secret holding the issuer's certificate alone (ca.crt, the authority above an intermediate issuer, or tls.crt), so peat-ca carries the certificate that signs the databases': its key is never needed or kept, and a Secret that holds it (tls.key) is refused. The status warns 30 days before the certificate expires."),
   }, { default: {} }),
   control: obj('The control layer.', {
     replicas: int('How many pods; one acts at a time.', { minimum: 1, maximum: 5, default: 2 }),

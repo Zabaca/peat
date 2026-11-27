@@ -222,10 +222,15 @@ describe('a given authority, and an issuer', () => {
     expect(k.get('v1', 'configmaps', 'peat-db', 'peat-ca').data['ca.crt']).toBe(issuer.certPem)
     const kept = k.get('v1', 'secrets', 'peat', KEYS_SECRET).data
     expect(Buffer.from(kept['ca.crt'], 'base64').toString()).not.toBe(issuer.certPem) // the operator's own, which signs nothing here
-    // given the key too, it is not read
+    // given the key too: refused, and the key is copied nowhere
     k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'corp-ca', namespace: 'peat' }, data: { 'tls.crt': Buffer.from(issuer.certPem).toString('base64'), 'tls.key': Buffer.from(issuer.keyPem).toString('base64') } })
-    await reconcile(k)
-    expect(Object.values(k.get('v1', 'secrets', 'peat', KEYS_SECRET).data).map((v: any) => Buffer.from(v, 'base64').toString())).not.toContain(issuer.keyPem)
+    const refused = await reconcile(k)
+    expect(refused.phase).toBe('Failed')
+    expect(refused.message).toContain("holds tls.key; with certificates.issuer give the issuer's certificate alone")
+    // an issuer's certificate in its last 30 days: the status says so
+    const soon = newCa(new Date(), 10)
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'corp-ca', namespace: 'peat' }, data: { 'ca.crt': Buffer.from(soon.certPem).toString('base64') } })
+    expect((await reconcile(k)).message).toContain("keys.caSecret: the issuer's certificate expires on")
     expect([...k.objects.values()].filter((o) => o.kind === 'Secret' && o.metadata.name !== 'corp-ca' && Object.values(o.data ?? {}).some((v: any) => Buffer.from(v, 'base64').toString() === issuer.keyPem))).toEqual([])
   })
 })
