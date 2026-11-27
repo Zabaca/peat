@@ -532,17 +532,40 @@ step "the way back: a return to the frozen copy, what was written since kept in 
 # a row written on 19 after the move
 mvsql 'insert into items values (501, $$written on 19$$)'
 execs() { k -n peat logs "pod/$(ready_pod peat app=peat-control)" --tail=-1 2>/dev/null | grep -c 'move shop/mv18: exec on' || true; }
-# the old copy woken, so the way back's first step (stopping both computes) lasts a few seconds: the control layer is restarted in it
-oldsql() { PGPASSWORD="$mv_password" psql "host=mv18-pg18.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
-t0=$(date +%s); until oldsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'the old copy mv18-pg18 did not wake'; sleep 3; done
+# The restart made certain, not raced: a rule of the test's own refuses the control layer's making of mv18-pg19, so the way back stops at
+# that step with its state going-back and says it goes on later; then its pod is killed, the new one is up, and the rule goes. Only the
+# new pod can finish it (a way back takes under 2 s, so a pod killed in the middle of one otherwise finishes it before the kubelet ends it).
+k apply -f - >/dev/null <<EOF
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata: { name: test-hold-the-way-back }
+spec:
+  failurePolicy: Fail
+  matchConstraints: { resourceRules: [ { apiGroups: [peat.zabaca.com], apiVersions: ["*"], operations: [CREATE], resources: [databases] } ] }
+  matchConditions: [ { name: control, expression: "request.userInfo.username == 'system:serviceaccount:peat:peat-control'" } ]
+  validations: [ { expression: "object.metadata.name != 'mv18-pg19'", message: "held by the install test" } ]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata: { name: test-hold-the-way-back }
+spec: { policyName: test-hold-the-way-back, validationActions: [Deny] }
+EOF
+# in force once the API server refuses it (a policy takes a moment to reach it)
+t0=$(date +%s); until printf 'apiVersion: peat.zabaca.com/v1alpha1\nkind: Database\nmetadata: { name: mv18-pg19, namespace: shop }\nspec: {}\n' | k "${as[@]}" create --dry-run=server -f - 2>&1 | grep -q 'held by the install test'; do [ "$(since "$t0")" -lt 60 ] || fail "the test's rule holding the way back did not take"; sleep 1; done
 t0=$(date +%s)
 k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
-t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = going-back ]; do [ "$(since "$t1")" -lt 120 ] || fail "the way back did not start: $(k -n shop get database mv18 -o jsonpath='{.status.move.state}: {.status.message}')"; sleep 0.2; done
-# killed at once (no grace: a graceful stop lets the pod finish the way back first)
-k -n peat delete pod -l app=peat-control --grace-period=0 --force --wait=false >/dev/null 2>&1
-echo "  the control layer's pod killed during the way back (going-back)"
+t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = going-back ] && k -n shop get database mv18 -o jsonpath='{.status.message}' | grep -q 'not finished (goes on at the next pass)'; do
+  [ "$(since "$t1")" -lt 120 ] || fail "the way back did not stop at the held step: $(k -n shop get database mv18 -o jsonpath='{.status.move.state}: {.status.message}')"
+  sleep 1
+done
+old_ctl=$(ready_pod peat app=peat-control)
+k -n peat delete pod "$old_ctl" --grace-period=0 --force --wait=false >/dev/null 2>&1
+t1=$(date +%s); until new_ctl=$(ready_pod peat app=peat-control) && [ -n "$new_ctl" ] && [ "$new_ctl" != "$old_ctl" ] && ! k -n peat get pod "$old_ctl" >/dev/null 2>&1; do [ "$(since "$t1")" -lt 180 ] || fail 'no new control layer pod after the kill'; sleep 1; done
+echo "  the way back held at its step (going-back), its control layer pod killed, a new one up"
+k delete validatingadmissionpolicybinding test-hold-the-way-back >/dev/null
+k delete validatingadmissionpolicy test-hold-the-way-back >/dev/null
 t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = back ]; do
-  [ "$(since "$t1")" -lt 300 ] || fail "the way back did not end in 300 s: $(k -n shop get database mv18 -o jsonpath='{.status.phase}: {.status.message}')"
+  [ "$(since "$t1")" -lt 300 ] || fail "the way back did not end in 300 s: $(k -n shop get database mv18 -o jsonpath='{.status.phase}: {.status.message}'); the control layer: $(k -n peat logs -l app=peat-control --tail=40 2>&1)"
   sleep 1
 done
 back_s=$(since "$t0")
@@ -566,8 +589,8 @@ t0=$(date +%s); until newsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -
 case "$(newsql 'show server_version_num')" in 19*) ;; *) fail 'mv18-pg19 is not on Postgres 19';; esac
 [ "$(newsql 'select note from items where id = 501')" = 'written on 19' ] || fail 'the row written after the move is not in the kept newer copy mv18-pg19'
 # finished by the control layer's new pod: it went on from the state going-back
-k -n peat logs "pod/$(ready_pod peat app=peat-control)" --tail=-1 2>/dev/null | grep -q 'move back shop/mv18: back on Postgres 18' || fail 'the way back was not finished by the restarted control layer'
-echo "  back on 18 in $back_s s, finished by the control layer restarted in it, as frozen at the move (500 rows); the row written on 19 since is in the kept copy mv18-pg19"
+k -n peat logs "pod/$new_ctl" --tail=-1 2>/dev/null | grep -q 'move back shop/mv18: back on Postgres 18' || fail "the way back was not finished by the restarted control layer: $(k -n peat logs "pod/$new_ctl" --tail=40 2>&1)"
+echo "  back on 18, finished by the control layer restarted in it (its last pass $(k -n shop get database mv18 -o jsonpath='{.status.move.seconds}') s, $back_s s in all with the hold), as frozen at the move (500 rows); the row written on 19 since is in the kept copy mv18-pg19"
 
 step "a move resumed after the control layer restarts mid-move, then its old copy deleted when keepOldFor ends"
 # asked again (the move to 19 ended in a way back), with a keepOldFor of seconds
