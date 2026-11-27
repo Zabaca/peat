@@ -205,7 +205,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
 // ---- Database
 
 export const databaseSpec: Schema = obj('A database on the platform. Its name is the object\'s name (1 to 31 lowercase letters, digits or hyphens, starting with a letter), unique across the platform; it is reached at <name>.<the platform\'s domain> through the front door, and inside the cluster at <name>.<database namespace>.svc.', {
-  pgVersion: int("Its Postgres version; default the platform's. Raising it moves the database to the newer version under its own name, address and login (the door is shut for the copy, every table is compared, the old copy is kept stopped); lowering it is refused, and so is any version below the one it runs (status.pgVersion), as for a database made without one and later given an older one.", { enum: [...PG_VERSIONS] }),
+  pgVersion: int("Its Postgres version; default the platform's. Raising it moves the database to the newer version under its own name, address and login (the door is shut for the copy, the two sides are checked as moveVerify says, the old copy is kept stopped); lowering it is refused, and so is any version below the one it runs (status.pgVersion), as for a database made without one and later given an older one.", { enum: [...PG_VERSIONS] }),
   parent: str('A database (in the same namespace) this one is made from: a copy-on-write branch of it, or, with at, a restore of it to a moment. The parent is untouched.', { pattern: DATABASE_NAME }),
   at: str('With parent: the moment (an RFC 3339 time) or the log position (X/Y) the copy is made at; none: now.'),
   replicaOf: str("A database this one is a read replica of: a second compute on its parent's data, read only.", { pattern: DATABASE_NAME }),
@@ -213,6 +213,7 @@ export const databaseSpec: Schema = obj('A database on the platform. Its name is
   memory: obj('The memory of its compute; default the platform\'s.', { request: str('What it asks for.'), limit: str('What it may use.') }),
   closed: bool('True: every connection is refused and it stays asleep until this is false again.', { default: false }),
   keepOldFor: duration('After a move to a newer Postgres version, how long the old copy is kept, stopped, as the way back. A duration (30d).', { default: '30d' }),
+  moveVerify: str("How a real move checks its copy before it switches: counts (the default: the same databases, roles, settings and objects, and every table's row count) or full (every row compared as well, as a rehearsal always does).", { enum: ['counts', 'full'] }),
   requests: obj('One-off requests: set a new value to ask again; the status says which value was answered.', {
     stop: str('Put it to sleep now (the next connection wakes it).'),
     rehearseMove: str('Copy and compare to a newer version without shutting the door or switching, to learn how long the move would take: the version, then @ and anything (19@2026-12-01T12:00:00Z; a new value asks again).'),
@@ -249,6 +250,7 @@ export const databaseStatus: Schema = obj('The database as it is.', {
     request: str('What asked for it.'), target: str("The move's own compute, made for the copy."), toTimeline: str('The timeline the copy is made in.'),
     startedAt: str('When it started.', { format: 'date-time' }), switchedAt: str('When the database was switched to the new version.', { format: 'date-time' }),
     seconds: int('How long the copy took, or the door was shut.'), equal: bool('Whether every database, role, table, privilege and extension compared equal.'),
+    verify: str('How the copy was checked: counts (row counts) or full (every row).', { enum: ['counts', 'full'] }),
     oldDatabase: str('The old copy, kept stopped.'), deleteOldAfter: str('When the old copy is deleted (its data then held as any deleted database\'s).', { format: 'date-time' }),
     message: str('What it found.'),
   }),
@@ -298,6 +300,7 @@ export interface DatabaseSpec {
   memory?: Partial<Memory>
   closed: boolean
   keepOldFor: string
+  moveVerify?: 'counts' | 'full'
   requests?: { stop?: string; rehearseMove?: string }
 }
 export interface ObjectMeta { name: string; namespace?: string; uid?: string; generation?: number; resourceVersion?: string; labels?: Record<string, string>; annotations?: Record<string, string>; finalizers?: string[]; deletionTimestamp?: string; creationTimestamp?: string }

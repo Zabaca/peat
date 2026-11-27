@@ -11,7 +11,7 @@
 //   peat replica <of> <db>                                 a read replica of <of>
 //   peat stop <db>                                         put it to sleep now (the next connection wakes it)
 //   peat close <db> | peat open <db>                       refuse every connection until it is opened
-//   peat move <db> --pg <version> [--rehearse]             move it to a newer Postgres version under its own name, address and login (a rehearsal copies and compares only)
+//   peat move <db> --pg <version> [--rehearse | --verify counts|full]  move it to a newer Postgres version under its own name, address and login (a rehearsal copies and compares every row, and switches nothing; --verify full has the move compare every row too)
 //   peat move <db> --retry | --back                        try a failed move again; go back to the last move's version while its old copy is kept
 //   peat delete <db> --yes                                 delete it: its compute at once, its data after the platform's hold
 //   peat url <db>                                          its connection URL (from its login Secret)
@@ -54,7 +54,7 @@ export function parsePg(v: string | undefined): 18 | 19 {
  */
 export function parseArgs(argv: string[]): { words: string[]; opts: Record<string, string | true> } {
   const words: string[] = [], opts: Record<string, string | true> = {}
-  const takes = new Set(['n', 'namespace', 'kubeconfig', 'context', 'timeout', 'pg', 'at'])
+  const takes = new Set(['n', 'namespace', 'kubeconfig', 'context', 'timeout', 'pg', 'at', 'verify'])
   const flags = new Set(['A', 'all-namespaces', 'no-wait', 'yes', 'rehearse', 'retry', 'back', 'help', 'h'])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
@@ -218,7 +218,9 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
           return await follow((y) => y.status?.move?.request === request, `a rehearsal of the move to Postgres ${pg}`)
         }
         if (Number(o.status?.pgVersion ?? 0) >= pg) throw new Refused(`${a} runs Postgres ${o.status?.pgVersion}: a move goes to a newer version`)
-        await patch(o, { spec: { pgVersion: pg } })
+        const verify = opts['verify'] === undefined ? undefined : String(opts['verify'])
+        if (verify !== undefined && verify !== 'counts' && verify !== 'full') throw new Refused(`--verify is counts (every table's row count, the default) or full (every row), not ${JSON.stringify(verify)}`)
+        await patch(o, { spec: { pgVersion: pg, ...(verify ? { moveVerify: verify } : {}) } })
         return await follow((y) => y.status?.move?.to === pg && !y.status?.move?.rehearsal, `the move to Postgres ${pg}`)
       }
       case 'delete': {
@@ -281,7 +283,7 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
 const HELP = [
   'peat: a platform\'s databases, through your own Kubernetes login',
   '  peat list [-n <namespace> | -A]', '  peat show <db>', '  peat make <db> [--pg 18|19]', '  peat branch <from> <db>', '  peat restore <from> <db> --at <time | log position>',
-  '  peat replica <of> <db>', '  peat stop <db>', '  peat close <db> | peat open <db>', '  peat move <db> --pg 19 [--rehearse] | --retry | --back', '  peat delete <db> --yes', '  peat url <db>', '  peat ca [<db>]', '  peat status', '  peat retry [<platform>]',
+  '  peat replica <of> <db>', '  peat stop <db>', '  peat close <db> | peat open <db>', '  peat move <db> --pg 19 [--rehearse | --verify full] | --retry | --back', '  peat delete <db> --yes', '  peat url <db>', '  peat ca [<db>]', '  peat status', '  peat retry [<platform>]',
   'options: -n/--namespace (default: the kubeconfig context\'s), -A (look a database up in every namespace), --kubeconfig, --context, --no-wait, --timeout <seconds>',
 ]
 

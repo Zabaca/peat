@@ -1522,7 +1522,9 @@ async function runMove(ns: string, name: string): Promise<void> {
     if (a.do !== 'start') return
     const d = recordOf(o)!
     const answered = { ...(o.status?.answered ?? {}), ...(a.rehearsal ? { rehearseMove: a.request } : {}), ...(o.spec?.requests?.retryMove ? { retryMove: o.spec.requests.retryMove } : {}) }
-    const fresh: MoveStatus = { from: d.pg, to: a.to, rehearsal: a.rehearsal, request: a.request, state: 'preparing', startedAt: new Date().toISOString(), message: `${a.rehearsal ? 'rehearsing the move' : 'moving'} to Postgres ${a.to}` }
+    // a rehearsal compares every row; a real move its row counts, unless the Database asks for every row (moveVerify: full)
+    const verify = a.rehearsal || o.spec?.moveVerify === 'full' ? 'full' : 'counts'
+    const fresh: MoveStatus = { verify, from: d.pg, to: a.to, rehearsal: a.rehearsal, request: a.request, state: 'preparing', startedAt: new Date().toISOString(), message: `${a.rehearsal ? 'rehearsing the move' : 'moving'} to Postgres ${a.to}` }
     try { computeImageFor(a.to, COMPUTE_IMAGES) } catch (e) { return void (await write({ ...fresh, state: 'refused', message: String(e) }, { answered })) }
     const old = oldNameOf(name, d.pg)
     if (!a.rehearsal && ((await getDb(old)) || (await readRecords(RECORDS)).has(old))) return void (await write({ ...fresh, state: 'refused', message: `the old copy's name ${old} is taken: delete that database, then ask again (requests.retryMove)` }, { answered }))
@@ -1530,7 +1532,7 @@ async function runMove(ns: string, name: string): Promise<void> {
     while ((await getDb(target)) || (await readRecords(RECORDS)).has(target)) target = targetNameOf(hex32())
     // a fresh status.move: what an earlier one said is cleared, not merged with it
     mv = {}
-    await write({ from: null, to: null, rehearsal: null, request: null, state: null, target: null, toTimeline: null, oldDatabase: null, startedAt: null, switchedAt: null, deleteOldAfter: null, seconds: null, equal: null, message: null } as any)
+    await write({ verify: null, from: null, to: null, rehearsal: null, request: null, state: null, target: null, toTimeline: null, oldDatabase: null, startedAt: null, switchedAt: null, deleteOldAfter: null, seconds: null, equal: null, message: null } as any)
     await write({ ...fresh, target, ...(a.rehearsal ? {} : { oldDatabase: old }) }, { answered })
   }
   if (mv.state === 'switching') return finishSwitch(ns, name)
@@ -1597,7 +1599,8 @@ async function runMove(ns: string, name: string): Promise<void> {
       // each side read on its own compute, by its own superuser: what the copy made against what it was made from
       const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(srcPod, db, sql, `read ${db} on the old version`), await localPsql(tgtPod, db, sql, `read ${db} on the new version`)]
       const sides: Sides = { databases: await both('postgres', DATABASES_SQL), roles: await both('postgres', ROLES_SQL), fingerprints: {} }
-      for (const db of dbs) sides.fingerprints[db] = await both(db, fingerprintSql(db))
+      const verify = mv.rehearsal || mv.verify === 'full' ? 'full' : 'counts'
+      for (const db of dbs) sides.fingerprints[db] = await both(db, fingerprintSql(db, verify))
       const c = compareSides(sides)
       if (!c.same) throw new Error(`the copy is not the same: ${c.why}`)
       if (!mv.rehearsal) {
@@ -1610,7 +1613,7 @@ async function runMove(ns: string, name: string): Promise<void> {
         await stopCompute(name)
         console.log(`move ${ns}/${name}: the old version stopped ${Date.now() - looked} ms after the last look at it`)
       }
-      await write({ equal: true, message: `copied in ${seconds} s and compared equal: ${c.databases} databases, ${c.roles} roles, ${c.tables} tables, ${c.rows} rows` })
+      await write({ equal: true, message: `copied in ${seconds} s and compared equal (${verify === 'full' ? 'every row' : 'every table\'s row count'}): ${c.databases} databases, ${c.roles} roles, ${c.tables} tables, ${c.rows} rows` })
     } finally {
       clearInterval(renew)
       if (!dropped) await localPsql(srcPod, 'postgres', dropRolesSql([role]), 'drop the move role').catch((e) => console.log(`move ${ns}/${name}: drop ${role}: ${e}`))
@@ -1690,7 +1693,9 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
     const writes = await localPsql(cur, 'postgres', WRITES_SQL, 'count the writes')
     const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(old, db, sql, `read ${db} on the old copy`), await localPsql(cur, db, sql, `read ${db}`)]
     const sides: Sides = { databases: await both('postgres', DATABASES_SQL), roles: await both('postgres', ROLES_SQL), fingerprints: {} }
-    for (const db of lines(sides.databases[1])) sides.fingerprints[db] = await both(db, fingerprintSql(db))
+    // every row, whatever the move checked: the way back drops what the database holds now for its old copy, so a row updated since the
+    // move (which no count shows) must stop it
+    for (const db of lines(sides.databases[1])) sides.fingerprints[db] = await both(db, fingerprintSql(db, 'full'))
     const c = compareSides(sides)
     if (c.same) {
       const again = lines(await localPsql(cur, 'postgres', outsideSessionsSql(''), 'look for sessions'))

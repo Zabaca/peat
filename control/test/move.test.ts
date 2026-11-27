@@ -124,10 +124,29 @@ describe('the comparison', () => {
     expect(compareSides({ ...same, databases: ['app\nlake\npostgres', 'app\npostgres'] }).why).toBe('the databases differ: only on the old side lake; only on the new -')
     expect(compareSides({ ...same, roles: ['role lake_reader verifier=1\nrole lake_writer verifier=2', 'role lake_reader verifier=1'] }).why).toContain('role lake_writer')
     expect(compareSides({ ...same, roles: ['role lake_reader verifier=1', 'role lake_reader verifier=9'] }).same).toBe(false)
-    expect(compareSides({ ...same, fingerprints: { ...same.fingerprints, app: ['table public.t owner=app acl=- rows=3 md5=x', 'table public.t owner=app acl=- rows=3 md5=y'] } }).why).toBe('app differs: only on the old side table public.t owner=app acl=-; only on the new table public.t owner=app acl=-')
+    expect(compareSides({ ...same, fingerprints: { ...same.fingerprints, app: ['table public.t owner=app acl=- rows=3 md5=x', 'table public.t owner=app acl=- rows=3 md5=y'] } }).why).toBe('app differs: only on the old side table public.t owner=app acl=- rows=3; only on the new table public.t owner=app acl=- rows=3')
     expect(compareSides({ ...same, fingerprints: { ...same.fingerprints, lake: ['unsupported public.remote kind=f', 'unsupported public.remote kind=f'] } }).why).toBe('lake holds what the move cannot copy and compare: public.remote (a foreign table)')
     const { lake: _, ...missing } = same.fingerprints
     expect(compareSides({ ...same, fingerprints: missing as any }).why).toBe('lake was not compared')
+  })
+  test('a real move\'s check is every table\'s row count; a full one adds a hash of every row, order-independent and of no size limit', () => {
+    const counts = fingerprintSql('app', 'counts'), full = fingerprintSql('app', 'full')
+    expect(counts).toContain("'' rows='' || count(*) from %I.%I t")
+    expect(counts).not.toMatch(/hash=|string_agg\(t::text/)
+    // each row's md5, its two halves summed as 64-bit numbers: nothing held but two sums (the old hash of every row joined stopped at 1 GB)
+    expect(full).toContain("sum((''x'' || substr(md5(t::text), 1, 16))::bit(64)::bigint::numeric)")
+    expect(full).toContain("sum((''x'' || substr(md5(t::text), 17, 16))::bit(64)::bigint::numeric)")
+    expect(full).not.toContain('string_agg(t::text')
+    expect(fingerprintSql('app')).toBe(full)
+    // read from a Postgres 17 (2026-11-27): the same rows in another order give the same line; a changed, missing or doubled row does not
+    const line = (rows: number, hash: string) => `table public.t owner=app acl=- rows=${rows} hash=${hash}`
+    const same = line(3, '15824462171170473472/-15499744221373098623')
+    const sides = (a: string, b: string) => ({ databases: ['app', 'app'] as [string, string], roles: ['', ''] as [string, string], fingerprints: { app: [a, b] as [string, string] } })
+    expect(compareSides(sides(same, same))).toMatchObject({ same: true, tables: 1, rows: 3 })
+    for (const other of [line(3, '18633034878675430594/-18494230842328794849'), line(2, '9416011521456614484/-12053845330010379241'), line(4, '22232912820884332460/-18945643112735818005')]) expect(compareSides(sides(same, other)).same).toBe(false)
+    // the difference is said with its row counts, never its hash
+    expect(compareSides(sides(same, line(2, '9416011521456614484/-12053845330010379241'))).why).toBe('app differs: only on the old side table public.t owner=app acl=- rows=3; only on the new table public.t owner=app acl=- rows=2')
+    expect(compareSides(sides('table public.t owner=app acl=- rows=5', 'table public.t owner=app acl=- rows=5'))).toMatchObject({ same: true, rows: 5 })
   })
   test('the fingerprint reads every user schema and leaves the platform\'s own out', () => {
     const sql = fingerprintSql('postgres')

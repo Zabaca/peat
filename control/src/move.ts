@@ -143,9 +143,13 @@ export const SETTINGS_COPY_SQL = `select format('alter %s set %I to %s;', case w
  * prints an `unsupported` line, which fails the comparison. Rows are never printed, only counts and hashes. The platform's own schemas and
  * tables are left out.
  */
-export function fingerprintSql(database: string): string {
+export function fingerprintSql(database: string, verify: 'counts' | 'full' = 'full'): string {
   const skip = (PLATFORM_TABLES[database] ?? []).map((t) => lit(t))
   const notSkipped = skip.length ? ` and (n.nspname || '.' || c.relname) not in (${skip.join(', ')})` : ''
+  // full: each row's md5 (of the row as text), its two halves summed as 64-bit numbers: order does not matter, a changed, missing or
+  // doubled row changes a sum, and nothing is held but two sums (no limit with the table's size, unlike a hash of every row joined).
+  // counts: the row count alone.
+  const rowsHash = verify === 'full' ? ` || '' hash='' || coalesce(sum((''x'' || substr(md5(t::text), 1, 16))::bit(64)::bigint::numeric)::text, ''-'') || ''/'' || coalesce(sum((''x'' || substr(md5(t::text), 17, 16))::bit(64)::bigint::numeric)::text, ''-'')` : ''
   return `
 select 'database ' || datname || ' owner=' || pg_get_userbyid(datdba) || ' acl=' || coalesce((select string_agg(a::text, ',' order by a::text) from unnest(datacl) a), '-') from pg_database where datname = current_database();
 select 'schema ' || nspname || ' owner=' || pg_get_userbyid(nspowner) || ' acl=' || coalesce((select string_agg(a::text, ',' order by a::text) from unnest(nspacl) a), '-') from pg_namespace where nspname not in ${SYSTEM} and nspname !~ '^pg_' order by nspname;
@@ -161,7 +165,7 @@ select 'type ' || n.nspname || '.' || t.typname || ' kind=' || t.typtype::text |
 select 'function ' || n.nspname || '.' || p.proname || ' owner=' || pg_get_userbyid(p.proowner) || ' md5=' || md5(pg_get_functiondef(p.oid)) from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname not in ${SYSTEM} and p.prokind in ('f', 'p') order by 1;
 select 'trigger ' || n.nspname || '.' || c.relname || '.' || t.tgname || ' md5=' || md5(pg_get_triggerdef(t.oid)) from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace where not t.tgisinternal and n.nspname not in ${SYSTEM} order by 1;
 select 'sequence ' || schemaname || '.' || sequencename || ' last=' || coalesce(last_value::text, '-') from pg_sequences where schemaname not in ${SYSTEM} order by 1;
-select format('select %L || '' owner='' || %L || '' acl='' || %L || '' rows='' || count(*) || '' md5='' || coalesce(md5(string_agg(t::text, E''\\n'' order by t::text collate "C")), ''-'') from %I.%I t', 'table ' || n.nspname || '.' || c.relname, pg_get_userbyid(c.relowner), coalesce((select string_agg(a::text, ',' order by a::text) from unnest(c.relacl) a), '-'), n.nspname, c.relname)
+select format('select %L || '' owner='' || %L || '' acl='' || %L || '' rows='' || count(*)${rowsHash} from %I.%I t', 'table ' || n.nspname || '.' || c.relname, pg_get_userbyid(c.relowner), coalesce((select string_agg(a::text, ',' order by a::text) from unnest(c.relacl) a), '-'), n.nspname, c.relname)
   from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'm') and n.nspname not in ${SYSTEM} and n.nspname !~ '^pg_'${notSkipped} order by n.nspname, c.relname \\gexec
 `
 }
@@ -201,10 +205,11 @@ export function compareSides(s: Sides): Compared {
     if (unsupported.length) return fail(`${db} holds what the move cannot copy and compare: ${[...new Set(unsupported.map((l) => l.slice('unsupported '.length).replace(' kind=f', ' (a foreign table)')))].slice(0, 5).join(', ')}`)
     const d = diff(a, b)
     if (d.onlyA.length || d.onlyB.length) {
-      const what = (l: string) => l.replace(/ md5=\S+/, '').replace(/ rows=\d+/, '').slice(0, 120)
+      // a row count is said (it is no row's content), a hash is not
+      const what = (l: string) => l.replace(/ (md5|hash)=\S+/, '').slice(0, 120)
       return fail(`${db} differs: only on the old side ${d.onlyA.slice(0, 4).map(what).join(' | ') || '-'}; only on the new ${d.onlyB.slice(0, 4).map(what).join(' | ') || '-'}`)
     }
-    for (const l of a) { const m = /^table \S+ .* rows=(\d+) md5=/.exec(l); if (m) { tables++; rows += Number(m[1]) } }
+    for (const l of a) { const m = /^table \S+ .* rows=(\d+)(?: |$)/.exec(l); if (m) { tables++; rows += Number(m[1]) } }
   }
   return { same: true, why: '', tables, rows, databases: dbA.length, roles: rA.filter((l) => l.startsWith('role ')).length }
 }
@@ -243,7 +248,7 @@ export const MOVE_SCRIPT = [
 
 // ---- what the database loop does about a move
 
-export interface MoveStatus { from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string }
+export interface MoveStatus { verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string }
 export type MoveAction =
   | { do: 'none' }
   | { do: 'start'; to: number; rehearsal: boolean; request: string }

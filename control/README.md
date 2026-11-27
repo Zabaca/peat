@@ -137,17 +137,25 @@ login. Neon has no in-place major upgrade, so a move is a copy, in the control l
   - every role (its password's verifier, its attributes, its memberships, its settings), then every database (each object made by
     its own owner, and its settings and its roles' settings in it);
   - and loads it all locally.
-- Both sides are compared: the database list, the roles, the settings (of each database, each role, and each role in a database), and
-  every database's tables (rows hashed), views, sequences, functions, triggers, types, indexes, constraints, privileges and default
-  privileges. A database holding what the comparison cannot read (a foreign table) fails the move, and the message names it.
+- The copy stops at its first error. Then both sides are compared: the database list, the roles, the settings (of each database, each
+  role, and each role in a database), every database's tables, views, sequences, functions, triggers, types, indexes, constraints,
+  privileges and default privileges, and every table's row count. A database holding what the comparison cannot read (a foreign
+  table) fails the move, and the message names it. That is a real move's check (`moveVerify: counts`, the default). With
+  `moveVerify: full` (`peat move <db> --pg 19 --verify full`) it also compares every row, as a rehearsal always does: each row's hash,
+  summed per table, so order does not matter and no table is too large for it. A row count costs a read of the table; a hash of every
+  row costs that read and a hash of each row (on a Postgres 17, 3 million rows in memory: 30 ms counted, 2.4 s hashed).
+- What a real move does not catch: a copy wrong in a way no count shows (a value changed in the copy, with the same number of rows) on a
+  move made without a rehearsal or `--verify full`. The old copy and the way back remain for that. Rehearse first
+  (`peat move <db> --pg 19 --rehearse`): it copies and compares every row with the door open, and switches nothing.
 - Equal, the database's record is pointed at the new timeline and version, and the door opens. The old timeline is kept as a stopped
   database `<name>-pg<old>` for `keepOldFor` (30 days by default), then deleted, its data then held as any deleted database's.
 
 A failed move switches nothing, opens the door and waits for `requests.retryMove` (`peat move <db> --retry`). A rehearsal
 (`requests.rehearseMove: 19@<anything>`, `peat move <db> --pg 19 --rehearse`) copies and compares with the door open and switches
 nothing; `status.move.seconds` is how long the copy took. While the old copy is kept, `requests.moveBack` (`peat move <db> --back`) goes
-back: the door is shut and the database compared with its old copy, and only if they are the same (nothing written since the move) is
-the record pointed back at the old timeline. A database written since is refused; copying it down to the older version is by hand. A
+back: the door is shut and the database compared with its old copy, every row whatever the move checked, and only if they are the
+same (nothing written since the move) is the record pointed back at the old timeline. Every row, because the way back gives up what
+the database holds now: a row updated since the move, which no count shows, must stop it. A database written since is refused; copying it down to the older version is by hand. A
 restore of a moved database to a moment before its move is refused, and names the old copy, which holds that history. A replica does
 not move, nor a database that has replicas (delete them, move, make them again); branches stay on the old version.
 
