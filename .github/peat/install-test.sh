@@ -309,6 +309,19 @@ if [ "$records" = kubernetes ]; then
   echo "  $new_ctl leads at $new_ip, its copy current; a database made 30 s after it answers"
 fi
 
+step "a pageserver's folder wiped under it: it restarts by itself, makes the folder again, and the database answers"
+restarts() { k -n peat get pod pageserver-w1-0 -o jsonpath='{.status.containerStatuses[0].restartCount}'; }
+before_restarts=$(restarts)
+k -n peat exec pageserver-w1-0 -c pageserver -- rm -rf /vol/neon
+t0=$(date +%s); until [ "$(restarts)" -gt "$before_restarts" ] && [ "$(k -n peat get pod pageserver-w1-0 -o jsonpath='{.status.containerStatuses[0].ready}')" = true ]; do
+  [ "$(since "$t0")" -lt 180 ] || fail "the pageserver whose folder was wiped did not restart and come back by itself in 180 s"
+  sleep 2
+done
+heal_s=$(since "$t0")
+k -n peat exec pageserver-w1-0 -c pageserver -- test -f /vol/neon/identity.toml || fail 'the restarted pageserver did not make its folder again'
+t0=$(date +%s); until [ "$(sql 'select count(*) from t' 2>/dev/null)" = 100000 ]; do [ "$(since "$t0")" -lt 300 ] || fail 'the database did not answer with its rows after the pageserver came back'; sleep 3; done
+echo "  restarted by itself and Ready in $heal_s s with its folder made again; first reads its 100000 rows"
+
 step "asleep, then woken by a connection"
 curl -fsS -X POST localhost:18080/db/first/stop >/dev/null || fail 'the stop was refused'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=first -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'the compute did not go'; sleep 2; done

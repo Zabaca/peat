@@ -103,7 +103,16 @@ describe('volumes', () => {
     // the machine's volume mounted as itself and its folder `neon` addressed inside: never a subPath, which Talos's kubelet resolves in its own view
     for (const c of [...podOf(ps).initContainers, ...podOf(ps).containers]) for (const m of c.volumeMounts) expect(m.subPath).toBeUndefined()
     expect(podOf(ps).containers[0].volumeMounts).toContainEqual({ name: 'volume', mountPath: '/vol' })
-    expect(podOf(ps).containers[0].command).toEqual(['/usr/local/bin/pageserver', '-D', '/vol/neon'])
+    // a wiped folder under a running pageserver: the liveness probe fails, and the restart runs the same config script (the identity guard
+    // with it) before the pageserver, which makes the folder again (the volume's root is the pageserver's)
+    const main = podOf(ps).containers[0]
+    expect(main.command[0]).toBe('/bin/sh')
+    expect(main.command[2]).toBe(`${podOf(ps).initContainers[1].args[0]}exec /usr/local/bin/pageserver -D /vol/neon\n`)
+    expect(main.command[2]).toStartWith('set -eu\nid=1\nmkdir -p /vol/neon\n')
+    expect(main.livenessProbe).toEqual({ exec: { command: ['/bin/sh', '-c', 'test -f /vol/neon/identity.toml'] }, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3 })
+    expect(main.volumeMounts).toContainEqual({ name: 'tok', mountPath: '/tok' })
+    expect(main.env).toContainEqual({ name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } })
+    expect(podOf(ps).initContainers[0].command[2]).toBe('set -eu; chown 1000:1000 /vol; mkdir -p /vol/neon; chown 1000:1000 /vol/neon')
     expect(podOf(ps).initContainers[1].args[0]).toContain('echo "id=$id" > /vol/neon/identity.toml')
     expect(podOf(ps).initContainers[1].args[0]).not.toContain('/data')
   })

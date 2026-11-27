@@ -213,6 +213,7 @@ export function pageserver(r: Resolved, at: { id: number; node: string }, image 
   const vol = r.spec.pageservers.storage.hostPath!
   const script = `set -eu
 id=${id}
+mkdir -p /vol/neon
 if [ -f /vol/neon/identity.toml ] && [ "$(cat /vol/neon/identity.toml)" != "id=$id" ]; then
   echo "refusing to start: this directory belongs to $(cat /vol/neon/identity.toml), not id=$id" >&2
   exit 1
@@ -241,17 +242,23 @@ printf '{"host":"%s","http_host":"%s","http_port":${PORTS.pageserverHttp},"port"
       template: { metadata: { labels }, spec: platformPod(n, {
         nodeSelector: pinTo(at.node),
         initContainers: [
-          { name: 'prep', image, securityContext: { runAsUser: 0 }, command: ['/bin/sh', '-c', 'set -eu; mkdir -p /vol/neon; chown 1000:1000 /vol/neon'], volumeMounts: [{ name: 'volume', mountPath: '/vol' }] },
+          // the volume's root too is the pageserver's (uid 1000): a pageserver whose folder was wiped under it makes it again as it restarts
+          { name: 'prep', image, securityContext: { runAsUser: 0 }, command: ['/bin/sh', '-c', 'set -eu; chown 1000:1000 /vol; mkdir -p /vol/neon; chown 1000:1000 /vol/neon'], volumeMounts: [{ name: 'volume', mountPath: '/vol' }] },
           { name: 'config', image, env: [{ name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } }], command: ['/bin/sh', '-c'], args: [script], volumeMounts: [{ name: 'volume', mountPath: '/vol' }, { name: 'tok', mountPath: '/tok' }] },
         ],
         containers: [{
           name: 'pageserver', image,
-          env: [...storeEnv(r.store.pageservers.credentialsSecret), secretEnv('NEON_AUTH_TOKEN', SECRETS.pageserverTokens, 'pageserver_to_safekeepers.jwt')],
-          command: ['/usr/local/bin/pageserver', '-D', '/vol/neon'],
+          // the config script again before the pageserver (the same identity guard): a restart after the folder was wiped writes it afresh, as
+          // a pod made again would, and the pageserver re-attaches its tenants from the controller
+          env: [...storeEnv(r.store.pageservers.credentialsSecret), secretEnv('NEON_AUTH_TOKEN', SECRETS.pageserverTokens, 'pageserver_to_safekeepers.jwt'), { name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } }],
+          command: ['/bin/sh', '-c', `${script}exec /usr/local/bin/pageserver -D /vol/neon\n`],
           ports: [{ containerPort: PORTS.pageserverPg }, { containerPort: PORTS.pageserverHttp }],
           resources: { requests: { cpu: '500m', memory: r.spec.pageservers.memory.request }, limits: { memory: r.spec.pageservers.memory.limit } },
           readinessProbe: { httpGet: { path: '/v1/status', port: PORTS.pageserverHttp }, periodSeconds: 5 },
-          volumeMounts: [{ name: 'volume', mountPath: '/vol' }, { name: 'auth', mountPath: '/auth' }],
+          // its folder or its identity gone under it (a volume wiped, a disk replaced): the kubelet restarts it, and the command above makes them again
+          // 5 s for each look, three missed in a row (30 to 35 s): a stall of the disk is not taken for a wipe
+          livenessProbe: { exec: { command: ['/bin/sh', '-c', 'test -f /vol/neon/identity.toml'] }, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3 },
+          volumeMounts: [{ name: 'volume', mountPath: '/vol' }, { name: 'auth', mountPath: '/auth' }, { name: 'tok', mountPath: '/tok' }],
         }],
         volumes: [
           { name: 'volume', hostPath: hostDir(vol.path, vol.create) },
