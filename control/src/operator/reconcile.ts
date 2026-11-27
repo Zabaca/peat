@@ -125,6 +125,43 @@ async function pieces(k: Kube, r: Resolved, rendered: Manifest[]): Promise<{ kin
   return out
 }
 
+export const CA_CONFIG_MAP = 'peat-ca'
+/**
+ * What a client of each database needs, in the database's own namespace: the authority's public certificate (a ConfigMap `peat-ca`,
+ * ca.crt, for sslmode=verify-full) in every namespace that holds a Database, and each made database's login (a Secret `<name>-login`:
+ * username, password, the names to connect to and a URL). A branch and a replica use their root's login. The control layer keeps the
+ * passwords in the platform namespace; these are copies the operator makes. Outside the platform's namespaces it deletes nothing: each copy
+ * is owned by its Database (a login by its database, the certificate by every Database of its namespace), so Kubernetes removes it with the
+ * last of them, and a person's own object of the same name is never the operator's to remove.
+ */
+async function published(k: Kube, r: Resolved, keys: Record<string, string>, caPublished: boolean): Promise<{ manifests: Manifest[]; dbs: any[]; keep: Set<string> }> {
+  // a list that fails stops the pass: an empty answer would read as "no database wants its copies" and prune them
+  const list = ok(await k.request('GET', `/apis/${API_VERSION}/databases`), 'list the Databases', [404])
+  const dbs = list.status === 404 ? [] : list.json.items as any[]
+  const keep = new Set<string>()
+  const owner = (d: any) => ({ apiVersion: API_VERSION, kind: 'Database', name: String(d.metadata.name), uid: String(d.metadata.uid) })
+  const meta = (name: string, namespace: string, owners: any[]) => ({ name, namespace, labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name }, ...(owners.length ? { ownerReferences: owners.map(owner) } : {}) })
+  const out: Manifest[] = []
+  // the database namespace has its own (render.ts), owned by the platform, not by its Databases
+  if (caPublished) for (const ns of [...new Set(dbs.map((d) => d.metadata.namespace as string))].filter((x) => x !== r.names.dbNamespace).sort()) out.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(CA_CONFIG_MAP, ns, dbs.filter((d) => d.metadata.namespace === ns && d.metadata.uid)), data: { 'ca.crt': keys['ca.crt'] ?? '' } })
+  for (const d of dbs) {
+    const rec = d.status?.record
+    if (!d.status?.tenant || !rec || d.metadata.deletionTimestamp) continue
+    const root = rec.root ? d.metadata.name : rec.parent
+    const login = ok(await k.request('GET', `/api/v1/namespaces/${r.names.namespace}/secrets/db-${root}-login`), `read the login of ${root}`, [404])
+    // a login not there (a make that has not written it yet): the copy is left as it is, neither written nor pruned
+    if (login.status === 404) { keep.add(`Secret/${d.metadata.namespace}/${d.metadata.name}-login`); continue }
+    const password = Buffer.from(String(login.json.data?.password ?? ''), 'base64').toString()
+    const serviceHost = `${d.metadata.name}.${r.names.dbNamespace}.svc`
+    const host = r.spec.gateways.domain ? `${d.metadata.name}.${r.spec.gateways.domain}` : serviceHost
+    out.push({ apiVersion: 'v1', kind: 'Secret', metadata: meta(`${d.metadata.name}-login`, d.metadata.namespace, d.metadata.uid ? [d] : []), type: 'Opaque', stringData: {
+      username: 'app', password, dbname: 'app', host, serviceHost, port: '5432',
+      url: `postgresql://app:${encodeURIComponent(password)}@${host}:5432/app?sslmode=verify-full`,
+    } })
+  }
+  return { manifests: out, dbs, keep }
+}
+
 /** One pass. Returns what it did, for the log and the tests. */
 export async function reconcile(k: Kube): Promise<PassResult> {
   const all = (ok(await k.request('GET', platformsPath), 'list the Platforms').json.items ?? []) as Platform[]
@@ -210,20 +247,32 @@ export async function reconcile(k: Kube): Promise<PassResult> {
     ok(await serverApply(k, cm, FIELD_MANAGER), 'keep the placements')
   }
 
-  const rendered = render(r, keys)
+  // the authority that signs the databases' certificates: with an issuer, only the one keys.caSecret names (none is published otherwise)
+  const caPublished = !r.spec.certificates.issuer || Boolean(r.spec.keys.caSecret)
+  const pub = await published(k, r, keys, caPublished)
+  const rendered = [...render(r, keys), ...pub.manifests]
   for (const m of rendered.filter((x) => x.kind !== 'Namespace')) await applyOne(m)
+  // a database's status names its copies once they are there: its login written (not a person's own Secret of that name, refused above)
+  const loginsWritten = new Set(pub.manifests.filter((m) => m.kind === 'Secret').map(key).filter((k2) => !refused.some((x) => x.startsWith(`${k2} `))))
+  for (const d of pub.dbs) {
+    if (!loginsWritten.has(`Secret/${d.metadata.namespace}/${d.metadata.name}-login`)) continue
+    if (!d.status?.tenant || d.metadata.deletionTimestamp || (d.status.loginSecret && (d.status.caConfigMap || !caPublished))) continue
+    await k.request('PATCH', `/apis/${API_VERSION}/namespaces/${d.metadata.namespace}/databases/${d.metadata.name}/status`, { status: { loginSecret: `${d.metadata.name}-login`, ...(caPublished ? { caConfigMap: CA_CONFIG_MAP } : {}) } }, 'application/merge-patch+json')
+  }
 
   // what the operator made and no longer renders, by its record: removed only inside the platform's namespaces, or cluster-scoped and still
   // carrying the operator's labels, and only the very object it made (the delete carries the recorded UID as a precondition). A namespace
   // is never removed: what is in it may not be its own.
-  const wanted = new Set(rendered.map(key))
+  const wanted = new Set([...rendered.map(key), ...pub.keep])
   const platformNamespaces = new Set([r.names.namespace, r.names.computeNamespace, r.names.gatewayNamespace, r.names.dbNamespace])
   let pruned = 0
   for (const k2 of owned.keys()) {
     if (wanted.has(k2)) continue
     const [kind, ns, name] = k2.split('/') as [string, string, string]
     const known = kindOf(k2)
-    if (!known || kind === 'Namespace' || (known.namespaced && !platformNamespaces.has(ns))) continue
+    if (!known || kind === 'Namespace') continue
+    // outside the platform's namespaces the operator deletes nothing: what it published there goes with its Database (an owner reference)
+    if (known.namespaced && !platformNamespaces.has(ns)) { await owned.forget(k2); continue }
     const m = { apiVersion: known.apiVersion, kind, metadata: { name, ...(known.namespaced ? { namespace: ns } : {}) } }
     const live = await k.request('GET', pathOf(m))
     if (live.status === 404) { await owned.forget(k2); continue }

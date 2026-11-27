@@ -16,7 +16,23 @@ made a setting, and the operator that installs and keeps a whole platform from o
 | Shared names | Namespaces, the machine label, the dead taint, the API group: neutral defaults, each a setting. | `src/names.ts` |
 
 Still to come in this folder: the ordered upgrade (today a changed release reaches every piece at once), adoption of a platform installed
-another way, the control layer's records as Database objects, the `peat` command and the move of a database to a newer Postgres major.
+another way, the `peat` command and the move of a database to a newer Postgres major.
+
+## Databases
+
+A database is a Database object, in any namespace; its name is unique across the platform. The control layer makes the storage behind
+it (a new database, a branch of `parent`, a restore of `parent` to the moment `at`, a replica of `replicaOf`) and keeps its record in
+the object's status, with a copy in the platform namespace (a ConfigMap `db-<name>`) from which a lost status is written again (so a
+Database object deleted without its finalizer and made again, while that ConfigMap is there, attaches to the same data); the
+operator publishes, in the object's namespace, the Secret `<name>-login` (username, password, host, URL) and the ConfigMap `peat-ca`
+(the authority's certificate, for `sslmode=verify-full`; not published when `certificates.issuer` is set and `keys.caSecret` is not,
+since the platform's own authority then signs nothing), and the status names both. `spec.closed: true` refuses every connection until it
+is false again; `spec.requests.stop` puts it to sleep now. A deleted database's compute goes at once and its data after the Platform's
+`databases.deleteHold` (`never` keeps it; a hold is fixed when the database is deleted); a database made from another waits for its
+branches to be deleted first, and the name can be used again at once. The control layer's HTTP API (`POST /db`, `/branch`, `/restore`,
+`/replica`, `DELETE /db/<name>`) writes the same objects. `POST /records/copy` makes a Database object for every record that has none
+(an install whose records are the control layer's older ConfigMaps, or a cluster whose objects were lost) and compares the two
+(`?dry=1` compares only); `?held=<name>` first brings a deleted database back from its held data while the hold lasts.
 
 ## Installing
 

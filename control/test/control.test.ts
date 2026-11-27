@@ -126,7 +126,7 @@ describe('the names and settings the program reads', () => {
   test('its program imports nothing but Node\'s own and the folder\'s shared modules', () => {
     for (const f of ['control.ts', 'storage-spec.ts']) {
       const specifiers = [...src(f).matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]!)
-      for (const s of specifiers) expect(s.startsWith('node:') || ['./storage-spec', './names', './operator/keys'].includes(s), `${f}: ${s}`).toBe(true)
+      for (const s of specifiers) expect(s.startsWith('node:') || ['./storage-spec', './names', './operator/keys', './databases', './records'].includes(s), `${f}: ${s}`).toBe(true)
     }
   })
 })
@@ -135,7 +135,7 @@ describe('what the control layer makes, and what its account must be granted', (
   test('the objects it makes carry only its own labels: a label copied from elsewhere could make another tool prune them', () => {
     const keys = [...control.matchAll(/labels: \{([^}]*)\}/g)].flatMap((m) => [...m[1]!.matchAll(/(?:'([^']+)'|\b([a-z][\w-]*))\s*:/g)].map((k) => k[1] ?? k[2]!))
     expect(keys.length).toBeGreaterThan(8)
-    for (const k of keys) expect(['app', 'compute', 'tenant', 'peat-port', 'peat-record', 'peat-compute-spec', 'peat-compute-deploy', 'peat-pg', 'peat-db-cert', 'peat-route', 'peat-sk', 'peat-sk-lost', 'peat-sk-open', 'peat-sk-keeper-tried', 'peat-recovered', 'peat-sk-replacement'], k).toContain(k)
+    for (const k of keys) expect(['app', 'compute', 'tenant', 'peat-port', 'peat-record', 'peat-compute-spec', 'peat-compute-deploy', 'peat-pg', 'peat-db-cert', 'peat-route', 'peat-sk', 'peat-sk-lost', 'peat-sk-open', 'peat-sk-keeper-tried', 'peat-recovered', 'peat-sk-replacement', 'peat-held', 'peat-superseded'], k).toContain(k)
   })
 
   // What the account needs, per namespace, read from the program's calls: the operator's Roles grant exactly this (judged with them).
@@ -228,7 +228,8 @@ describe('who may call which route', () => {
     // names that reach an API path are held to a pattern, and a name with a slash or `..` matches neither
     const DB = /^[a-z][a-z0-9-]{0,30}$/
     const POD = /^[a-z0-9]([a-z0-9-]{0,250}[a-z0-9])?$/
-    expect(control).toContain('const DB_NAME = /^[a-z][a-z0-9-]{0,30}$/')
+    expect(readFileSync(join(import.meta.dir, '../src/databases.ts'), 'utf8')).toContain('export const DB_NAME = /^[a-z][a-z0-9-]{0,30}$/')
+    expect(control).toContain("import { COPYING, DB_NAME,")
     expect(control).toContain('const POD_NAME = /^[a-z0-9]([a-z0-9-]{0,250}[a-z0-9])?$/')
     for (const bad of ['..', '../x', 'a/b', '', 'A', '-a', 'a.b']) { expect(DB.test(bad), bad).toBe(false); expect(POD.test(bad), bad).toBe(false) }
     for (const p of ['/pod/..', '/pod/a/b', '/cluster/..', '/cluster/a.b', '/route/../x', '/cluster/' + 'a'.repeat(32)]) expect(allowed('gateway', 'GET', p), p).toBe(false)
@@ -448,11 +449,11 @@ describe('the safekeepers: closing, seeding, moving, deciding', () => {
     expect(control).toContain("availability_zone_id: SPREAD === 'none' ? `sk-${id}` : (zone ?? `sk-${id}`)")
     expect(control).not.toContain('availability_zone_id: `sk-${id}` }')
     expect(control).toContain('await ensureSkZones(')
-    for (const route of ["path === '/db') {", "(path === '/branch' || path === '/restore')"]) {
-      const at = control.indexOf(`req.method === 'POST' && ${route}`)
-      expect(at).toBeGreaterThan(0)
-      expect(control.slice(at, at + 600)).toContain('replacementOpen()')
-    }
+    // every database is made by the acting layer's loop over the Database objects, which waits while a replacement is open (databaseAction decides)
+    const loop = control.slice(control.indexOf('async function reconcileDatabases'), control.indexOf('async function reconcileDatabases') + 600)
+    expect(loop).toContain('const busy = await replacementOpen()')
+    expect(loop).toContain('const busy = await replacementOpen()')
+    expect(control).toContain('databaseAction(o, all, { replacementOpen: busy, records })')
     expect(control.match(/'peat-sk-open': 'true'/g)?.length).toBe(2) // the lost mark and the replacement mark
   })
 
@@ -1069,15 +1070,16 @@ describe('a database\'s Postgres version: 19 by default since 2026-11-26, 18 for
     expect(control).toContain("19: process.env['COMPUTE_IMAGE_PG19'] || undefined")
     expect(control).toContain("const DEFAULT_PG = Number(process.env['DEFAULT_PG_VERSION'] || '19')")
     expect(control).toContain('image: computeImageFor(d.pg, COMPUTE_IMAGES)')
-    expect(control).toContain('pg: pgVersionOf(d.pg)') // a record read by getDb
-    expect(control).toContain('pg: pgVersionOf(i.data.pg)') // and by listDbs
-    expect(control).toContain('pg: String(d.pg)') // and written by saveDb
+    const records = readFileSync(join(import.meta.dir, '../src/records.ts'), 'utf8')
+    expect(records).toContain("pg: pgVersionOf(s.pgVersion === undefined ? undefined : String(s.pgVersion))") // a record read from its Database's status
+    expect(records).toContain('tenant: r.tenant, timeline: r.timeline, pgVersion: r.pg, createdAt: r.created') // and written there by save
     expect(control).toContain('const pg = requestedPgVersion(asked, DEFAULT_PG)')
     expect(control).toContain('{ new_timeline_id: timeline, pg_version: pg }')
-    expect(control).toContain("pg_version: parent.pg }), 'create branch timeline'") // a branch and a restore are of the parent's version
-    expect(control).toContain('created: new Date().toISOString(), pg: parent.pg }')
+    expect(control).toContain("pg_version: parent.pg }), 'create branch timeline', [409])") // a branch and a restore are of the parent's version
+    expect(control).toContain('created: new Date().toISOString(), pg: parent.pg, closed: false }, lsn, kind }')
     expect(control).toContain("pg_version: d.pg }), 'create the recovered timeline'")
-    expect(control).toContain('createDb(b.name, b.pg_version)')
+    expect(control).toContain("{ pgVersion: Number(b.pg_version) }") // the API's version is the Database's
+    expect(control).toContain('await createDb(name, act.pg, ns)')
   })
   test('the version is checked, and a compute image looked up, before the tenant is made: a request no compute could serve leaves nothing behind', () => {
     const fn = control.slice(control.indexOf('async function createDb('), control.indexOf('async function attachedPageserverApi'))

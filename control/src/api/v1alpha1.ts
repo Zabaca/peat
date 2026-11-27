@@ -232,6 +232,13 @@ export const databaseStatus: Schema = obj('The database as it is.', {
     seconds: int('How long the copy took, or the door was shut.'), equal: bool('Whether every table, role, privilege and extension compared equal.'),
     oldDatabase: str('The old copy, kept stopped.'), message: str('What it found.'),
   }),
+  record: obj("The control layer's own record of the database, written by it alone; it keeps a copy in the platform namespace and writes this again from it if it is lost.", {
+    mode: str('primary, or replica (a read replica on its parent\'s timeline).', { enum: ['primary', 'replica'] }),
+    root: bool('Whether it is the first database of its tenant (a branch and a replica share their root\'s tenant and login).'),
+    parent: str("The root database whose login a branch or a replica uses; empty for a root."),
+    from: str('The database it was made from (a branch\'s or a replica\'s parent); empty for a root.'),
+    port: int("The gateways' own port for it (inside the gateway pods; clients use the front door)."),
+  }),
   deleteAfter: str("When a deleted database's data is removed from the store (never: kept).", { }),
   conditions: list('Conditions.', condition),
 })

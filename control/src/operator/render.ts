@@ -166,7 +166,8 @@ export function controller(r: Resolved, image = r.images.storage): Manifest[] {
   const t = SECRETS.controllerTokens
   const kubernetes = r.spec.controller.records === 'kubernetes'
   const records = kubernetes
-    ? ['--records', 'kubernetes', '--records-namespace', n.namespace, '--records-copy-storage', remoteStorage(r, r.store.records)]
+    // its address in the Leader record, by which a second controller asks it to step down and the records' copy tool finds it to see that it is stopped
+    ? ['--records', 'kubernetes', '--records-namespace', n.namespace, '--records-copy-storage', remoteStorage(r, r.store.records), '--address-for-peers', `http://storage-controller.${n.namespace}.svc:${PORTS.controller}`]
     : ['--database-url', '$(DATABASE_URL)']
   const recordsEnv = kubernetes ? storeEnv(r.store.records.credentialsSecret) : [secretEnv('DATABASE_URL', r.spec.controller.postgres!.urlSecret, r.spec.controller.postgres!.key)]
   return [
@@ -305,6 +306,7 @@ export function controlEnv(r: Resolved, images = r.images): { name: string; valu
     { name: 'RELEASE', value: images.release },
     { name: 'DEFAULT_PG_VERSION', value: String(s.computes.defaultPgVersion) },
     { name: 'PAGESERVER_SECONDARIES', value: s.pageservers.count! > 1 ? '1' : '0' },
+    { name: 'DELETE_HOLD', value: s.databases.deleteHold },
     { name: 'IDLE_MINUTES', value: String(idleMinutesOf(s.computes.idleAfter)) },
     { name: 'COMPUTE_MEMORY_REQUEST', value: s.computes.memory.request },
     { name: 'COMPUTE_MEMORY_LIMIT', value: s.computes.memory.limit },
@@ -364,6 +366,9 @@ export function controlAccount(r: Resolved): Manifest[] {
     ...role(r, n.dbNamespace, [rule([''], ['services'], ['get', 'list', 'create', 'update', 'delete'])]),
     ...role(r, n.gatewayNamespace, [rule([''], ['pods'], ['get', 'list', 'delete'])]),
     { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: meta(r, `${CONTROL_ACCOUNT}-nodes`), rules: [rule([''], ['nodes'], ['get', 'list', 'patch'])] },
+    // the databases' records: the Database objects of every namespace, their status and their finalizer (the API makes one in the database namespace, or the namespace it is asked for)
+    { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: meta(r, `${CONTROL_ACCOUNT}-databases`), rules: [rule([GROUP], ['databases'], ['get', 'list', 'watch', 'create', 'patch', 'update', 'delete']), rule([GROUP], ['databases/status'], ['get', 'patch', 'update'])] },
+    { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRoleBinding', metadata: meta(r, `${CONTROL_ACCOUNT}-databases`), roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: `${CONTROL_ACCOUNT}-databases` }, subjects: [{ kind: 'ServiceAccount', name: CONTROL_ACCOUNT, namespace: n.namespace }] },
     { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRoleBinding', metadata: meta(r, `${CONTROL_ACCOUNT}-nodes`), roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: `${CONTROL_ACCOUNT}-nodes` }, subjects: [{ kind: 'ServiceAccount', name: CONTROL_ACCOUNT, namespace: n.namespace }] },
   ]
 }

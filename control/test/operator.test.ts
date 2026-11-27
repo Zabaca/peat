@@ -364,6 +364,63 @@ describe('keeping it as declared', () => {
   })
 })
 
+describe('what a client of a database needs, in its own namespace', () => {
+  test('the authority\'s certificate in every namespace that holds a Database, each made database\'s login (a branch uses its root\'s), named in its status; removed with the database', async () => {
+    k.put(platform({ gateways: { domain: 'db.example.com' } }))
+    await reconcile(k)
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'db-orders-login', namespace: 'peat' }, data: { password: Buffer.from('s3cret word').toString('base64') } })
+    const rec = (parent = '', root = true) => ({ tenant: 'a'.repeat(32), timeline: 'b'.repeat(32), pgVersion: 19, phase: 'Ready', record: { mode: 'primary', root, parent, port: 15010 } })
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders', namespace: 'shop' }, spec: {}, status: rec() })
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders-dev', namespace: 'shop' }, spec: { parent: 'orders' }, status: rec('orders', false) })
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'pending', namespace: 'other' }, spec: {} })
+    await reconcile(k)
+    expect(k.get('v1', 'configmaps', 'shop', 'peat-ca').data['ca.crt']).toContain('BEGIN CERTIFICATE')
+    expect(k.get('v1', 'configmaps', 'other', 'peat-ca')).toBeDefined()
+    const login = k.get('v1', 'secrets', 'shop', 'orders-login')
+    expect(decode(login, 'password')).toBe('s3cret word')
+    expect(decode(login, 'host')).toBe('orders.db.example.com')
+    expect(decode(login, 'url')).toBe('postgresql://app:s3cret%20word@orders.db.example.com:5432/app?sslmode=verify-full')
+    expect(decode(k.get('v1', 'secrets', 'shop', 'orders-dev-login'), 'password')).toBe('s3cret word')
+    expect(k.get('v1', 'secrets', 'other', 'pending-login')).toBeUndefined()
+    expect(k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status).toMatchObject({ loginSecret: 'orders-login', caConfigMap: 'peat-ca' })
+    // outside the platform's namespaces the operator deletes nothing: each copy is owned by its Database, which Kubernetes removes it with
+    const dev = k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders-dev')
+    expect(k.get('v1', 'secrets', 'shop', 'orders-dev-login').metadata.ownerReferences).toEqual([{ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', name: 'orders-dev', uid: dev.metadata.uid }])
+    expect(k.get('v1', 'configmaps', 'shop', 'peat-ca').metadata.ownerReferences.map((o: any) => o.name).sort()).toEqual(['orders', 'orders-dev'])
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|databases|orders-dev'))!)
+    const r = await reconcile(k)
+    expect(r.pruned).toBe(0)
+    expect(k.get('v1', 'secrets', 'shop', 'orders-dev-login')).toBeDefined() // the API server's garbage collector removes it, not the operator
+  })
+  test('a failed list of the Databases stops the pass, and a login not there yet leaves its copy as it is: neither prunes a published copy', async () => {
+    k.put(platform())
+    await reconcile(k)
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'db-orders-login', namespace: 'peat' }, data: { password: Buffer.from('pw').toString('base64') } })
+    const rec = { tenant: 'a'.repeat(32), timeline: 'b'.repeat(32), pgVersion: 19, phase: 'Ready', record: { mode: 'primary', root: true, parent: '', port: 15010 } }
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders', namespace: 'peat-db' }, spec: {}, status: rec })
+    await reconcile(k)
+    expect(k.get('v1', 'secrets', 'peat-db', 'orders-login')).toBeDefined()
+    k.forcedOnce.set('GET /apis/peat.zabaca.com/v1alpha1/databases', { status: 503, json: { message: 'unavailable' } })
+    await expect(reconcile(k)).rejects.toThrow('list the Databases: 503')
+    expect(k.get('v1', 'secrets', 'peat-db', 'orders-login')).toBeDefined()
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|secrets|db-orders-login'))!)
+    const r = await reconcile(k)
+    expect(r.pruned).toBe(0)
+    expect(k.get('v1', 'secrets', 'peat-db', 'orders-login')).toBeDefined()
+  })
+  test('a person\'s own Secret of the login\'s name is left alone, and the status does not name it as the login', async () => {
+    k.put(platform())
+    await reconcile(k)
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'db-orders-login', namespace: 'peat' }, data: { password: Buffer.from('pw').toString('base64') } })
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'orders-login', namespace: 'shop' }, data: { mine: Buffer.from('x').toString('base64') } })
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders', namespace: 'shop' }, spec: {}, status: { tenant: 'a'.repeat(32), timeline: 'b'.repeat(32), pgVersion: 19, phase: 'Ready', record: { mode: 'primary', root: true, parent: '', port: 15010 } } })
+    const r = await reconcile(k)
+    expect(r.refused.some((x) => x.startsWith('Secret/shop/orders-login '))).toBe(true)
+    expect(decode(k.get('v1', 'secrets', 'shop', 'orders-login'), 'mine')).toBe('x')
+    expect(k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status.loginSecret).toBeUndefined()
+  })
+})
+
 describe('a one-machine trial', () => {
   test('spread none: every piece on the one machine, one replica each, the safekeepers zones of their own, and the status says what it survives', async () => {
     for (const n of ['machine-2', 'machine-3']) k.objects.delete([...k.objects.keys()].find((x) => x.endsWith(`|${n}`))!)
