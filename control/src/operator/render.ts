@@ -16,7 +16,7 @@
 import { durationMs } from '../api/schema'
 import { GROUP, controlUser, frontDoor, placement, toEnv, type Names } from '../names'
 import { SAFEKEEPER_RESOURCES, hostDir } from '../storage-spec'
-import { MOVE_EXECS_CONFIG_MAP, MOVE_SCRIPT, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL } from '../move'
+import { MOVE_SCRIPT, moveExecRole, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL } from '../move'
 import type { Resolved } from './platform'
 import { TOKENS, type Holder } from './keys'
 
@@ -375,9 +375,8 @@ export function controlAccount(r: Resolved): Manifest[] {
   return [
     { apiVersion: 'v1', kind: 'ServiceAccount', metadata: meta(r, CONTROL_ACCOUNT, n.namespace) },
     ...role(r, n.namespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['secrets', 'configmaps'], CRUD), rule(['apps'], ['statefulsets'], ['get', 'list', 'create', 'update', 'delete']), rule(['batch'], ['jobs'], ['get']), rule(['coordination.k8s.io'], ['leases'], ['get', 'list', 'create', 'update', 'patch'])]),
-    // pods/exec: the major-version move's copy runs psql and its fixed script in a move's two computes (the exec guard bounds it); an exec
-    // over a WebSocket is a GET, so it needs get as well as create
-    ...role(r, n.computeNamespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['pods/exec'], ['create', 'get']), rule([''], ['secrets'], CRUD), rule(['apps'], ['deployments'], CRUD), rule(['cert-manager.io'], ['certificates'], CRUD)]),
+    // no pods/exec: the operator grants it for a move's own pods while the move needs them (moveExecGrant), and takes it back after
+    ...role(r, n.computeNamespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['secrets'], CRUD), rule(['apps'], ['deployments'], CRUD), rule(['cert-manager.io'], ['certificates'], CRUD)]),
     ...role(r, n.dbNamespace, [rule([''], ['services'], ['get', 'list', 'create', 'update', 'delete'])]),
     ...role(r, n.gatewayNamespace, [rule([''], ['pods'], ['get', 'list', 'delete'])]),
     { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: meta(r, `${CONTROL_ACCOUNT}-nodes`), rules: [rule([''], ['nodes'], ['get', 'list', 'patch'])] },
@@ -524,7 +523,6 @@ export const NODE_POLICY = 'peat-control-keeps-to-peat-nodes'
 export const STATEFULSET_POLICY = 'peat-control-statefulsets-keep-to-the-safekeeper'
 export const SERVICE_POLICY = 'peat-control-services-stay-inside'
 export const COMPUTE_POLICY = 'peat-control-computes-of-the-compute-images'
-export const EXEC_POLICY = 'peat-control-exec-only-for-a-move'
 export const EXEC_SHAPE_POLICY = 'peat-control-exec-only-psql-in-a-compute'
 export const NODE_SPEC_FIELDS = ['configSource', 'externalID', 'podCIDR', 'podCIDRs', 'providerID', 'unschedulable'] as const
 
@@ -634,12 +632,10 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
       },
     },
     binding(COMPUTE_POLICY),
-    // An exec is a CONNECT: a policy sees its options (the container and the command) and the pod's name, not the pod. Two rules: the
-    // shape (only a compute's container, only psql or the move's script), with no parameter; and the pods a move lists, for the move's
-    // length, in the ConfigMap peat-move-pods, which the operator keeps (made empty, before the binding). The list's binding lets a
-    // missing list through (Allow): an API server reads the parameter before the rule's matchConditions (seen on v1.37), so a binding
-    // that denied on a missing list refused every account's exec in the cluster. With the list deleted by hand, until the operator makes
-    // it again, the control layer is held to the shape alone. What neither bounds: psql's arguments are free, so within a listed pod the
+    // An exec is a CONNECT: a policy sees its options (the container and the command) and the pod's name, not the pod. Which pods the
+    // control layer may exec into is RBAC's: a Role the operator grants per move naming the move's own pods (moveExecGrant). This rule
+    // holds the shape, with no parameter (a parameter object's copy in the API server can go stale for good: kubernetes#141015): only a
+    // compute's container, only psql or the move's script. What it does not bound: psql's arguments are free, so within a granted pod the
     // account may run any SQL as the pod's local superuser while the move lasts.
     {
       apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', metadata: meta(r, EXEC_SHAPE_POLICY),
@@ -655,20 +651,21 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
       },
     },
     binding(EXEC_SHAPE_POLICY),
-    { apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(r, MOVE_EXECS_CONFIG_MAP, n.namespace) },
-    {
-      apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', metadata: meta(r, EXEC_POLICY),
-      spec: {
-        failurePolicy: 'Fail',
-        paramKind: { apiVersion: 'v1', kind: 'ConfigMap' },
-        matchConstraints: { resourceRules: [{ apiGroups: [''], apiVersions: ['v1'], operations: ['CONNECT'], resources: ['pods/exec', 'pods/attach'] }] },
-        matchConditions: byControl,
-        validations: [
-          { expression: "has(params.data) && params.data.exists(m, request.name in params.data[m].split(' '))", messageExpression: "'the control layer may exec only into a pod a move under way lists: ' + request.name + ' is not one'" },
-        ],
-      },
-    },
-    { apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicyBinding', metadata: meta(r, EXEC_POLICY), spec: { policyName: EXEC_POLICY, validationActions: ['Deny'], paramRef: { name: MOVE_EXECS_CONFIG_MAP, namespace: n.namespace, parameterNotFoundAction: 'Allow' } } },
+  ]
+}
+
+/**
+ * The Role and RoleBinding by which the control layer may exec into a move's own pods (`pods`, from moveExecPods: exactly those names),
+ * in the compute namespace. The operator renders them while a Database's move needs them; what it no longer renders it removes.
+ */
+export function moveExecGrant(r: Resolved, database: string, pods: string[]): Manifest[] {
+  if (pods.length === 0) return []
+  const n = r.names
+  const name = moveExecRole(database)
+  return [
+    // an exec over a WebSocket is a GET, so it needs get as well as create
+    { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'Role', metadata: meta(r, name, n.computeNamespace), rules: [{ apiGroups: [''], resources: ['pods/exec'], resourceNames: pods, verbs: ['create', 'get'] }] },
+    { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'RoleBinding', metadata: meta(r, name, n.computeNamespace), roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'Role', name }, subjects: [{ kind: 'ServiceAccount', name: CONTROL_ACCOUNT, namespace: n.namespace }] },
   ]
 }
 

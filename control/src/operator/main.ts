@@ -3,6 +3,7 @@
 import { randomBytes } from 'node:crypto'
 import { inCluster, ok, type Kube } from '../kube'
 import { reconcile } from './reconcile'
+import { GROUP } from '../names'
 
 const k = inCluster()
 const NS = process.env['OPERATOR_NAMESPACE'] || k.namespace
@@ -45,6 +46,31 @@ Bun.serve({
 })
 console.log(`peat operator ${ME} in ${NS}: one pass every ${EVERY_S} s while it holds the lease`)
 
+// A pass as soon as a Database asks for the exec a move needs, or takes it back (its status.move.pods), not at the next pass: a watch of the
+// Databases wakes the loop. Each one's ask is remembered, so only a change wakes it.
+let wake: (() => void) | undefined
+let pending = false
+const wakeUp = () => { if (wake) wake(); else pending = true }
+const asks = new Map<string, string>()
+async function watchMoves(): Promise<never> {
+  for (;;) {
+    try {
+      await k.watch!(`/apis/${GROUP}/v1alpha1/databases?watch=1&timeoutSeconds=300`, (e) => {
+        const o = e.object ?? {}
+        const id = `${o.metadata?.namespace}/${o.metadata?.name}`
+        const ask = e.type === 'DELETED' ? '' : JSON.stringify([o.status?.move?.pods ?? null, o.status?.move?.state ?? null, o.status?.phase ?? null, Boolean(o.metadata?.deletionTimestamp)])
+        const before = asks.get(id) ?? ''
+        if (ask === before) return
+        if (e.type === 'DELETED') asks.delete(id); else asks.set(id, ask)
+        const asked = (a: string) => a !== '' && JSON.parse(a)[0] !== null
+        if (asked(ask) || asked(before)) wakeUp()
+      })
+    } catch (e) { console.log(`watch of the Databases: ${String(e).slice(0, 200)}`) }
+    await new Promise((res) => setTimeout(res, 1000))
+  }
+}
+void watchMoves()
+
 for (;;) {
   try {
     const was: boolean = leading
@@ -60,5 +86,8 @@ for (;;) {
     failures++
     console.log(`pass failed: ${e}`)
   }
-  await new Promise((res) => setTimeout(res, EVERY_S * 1000))
+  // an ask that came during the pass is answered by the next one at once
+  if (pending) pending = false
+  else await new Promise<void>((res) => { const t = setTimeout(res, EVERY_S * 1000); wake = () => { clearTimeout(t); res() } })
+  wake = undefined
 }
