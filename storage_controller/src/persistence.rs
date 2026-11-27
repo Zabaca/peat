@@ -346,6 +346,15 @@ impl Persistence {
         self
     }
 
+    /// Kill the Kubernetes store's controller after `writes` writes (crash tests).
+    #[cfg(test)]
+    pub(crate) fn crash_after_writes(mut self, writes: i64) -> Self {
+        if let Store::Kubernetes(store) = &mut self.store {
+            store.crash_after_writes(writes);
+        }
+        self
+    }
+
     /// Hold each delete's answer in the Kubernetes store this long before noting it (tests).
     #[cfg(test)]
     pub(crate) fn delete_answer_delay(mut self, delay: std::time::Duration) -> Self {

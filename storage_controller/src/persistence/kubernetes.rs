@@ -94,6 +94,9 @@ pub(crate) struct KubernetesStore {
     /// API server and not yet answered).
     #[cfg(test)]
     delete_answer_delay: std::time::Duration,
+    /// Crash tests: the writes this controller makes before it is killed (`crash_after_writes`).
+    #[cfg(test)]
+    crash: Option<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 type Locks = std::sync::Mutex<HashMap<(&'static str, String), Arc<tokio::sync::Mutex<()>>>>;
@@ -440,6 +443,8 @@ impl KubernetesStore {
             locks: Default::default(),
             #[cfg(test)]
             delete_answer_delay: Default::default(),
+            #[cfg(test)]
+            crash: None,
         }
     }
 
@@ -447,6 +452,34 @@ impl KubernetesStore {
     #[cfg(test)]
     pub(crate) fn list_page(&mut self, page: u32) {
         self.list_page = page;
+    }
+
+    /// Crash tests: `writes` writes to the API server land, and this controller dies right after
+    /// the last of them (its answer never acted on); every write after it fails unsent, as from a
+    /// controller that is gone. Zero: it dies before its first write.
+    #[cfg(test)]
+    pub(crate) fn crash_after_writes(&mut self, writes: i64) {
+        self.crash = Some(Arc::new(std::sync::atomic::AtomicI64::new(writes)));
+    }
+
+    /// Crash tests: a write about to be sent by a controller already dead fails unsent.
+    #[cfg(test)]
+    fn dead(&self) -> Result<(), kube::Error> {
+        match &self.crash {
+            Some(c) if c.load(std::sync::atomic::Ordering::SeqCst) <= 0 => Err(killed()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Crash tests: a write that landed; the controller dies right after the last one it makes.
+    #[cfg(test)]
+    fn landed<T>(&self, res: Result<T, kube::Error>) -> Result<T, kube::Error> {
+        match &self.crash {
+            Some(c) if res.is_ok() && c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 => {
+                Err(killed())
+            }
+            _ => res,
+        }
     }
 
     /// Hold each delete's answer this long before noting it (tests).
@@ -573,7 +606,12 @@ impl KubernetesStore {
         *req.uri_mut() = format!("{uri}{sep}fieldValidation=Strict")
             .parse()
             .expect("a valid URI");
-        self.client.request::<Object<S>>(req).await
+        #[cfg(test)]
+        self.dead()?;
+        let res = self.client.request::<Object<S>>(req).await;
+        #[cfg(test)]
+        let res = self.landed(res);
+        res
     }
 
     fn lock<S: Spec>(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -688,7 +726,12 @@ impl KubernetesStore {
         params: &DeleteParams,
     ) -> Result<(), kube::Error> {
         self.guard.delete_in_doubt::<S>(name, revision);
-        match api.delete(name, params).await {
+        #[cfg(test)]
+        self.dead()?;
+        let res = api.delete(name, params).await;
+        #[cfg(test)]
+        let res = self.landed(res);
+        match res {
             Ok(held) if held.is_left() => {
                 tracing::warn!(
                     "{} {name}: a finalizer holds its delete; in doubt until it goes",
@@ -831,6 +874,8 @@ impl KubernetesStore {
                         locks: Default::default(),
                         #[cfg(test)]
                         delete_answer_delay: Default::default(),
+                        #[cfg(test)]
+                        crash: None,
                     };
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -2907,6 +2952,14 @@ fn is_conflict(e: &kube::Error) -> bool {
 
 fn is_not_found(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(s) if s.code == 404)
+}
+
+/// Crash tests: the error of a write by a controller that was killed.
+#[cfg(test)]
+fn killed() -> kube::Error {
+    kube::Error::ReadEvents(std::io::Error::other(
+        "the controller was killed here (a crash test)",
+    ))
 }
 
 /// The API server refused the request outright: nothing it asked for was done.

@@ -840,5 +840,7 @@ async fn something_may_run(
     None
 }
 
+pub mod measure;
+
 #[cfg(test)]
 mod tests;

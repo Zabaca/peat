@@ -12,6 +12,7 @@ Files beside this one:
 - [`rbac.yaml`](rbac.yaml): the Role the controller's account needs, and its RoleBinding, with the namespace and account name as placeholders.
 - [`test-stores.sh`](test-stores.sh): starts a Kubernetes API server with these kinds and a Postgres server, for the tests of both stores.
 - [`test-etcd-restore.sh`](test-etcd-restore.sh): restores etcd from a snapshot under a running controller, and checks what it does.
+- [`measure.md`](measure.md): the scale measure, how long a storage server's restart takes with 100 and 1,000 databases on it, and how to run it.
 
 ## Why the records can move
 
@@ -124,7 +125,7 @@ Within a second of each change to the records, the leader writes the copy: one d
 
 The leader does not write a document that goes back from the copy it last read or wrote: one in which a record's revision is lower, which lacks a record that copy holds and no mark covers, or which holds no records over one that holds some (from inside the cluster, every record gone at once is what a loss looks like, and the copy is then the way back). Such a document is not written, and the metric below shows the copy falling behind. The comparison is with what this controller last read or wrote, not a conditional write on the bucket; the handover's order and the Leader record's check (above) are what keep two controllers from writing at once. The leader writes the copy again at least once a minute, changed or not.
 
-The copy is one document rewritten whole, so its size and write time grow with the records, and the highest-ever values and the marks grow with every tenant and timeline ever deleted. The scale measure records the copy's size, its write time and the metric below at 10,000 tenants, and the count of highest-ever values and marks after churn; if a write takes more than a second there, the copy is split into parts.
+The copy is one document rewritten whole, so its size and write time grow with the records, and the highest-ever values and the marks grow with every tenant and timeline ever deleted. The scale measure records the copy's size, its write time and the metric below at 1,000 tenants, and the count of highest-ever values and marks after churn; if a write takes more than a second there, the copy is split into parts.
 
 The copy is for one use: rebuilding the records after the cluster's objects are lost or undone, with `storcon_records restore` (below). Its layout under the prefix is the controller's and may change between releases; read it through the tool.
 

@@ -48,6 +48,14 @@ pub struct StorageController {
 
 const COMMAND: &str = "storage_controller";
 
+/// A kubeconfig: when set, the controller keeps its records in Kubernetes objects through it
+/// (`--records kubernetes`, storage_controller/kubernetes/README.md) instead of in its Postgres.
+/// Each environment gets a namespace of its own there, kept across the controller's restarts as
+/// its database is, and the records' copy goes to a folder of the environment. The API server must
+/// have the record kinds applied (storage_controller/kubernetes/test-stores.sh does both); Peat's
+/// CI runs Neon's controller suites this way.
+const RECORDS_KUBECONFIG_ENV: &str = "STORAGE_CONTROLLER_RECORDS_KUBECONFIG";
+
 // Peat: 19, its default (Neon: 16), falling back to the others below; 18 is still supported.
 const STORAGE_CONTROLLER_POSTGRES_VERSION: PgMajorVersion = PgMajorVersion::PG19;
 
@@ -218,6 +226,38 @@ impl StorageController {
 
     pub async fn get_pg_lib_dir(&self) -> anyhow::Result<Utf8PathBuf> {
         self.get_pg_dir("lib").await
+    }
+
+    /// This environment's namespace for the records, made if missing.
+    async fn records_namespace(&self, kubeconfig: &OsStr) -> anyhow::Result<String> {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(self.env.base_data_dir.to_string_lossy().as_bytes());
+        let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let namespace = format!("storcon-{hex}");
+        let mut config = kube::Config::from_custom_kubeconfig(
+            kube::config::Kubeconfig::read_from(kubeconfig)?,
+            &Default::default(),
+        )
+        .await?;
+        // A test API server, on this machine
+        config.proxy_url = None;
+        let client = kube::Client::try_from(config)?;
+        let ns = k8s_openapi::api::core::v1::Namespace {
+            metadata: kube::api::ObjectMeta {
+                name: Some(namespace.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match kube::Api::<k8s_openapi::api::core::v1::Namespace>::all(client)
+            .create(&Default::default(), &ns)
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(s)) if s.code == 409 => {}
+            Err(e) => anyhow::bail!("making the records' namespace {namespace}: {e}"),
+        }
+        Ok(namespace)
     }
 
     /// Readiness check for our postgres process
@@ -664,6 +704,26 @@ impl StorageController {
             ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
             ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
         ];
+
+        if let Some(kubeconfig) = std::env::var_os(RECORDS_KUBECONFIG_ENV) {
+            let namespace = self.records_namespace(&kubeconfig).await?;
+            let at = args.iter().position(|a| a == "--database-url").unwrap();
+            args.drain(at..at + 2);
+            let copy = self
+                .env
+                .base_data_dir
+                .join("storage_controller_records_copy");
+            args.extend([
+                "--records".to_string(),
+                "kubernetes".to_string(),
+                format!("--records-namespace={namespace}"),
+                format!("--records-copy-storage=local_path = '{}'", copy.display()),
+            ]);
+            envs.push((
+                "KUBECONFIG".to_owned(),
+                kubeconfig.to_string_lossy().into_owned(),
+            ));
+        }
 
         if let Some(posthog_config) = &self.config.posthog_config {
             envs.push((
