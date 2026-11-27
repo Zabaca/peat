@@ -20,6 +20,12 @@ describe('a kubeconfig of several files', () => {
     expect(k.namespace).toBe('shop')
     expect(k.where).toBe('context staging at https://staging.example.com')
   })
+  test('a context whose namespace is empty reads as unset: the default namespace', () => {
+    dir = mkdtempSync(join(tmpdir(), 'peat-kube-'))
+    const a = join(dir, 'a')
+    writeFileSync(a, yaml({ 'current-context': 'c', contexts: [{ name: 'c', context: { cluster: 'x', user: 'u', namespace: '' } }], clusters: [{ name: 'x', cluster: { server: 'https://x.example.com' } }], users: [{ name: 'u', user: { token: 't' } }] }))
+    expect(fromKubeconfig({ path: a }).namespace).toBe('default')
+  })
   test('none of the files there: refused, naming them', () => {
     dir = mkdtempSync(join(tmpdir(), 'peat-kube-'))
     expect(() => fromKubeconfig({ path: join(dir, 'x') })).toThrow('no kubeconfig at')

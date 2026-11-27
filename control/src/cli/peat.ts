@@ -47,19 +47,29 @@ export function parsePg(v: string | undefined): 18 | 19 {
 }
 
 /** Arguments: positional words and options (`--x v`, `-n v`, `--flag`). */
+/**
+ * Arguments: positional words and options (`--x v`, `--x=v`, `-n v`, `-nprod` as kubectl reads it, `--flag`). An option the command does
+ * not know is refused, never ignored: a mistyped `--namespcae prod` must not act on the context's namespace. An empty namespace is refused.
+ */
 export function parseArgs(argv: string[]): { words: string[]; opts: Record<string, string | true> } {
   const words: string[] = [], opts: Record<string, string | true> = {}
   const takes = new Set(['n', 'namespace', 'kubeconfig', 'context', 'timeout', 'pg', 'at'])
+  const flags = new Set(['A', 'all-namespaces', 'no-wait', 'yes', 'rehearse', 'help', 'h'])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
+    // -n<value> run together, as kubectl takes it
+    const short = /^-n(.+)$/.exec(a)
+    if (short && !a.startsWith('--')) { opts['n'] = short[1]!.replace(/^=/, ''); continue }
     const m = /^--?([a-zA-Z][\w-]*)(?:=(.*))?$/.exec(a)
     if (!m) { words.push(a); continue }
     const k = m[1]!
-    if (m[2] !== undefined) opts[k] = m[2]
+    if (!takes.has(k) && !flags.has(k)) throw new Refused(`unknown option ${a} (peat help lists them)`)
+    if (m[2] !== undefined) { if (!takes.has(k)) throw new Refused(`${a.split('=')[0]} takes no value`); opts[k] = m[2] }
     else if (takes.has(k)) { const v = argv[++i]; if (v === undefined) throw new Refused(`${a} needs a value`); opts[k] = v }
     else opts[k] = true
   }
   if (opts['n'] !== undefined) opts['namespace'] = opts['n']
+  if (opts['namespace'] === '') throw new Refused('-n needs a namespace, not an empty one')
   return { words, opts }
 }
 
@@ -117,11 +127,14 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
   const { words, opts } = parsed
   const [verb, a, b] = words
   const usage = () => { out.line('usage: peat <list|show|make|branch|restore|replica|stop|close|open|move|delete|url|ca|status|retry> ... (peat help)'); return 2 }
-  if (verb === 'help' || opts['help']) { for (const l of HELP) out.line(l); return 0 }
+  if (verb === 'help' || opts['help'] || opts['h']) { for (const l of HELP) out.line(l); return 0 }
   if (!verb) return usage()
   const timeoutS = Number(opts['timeout'] ?? 180)
   if (!Number.isFinite(timeoutS) || timeoutS <= 0) { out.line(`peat: --timeout needs a number of seconds, not ${JSON.stringify(opts['timeout'])}`); return 2 }
-  const k = deps.kube ?? fromKubeconfig({ path: typeof opts['kubeconfig'] === 'string' ? opts['kubeconfig'] : undefined, context: typeof opts['context'] === 'string' ? opts['context'] : undefined, namespace: typeof opts['namespace'] === 'string' ? opts['namespace'] : undefined })
+  let k: Kube
+  // a kubeconfig that cannot be read is said in a line (outside a try, the error's stack and the bundled source would be printed)
+  try { k = deps.kube ?? fromKubeconfig({ path: typeof opts['kubeconfig'] === 'string' ? opts['kubeconfig'] : undefined, context: typeof opts['context'] === 'string' ? opts['context'] : undefined, namespace: typeof opts['namespace'] === 'string' ? opts['namespace'] : undefined }) }
+  catch (e) { out.line(`peat: ${(e as Error).message}`); return 1 }
   const ns = (typeof opts['namespace'] === 'string' ? opts['namespace'] : undefined)
   const here = ns ?? k.namespace
   const any = Boolean(opts['A'] || opts['all-namespaces']) && !ns
@@ -143,7 +156,8 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
   try {
     switch (verb) {
       case 'list': {
-        const r = ok(await k.request('GET', opts['A'] || opts['all-namespaces'] ? `/apis/${API_VERSION}/databases` : dbPath(here)), 'list the databases')
+        // -A lists every namespace, unless -n names one (as the other verbs take it)
+        const r = ok(await k.request('GET', any ? `/apis/${API_VERSION}/databases` : dbPath(here)), 'list the databases')
         const items = r.json.items as any[]
         if (!items.length) { out.line('no databases'); return 0 }
         for (const o of items) out.line(`${o.metadata.namespace}/${o.metadata.name}  ${o.status?.phase ?? 'Creating'}  ${o.status?.pgVersion ? `pg${o.status.pgVersion}` : ''}  ${o.status?.awake ? 'awake' : 'asleep'}  ${o.status?.host ?? o.status?.serviceHost ?? ''}`.replace(/\s+$/, ''))
