@@ -4,7 +4,7 @@
 // is an index-only scan the compute keeps in memory and never asks the pageserver), "the store unreachable" is a NetworkPolicy taken off
 // the storage pods' egress (the store itself is never touched), a machine cut is the installer's own command (as a power cut does) and is
 // started again by the guard's undo log, and a lost safekeeper is replaced by the control layer's own automation (`/sk-replace`).
-import { DB, FILLER_BYTES, FILLER_ROWS, READER_EXPECT, analyzeReader, analyzeWriter, type Ctx } from './lib'
+import { DB, FILLER_BYTES, FILLER_ROWS, READER_EXPECT, ackedRowsResult, analyzeReader, analyzeWriter, type Ctx } from './lib'
 import { RESTORED_CLUSTER } from './guard'
 
 export interface Opts { want?: 'with-gateway' | 'without-gateway'; gb?: number }
@@ -66,6 +66,8 @@ async function failureDrill(c: Ctx, o: { clientNode: (i: Info) => string; fault:
   const i = await gather(c)
   const client = o.clientNode(i)
   c.note(`attached pageserver ${i.attached}, secondary ${i.secondary.join(',') || 'none'}; compute on ${i.computeNode}; acting control layer on ${i.leaderNode}; gateways on ${i.gatewayNodes.join(',')}; clients on ${client}${o.note ? `; ${o.note(i)}` : ''}`)
+  // the SQL client goes where the writer and the reader go, a machine this drill does not cut: placed by what it first reads, it would land on the acting control layer's machine
+  c.sqlClientOn(client)
   await c.startWriter(client)
   await c.startReader(client)
   await c.sleep(25)
@@ -79,7 +81,8 @@ async function failureDrill(c: Ctx, o: { clientNode: (i: Info) => string; fault:
   await c.stopClients()
   if (rows === null) c.note('THE TABLE COULD NOT BE READ AFTER 5 MINUTES')
   const w = analyzeWriter(wlog, rows ?? '', faultAt), r = analyzeReader(rlog, faultAt)
-  c.record('acknowledged commits before the fault / acknowledged rows missing at the end', `${w.ackedBeforeFault} / ${w.missingAcked}`, w.missingAcked ? `FIRST MISSING ${w.missingFirst.join(',')}` : '')
+  const acked = ackedRowsResult(w, rows)
+  c.record('acknowledged commits before the fault / acknowledged rows missing at the end', acked.value, acked.note)
   c.record('writer: longest gap between acknowledged commits (s); began / ended after the fault (ms)', `${w.longestGapS}; ${w.gapBeganMsAfterFault} / ${w.firstOkAfterGapEndedMsAfterFault}`, `${w.errsFromFault} errors ${JSON.stringify(w.errMessages)}${w.duplicates.length ? ` DUPLICATES ${w.duplicates}` : ''}`)
   c.record('reader (heap scan): longest gap (s), errors, wrong counts', `${r.longestGapS}; ${r.errsFromFault} errors; ${r.wrongCounts} wrong`, `gap began ${r.gapBeganMsAfterFault} ms after the fault, ended ${r.gapEndedMsAfterFault} ${JSON.stringify(r.errMessages)}`)
 }

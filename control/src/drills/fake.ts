@@ -71,6 +71,9 @@ export class FakeCtx implements Ctx {
   notes: string[] = []
   results: { what: string; value: string; note: string }[] = []
   readonly started: string[] = []
+  /** The machines the drill chose: for its SQL client (each `sqlClientOn`), and for its writer and reader. */
+  readonly sqlOn: string[] = []
+  readonly clientsOn: string[] = []
   constructor(readonly g: Guard, readonly name: string, readonly runNo = 1, private readonly computeNode = 'machine-1', private readonly gateways = ['machine-1', 'machine-2']) {}
   note(l: string) { this.notes.push(l) }
   record(what: string, value: string, note = '') { this.results.push({ what, value, note }) }
@@ -97,8 +100,9 @@ export class FakeCtx implements Ctx {
   async createDb() {}
   async setCheckpoint(db: string, seconds: number) { await this.g.setTenantCheckpoint(db, seconds) }
   async startClientPod(name: string) { this.started.push(name) }
-  async startWriter() { this.started.push('drill-writer') }
-  async startReader() { this.started.push('drill-reader') }
+  async startWriter(node: string) { this.started.push('drill-writer'); this.clientsOn.push(node) }
+  async startReader(node: string) { this.started.push('drill-reader'); this.clientsOn.push(node) }
+  sqlClientOn(node: string) { this.sqlOn.push(node) }
   async stopClients() {}
   async clientClock() { return this.g.now() }
   async clientLog() { return '' }

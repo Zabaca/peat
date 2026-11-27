@@ -6,7 +6,7 @@ import { DEFAULT_NAMES } from '../src/names'
 import { DRILLS } from '../src/drills/drills'
 import { FAKE_MACHINES, FakeClock, FakeCtx, PlanExec, fakeSettings } from '../src/drills/fake'
 import { CLEAR_MINUTES, DEFAULT_VOLUMES, Guard, PEAT_ALERTS, RESTORED_CLUSTER, Refusal, SILENCE_MINUTES, assertMachine, assertNamespace, assertNoPending, assertReplayable, drillSettings, egressReachesStore, machineCommand, namespacesOf, parseMachineCommand, peatAlertNames, pendingPath, quietConflict, readPending, silenceMatchers, volumeTarget, type DrillSettings, type Exec, type Replay, type Result, type Shape } from '../src/drills/guard'
-import { DB, READER_EXPECT, READER_SQL, FILLER_BYTES, FILLER_ROWS, analyzeReader, analyzeWriter, diffSnapshots, type Snapshot } from '../src/drills/lib'
+import { DB, READER_EXPECT, READER_SQL, FILLER_BYTES, FILLER_ROWS, ackedRowsResult, analyzeReader, analyzeWriter, diffSnapshots, sqlClientAction, type Snapshot } from '../src/drills/lib'
 import { plan } from '../src/drills/run'
 
 /**
@@ -652,6 +652,46 @@ describe('every drill, run against a fake world with the real guard', () => {
     const c = new FakeCtx(g, 'worker-comp', 1, 'machine-3', ['machine-1', 'machine-2'])
     await expect(DRILLS.find((d) => d.name === 'worker-comp')!.run(c, { want: 'with-gateway' })).rejects.toThrow(/Nothing was cut/)
     expect(g.actions.filter((a) => a.what.startsWith('cut '))).toEqual([])
+  })
+  test('the drills that cut a machine put their SQL client, writer and reader on a machine they do not cut', async () => {
+    for (const d of DRILLS.filter((d) => d.machineCut)) {
+      const g = new Guard(new PlanExec(), { dry: true, clock: new FakeClock(), log: () => {}, settings: fakeSettings() })
+      const c = new FakeCtx(g, d.name, 1)
+      await d.run(c, { want: undefined })
+      const cut = g.actions.filter((a) => a.what.startsWith('cut ')).map((a) => a.what.slice(4))
+      expect(cut.length, d.name).toBe(1)
+      expect(c.sqlOn.length, d.name).toBe(1)
+      expect(MACHINES, d.name).toContain(c.sqlOn[0]!)
+      expect(c.sqlOn[0], d.name).not.toBe(cut[0]!)
+      expect(c.clientsOn, d.name).toEqual([c.sqlOn[0]!, c.sqlOn[0]!])
+    }
+  })
+  test('every drill that starts a writer and a reader says where its SQL client goes first, so the final read does not wait for a machine the drill cut', () => {
+    const t = read('drills.ts')
+    const f = t.slice(t.indexOf('async function failureDrill'))
+    expect(f.indexOf('c.sqlClientOn(client)')).toBeGreaterThan(0)
+    expect(f.indexOf('c.sqlClientOn(client)')).toBeLessThan(f.indexOf('await c.startWriter(client)'))
+    expect(read('lib.ts')).toContain("if (action === 'recreate') await this.g.killPod(this.n.computeNamespace, 'drill-sql')")
+  })
+  test('the SQL client pod: made when missing, kept when Ready where it should be, made again when not Ready or on another machine', () => {
+    expect(sqlClientAction(undefined, 'machine-1')).toBe('create')
+    expect(sqlClientAction(undefined, undefined)).toBe('create')
+    expect(sqlClientAction({ node: 'machine-1', ready: true }, 'machine-1')).toBe('keep')
+    expect(sqlClientAction({ node: 'machine-2', ready: true }, undefined)).toBe('keep')
+    expect(sqlClientAction({ node: 'machine-2', ready: true }, 'machine-1')).toBe('recreate')
+    expect(sqlClientAction({ node: 'machine-1', ready: false }, 'machine-1')).toBe('recreate')
+    expect(sqlClientAction({ node: 'machine-2', ready: false }, undefined)).toBe('recreate')
+  })
+  test('a table that could not be read is reported as not checked, never as rows missing', () => {
+    const log = ['ok 1000 1100 1|t', 'ok 2000 2100 2|t', 'ok 3000 3100 3|t'].join('\n')
+    const w = analyzeWriter(log, '', 3500)
+    expect(w.missingAcked).toBe(3)
+    const unread = ackedRowsResult(w, null)
+    expect(unread.value).toBe('3 / NOT CHECKED')
+    expect(unread.note).toContain('COULD NOT BE READ')
+    expect(unread.note).not.toContain('MISSING')
+    expect(ackedRowsResult(analyzeWriter(log, '1\n3\n', 3500), '1\n3\n')).toEqual({ value: '3 / 1', note: 'FIRST MISSING 2' })
+    expect(ackedRowsResult(analyzeWriter(log, '1\n2\n3\n', 3500), '1\n2\n3\n')).toEqual({ value: '3 / 0', note: '' })
   })
   test('plan() prints the steps and returns', async () => {
     const orig = console.log; const out: string[] = []; console.log = (l: string) => { out.push(String(l)) }

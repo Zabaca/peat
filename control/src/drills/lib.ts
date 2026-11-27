@@ -54,6 +54,17 @@ export function analyzeWriter(log: string, rows: string, fault: number): WriterS
     duplicates: [...counts.entries()].filter(([, c]) => c > 1).map(([n]) => n).slice(0, 3),
   }
 }
+/** The drill's first result line. A table that could not be read is not a table with rows missing: with nothing read, no acknowledged row can be called missing (found 2026-11-27: a drill whose own SQL client died with the machine it cut reported every acknowledged row missing, while the database was readable throughout). */
+export function ackedRowsResult(w: WriterSummary, rows: string | null): { value: string; note: string } {
+  if (rows === null) return { value: `${w.ackedBeforeFault} / NOT CHECKED`, note: 'THE TABLE COULD NOT BE READ, so whether any acknowledged row is missing is unknown (read it from outside the drill)' }
+  return { value: `${w.ackedBeforeFault} / ${w.missingAcked}`, note: w.missingAcked ? `FIRST MISSING ${w.missingFirst.join(',')}` : '' }
+}
+/** What to do about the drill's SQL client pod: make it, keep it, or make it again. It is made again when it is not Running and Ready (a bare Pod on a machine the drill cut never runs again), or when it sits on another machine than the one the drill chose for its clients (`home`, a machine the drill does not cut). */
+export function sqlClientAction(pod: { node: string; ready: boolean } | undefined, home: string | undefined): 'create' | 'keep' | 'recreate' {
+  if (!pod) return 'create'
+  if (!pod.ready || (home !== undefined && pod.node !== home)) return 'recreate'
+  return 'keep'
+}
 export interface ReaderSummary { answers: number; longestGapS: number; gapBeganMsAfterFault: number; gapEndedMsAfterFault: number; errsFromFault: number; errMessages: [string, number][]; wrongCounts: number }
 export function analyzeReader(log: string, fault: number, expect = READER_EXPECT): ReaderSummary {
   const ok: [number, number, string][] = [], err: [number, number, string][] = []
@@ -132,7 +143,9 @@ export interface Ctx {
   /** The writer pod's clock in ms: every time in the clients' logs and every fault time of a drill is on this clock. */
   clientClock(): Promise<number>
   clientLog(pod: string): Promise<string>
-  /** One SQL statement against a database through the front door (a client pod `drill-sql` runs psql). */
+  /** The machine the SQL client pod `drill-sql` runs on from now on: one the drill does not cut. A pod already running elsewhere is made again there at the next statement. */
+  sqlClientOn(node: string): void
+  /** One SQL statement against a database through the front door (a client pod `drill-sql` runs psql, made again when it is not Running or not where `sqlClientOn` said). */
   sql(db: string, text: string, seconds?: number): Promise<string>
   /** Waits until a database answers a query through the front door, up to `seconds`; the table's rows are read this way. */
   sqlRetry(db: string, text: string, seconds: number): Promise<string | null>
@@ -252,9 +265,15 @@ export class LiveCtx implements Ctx {
   async stopClients() { for (const p of ['drill-writer', 'drill-reader', 'drill-sql', 'drill-session', 'drill-fence-old', 'drill-fence-new']) await this.g.deleteObject(this.n.computeNamespace, 'Pod', p) }
   async clientClock() { return Number((await this.g.clientClock('drill-writer')).trim()) }
   async clientLog(pod: string) { return this.g.kread(['-n', this.n.computeNamespace, 'logs', pod]) }
+  sqlClientOn(node: string) { this.clientHome = node }
   async sql(db: string, text: string, seconds = 60) {
     const sqlPod = (await this.pods(this.n.computeNamespace, 'app=drill-client')).find((p) => p.name === 'drill-sql')
-    if (!sqlPod) await this.startClientPod('drill-sql', this.clientHome ?? (await this.controlLeader()).node, db, 'sleep 86400')
+    const action = sqlClientAction(sqlPod, this.clientHome)
+    if (action !== 'keep') {
+      // forced, so that a pod left on a machine that is down does not keep the name
+      if (action === 'recreate') await this.g.killPod(this.n.computeNamespace, 'drill-sql')
+      await this.startClientPod('drill-sql', this.clientHome ?? (await this.controlLeader()).node, db, 'sleep 86400')
+    }
     return this.g.clientPsql('drill-sql', { host: `${db}.${this.n.dbNamespace}.svc`, password: await this.password(db), seconds }, text)
   }
   async sqlRetry(db: string, text: string, seconds: number) {
