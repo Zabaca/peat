@@ -532,7 +532,7 @@ step "the way back: a return to the frozen copy, what was written since kept in 
 # a row written on 19 after the move
 mvsql 'insert into items values (501, $$written on 19$$)'
 execs() { k -n peat logs "pod/$(ready_pod peat app=peat-control)" --tail=-1 2>/dev/null | grep -c 'move shop/mv18: exec on' || true; }
-# The restart made certain, not raced: a rule of the test's own refuses the control layer's making of mv18-pg19, so the way back stops at
+# The restart made certain, not raced: a rule of the test's own refuses the control layer's making of a copy of mv18 (mv18-pg19), so the way back stops at
 # that step with its state going-back and says it goes on later; then its pod is killed, the new one is up, and the rule goes. Only the
 # new pod can finish it (a way back takes under 2 s, so a pod killed in the middle of one otherwise finishes it before the kubelet ends it).
 k apply -f - >/dev/null <<EOF
@@ -543,7 +543,7 @@ spec:
   failurePolicy: Fail
   matchConstraints: { resourceRules: [ { apiGroups: [peat.zabaca.com], apiVersions: ["*"], operations: [CREATE], resources: [databases] } ] }
   matchConditions: [ { name: control, expression: "request.userInfo.username == 'system:serviceaccount:peat:peat-control'" } ]
-  validations: [ { expression: "object.metadata.name != 'mv18-pg19'", message: "held by the install test" } ]
+  validations: [ { expression: "!has(object.spec.parent) || object.spec.parent != 'mv18'", message: "held by the install test" } ]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
