@@ -15,7 +15,7 @@
 import { X509Certificate, createHmac, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, pbkdf2Sync, randomBytes, sign as edSign, verify as edVerify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { SAFEKEEPER_RESOURCES, SEED_GROUP_ANNOTATION, closeDecision, decommissionDecision, reopenDecision, totalLossEvidence, formatSeedGroup, parseSeedGroup, membersOffBox, moveDecision, otherReplacementOpen, placementFor, replaceDecision, replacementMachines, replacementPool, safekeeperStatefulSet, seedCompletion, seedDecision, seedGroup, seedIds, neverWritten, isPullTimelineFailure, keeperNodeProblem, keeperReplacementVerdict, certInfo, certNeedsReload, tcpUp, memoryGauges, placementVerdict, startVerdict, within, type MemberAt, type ReplacementMark, type SkRecord, type TimelineRead } from './storage-spec'
-import { computeImageFor, pgVersionOf, requestedPgVersion } from './storage-spec' // a database's Postgres version and the compute image that serves it
+import { callerVerdict, computeImageFor, pgVersionOf, requestedPgVersion } from './storage-spec' // a database's Postgres version and the compute image that serves it
 import { ancestorFor, olderTimelineFor, ownMemberProbe, recoverDecision, recoverStep, recoveryPoint, recoveryScope, timelineOwnMembers, unfinishedRepoint, type MemberProbe, type RecoveryMark } from './storage-spec' // the recovery of a database under its own name (recoverDatabase)
 import { GROUP, controlUrl, fromEnv, frontDoor, parseLabel, placement } from './names'
 import { newLeaf } from './operator/keys'
@@ -1465,7 +1465,10 @@ const localPsql = (pod: string, db: string, sql: string, what: string) => inComp
 async function listExecs(key: string, pods: string[] | null): Promise<void> {
   const path = `/api/v1/namespaces/${NS}/configmaps/${MOVE_EXECS_CONFIG_MAP}`
   const r = await kube('PATCH', path, { data: { [key]: pods ? pods.join(' ') : null } }, 'application/merge-patch+json')
-  if (r.status === 404 && pods) ok(await kube('POST', `/api/v1/namespaces/${NS}/configmaps`, { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: MOVE_EXECS_CONFIG_MAP, namespace: NS }, data: { [key]: pods.join(' ') } }), 'list the move\'s pods', [409])
+  // the list is the operator's (made empty and kept): one this layer made would be an object the operator did not make, which it leaves
+  // alone and reports, keeping the Platform Installing. A list that is missing (deleted, the operator not yet past it) fails this step:
+  // the move fails, and goes on when asked again
+  if (r.status === 404 && pods) throw new Error(`the exec guard's list ${MOVE_EXECS_CONFIG_MAP} is missing (the operator makes it again at its next pass): ask again with requests.retryMove`)
   else ok(r, 'list the move\'s pods', [404])
 }
 /** The ready compute pod of a database, waited for (a start may pull the image first). */
@@ -2097,7 +2100,9 @@ Bun.serve({
     const path = url.pathname
     try {
       const cls = await callerClass(server.requestIP(req)?.address)
-      if (cls && !CALLER_ROUTES[cls]!.some(([m, re]) => m === req.method && re.test(path))) { bump('caller_refused_total'); console.log(`refused: a ${cls} may not ${req.method} ${path}`); return json({ error: `a ${cls} may not call this` }, 403) }
+      const verdict = cls ? callerVerdict(CALLER_ROUTES, cls, req.method, path) : 'pass'
+      if (verdict === 'again') { bump('caller_not_listed_total'); console.log(`not yet: an address no piece is listed at may not ${req.method} ${path}: asked to call again`); return new Response(JSON.stringify({ error: 'this address is not listed as a piece of the platform (yet): call again' }), { status: 503, headers: { 'content-type': 'application/json', 'retry-after': '1' } }) }
+      if (verdict === 'refuse') { bump('caller_refused_total'); console.log(`refused: a ${cls} may not ${req.method} ${path}`); return json({ error: `a ${cls} may not call this` }, 403) }
       if (req.method === 'GET' && path === '/healthz') return json({ ok: true })
       // the storage controller's compute hook
       if (req.method === 'PUT' && path.startsWith('/hook/')) {

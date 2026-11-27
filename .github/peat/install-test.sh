@@ -7,8 +7,9 @@
 #
 # The control image must be in the local Docker (it is loaded into the cluster); the others are pulled by the cluster, or loaded from the
 # local Docker when LOAD_IMAGES names them. The store is a MinIO
-# in the cluster, the storage controller's records a Postgres in the cluster (records postgres: the Kubernetes records come with the
-# controller that keeps them). The platform is a one-machine trial (spread none) on the cluster's one node. Needs kind, kubectl, docker,
+# in the cluster. The storage controller's records are the default, Kubernetes objects with their copy in the store (records
+# kubernetes); RECORDS=postgres keeps them in a Postgres in the cluster instead, for an UPGRADE_FROM release whose controller predates
+# the Kubernetes records. The platform is a one-machine trial (spread none) on the cluster's one node. Needs kind, kubectl, docker,
 # bun and psql on the PATH (KIND names another kind). KEEP=1 keeps the cluster afterwards; it is deleted otherwise, pass or fail.
 # UPGRADE_FROM=<a release in the registry> installs that release first (its storage and compute images, this control image) and, after
 # the databases' checks, upgrades the platform to the images given, with a writer and a reader running throughout.
@@ -26,6 +27,11 @@ export KUBECONFIG="$work/kubeconfig"
 k() { kubectl --context "kind-$cluster" "$@"; }
 started=$(date +%s)
 since() { echo "$(( $(date +%s) - $1 ))"; }
+# the name of a pod that is ready and not on its way out: a deleted pod is replaced at once (a Deployment's Recreate holds only for a
+# rollout), and the old one can still read ready beside the new one
+ready_pod() { # ready_pod <namespace> <label selector>
+  k -n "$1" get pods -l "$2" -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null | awk 'NF == 1 { print $1; exit }'
+}
 pids=()
 finish() {
   rc=$?
@@ -56,7 +62,7 @@ for image in ${LOAD_IMAGES:-}; do "$kind" load docker-image "$image" --name "$cl
 node="$cluster-control-plane"
 k label node "$node" peat.zabaca.com/machine=true --overwrite
 
-echo "== the store and the records' database (throwaways of their own)"
+echo "== the store (and, with RECORDS=postgres, the records' database), throwaways of their own"
 k create namespace store
 k -n store apply -f - <<EOF
 apiVersion: apps/v1
@@ -81,7 +87,9 @@ apiVersion: v1
 kind: Service
 metadata: { name: minio }
 spec: { selector: { app: minio }, ports: [ { port: 9000 } ] }
----
+EOF
+records=${RECORDS:-kubernetes}
+[ "$records" = postgres ] && k -n store apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: records-db }
@@ -113,9 +121,11 @@ k -n peat-system rollout status deployment/peat-operator --timeout=180s
 echo "== the platform: its namespace and the store's Secret first, then one Platform"
 k create namespace peat
 k -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=peat-test --from-literal=AWS_SECRET_ACCESS_KEY=peat-test-secret
-k -n peat create secret generic records-db --from-literal=uri='postgresql://postgres:peat-test@records-db.store.svc:5432/storage_controller'
 k -n store rollout status deployment/minio --timeout=180s
-k -n store rollout status deployment/records-db --timeout=180s
+if [ "$records" = postgres ]; then
+  k -n peat create secret generic records-db --from-literal=uri='postgresql://postgres:peat-test@records-db.store.svc:5432/storage_controller'
+  k -n store rollout status deployment/records-db --timeout=180s
+fi
 k apply -f - <<EOF
 apiVersion: peat.zabaca.com/v1alpha1
 kind: Platform
@@ -127,7 +137,7 @@ spec:
   objectStore: { endpoint: "http://minio.store.svc:9000", region: us-east-1, bucket: peat, credentialsSecret: peat-store }
   pageservers: { count: 1, storage: { hostPath: { path: /var/lib/peat/pageserver, create: true } } }
   safekeepers: { storage: { hostPath: { path: /var/lib/peat/safekeeper, create: true } } }
-  controller: { records: postgres, postgres: { urlSecret: records-db } }
+  controller: $(if [ "$records" = postgres ]; then echo '{ records: postgres, postgres: { urlSecret: records-db } }'; else echo '{ records: kubernetes }'; fi)
   gateways: { count: 1 }
   control: { replicas: 1 }
   computes: { idleAfter: 1m }
@@ -272,6 +282,33 @@ sql "insert into t select g, md5(g::text) from generate_series(1, 100000) g"
 [ "$(sql 'select count(*) from t')" = 100000 ] || fail 'the rows written were not read back'
 echo "  first answer $first_s s after the make; 100000 rows written and read back with verify-full"
 
+if [ "$records" = kubernetes ]; then
+  step "the storage controller's pod deleted and made again: the new one leads at its own address, the copy current, a new database attached"
+  old_ctl=$(k -n peat get pods -l app=storage-controller -o jsonpath='{.items[0].metadata.name}')
+  k -n peat delete pod "$old_ctl" --wait=false >/dev/null
+  t0=$(date +%s); until new_ctl=$(ready_pod peat app=storage-controller) && [ -n "$new_ctl" ] && [ "$new_ctl" != "$old_ctl" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'no new storage controller was ready in 180 s'; sleep 2; done
+  new_ip=$(k -n peat get pod "$new_ctl" -o jsonpath='{.status.podIP}')
+  # the Leader record names the new pod by its own address, not the Service's
+  t0=$(date +%s); until case "$(k -n peat get leaders.storagecontroller.peat.zabaca.com leader -o jsonpath='{.spec.address}' 2>/dev/null)" in "http://$new_ip:1234"*) true;; *) false;; esac; do
+    [ "$(since "$t0")" -lt 60 ] || fail "the Leader record does not name the new controller ($new_ip): $(k -n peat get leaders.storagecontroller.peat.zabaca.com leader -o jsonpath='{.spec.address}' 2>&1)"
+    sleep 2
+  done
+  # the copy in the store is written by the new leader: nothing behind (the pod's own port, so no network rule stands between)
+  k -n peat port-forward "pod/$new_ctl" 21234:1234 >>"$work/tunnel-controller.log" 2>&1 &
+  pids+=($!); ctl_tunnel=$!
+  tunnel_up 21234
+  t0=$(date +%s); until [ "$(curl -fsS localhost:21234/metrics 2>/dev/null | awk '/^storage_controller_records_copy_behind_seconds /{print $2}')" = 0 ]; do
+    [ "$(since "$t0")" -lt 60 ] || fail "the new leader's copy of the records is behind: $(curl -fsS localhost:21234/metrics 2>&1 | grep records_copy_behind | head -3)"
+    sleep 2
+  done
+  kill "$ctl_tunnel" 2>/dev/null || true
+  sleep 30
+  curl -fsS -X POST localhost:18080/db -H 'content-type: application/json' -d '{"name":"handover"}' >/dev/null || fail 'no database was made after the controller was replaced'
+  ho_password=$(k -n peat get secret db-handover-login -o jsonpath='{.data.password}' | base64 -d)
+  t0=$(date +%s); until [ "$(PGPASSWORD="$ho_password" psql "host=handover.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/ca.crt connect_timeout=30" -XAtqc 'select 1' 2>/dev/null)" = 1 ]; do [ "$(since "$t0")" -lt 300 ] || fail 'the database made after the controller was replaced did not answer'; sleep 3; done
+  echo "  $new_ctl leads at $new_ip, its copy current; a database made 30 s after it answers"
+fi
+
 step "asleep, then woken by a connection"
 curl -fsS -X POST localhost:18080/db/first/stop >/dev/null || fail 'the stop was refused'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=first -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'the compute did not go'; sleep 2; done
@@ -402,11 +439,13 @@ refused_exec() { # refused_exec <what> <expected message part> <exec args...>
   grep -qF "$want" <<< "$out" || fail "the exec guard refused $what, but not as expected: $out"
   echo "  refused: $what"
 }
-refused_exec 'an exec with no move under way (the list not there)' 'no params found' "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1'
-k -n peat create configmap peat-move-execs --from-literal="probe=some-other-pod" >/dev/null
+# the list is the operator's, there and empty from the install
+k -n peat get configmap peat-move-pods >/dev/null 2>&1 || fail "the operator did not make the exec guard's list, peat-move-pods"
+refused_exec 'an exec with no move under way (the list empty)' 'is not one' "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1'
+k -n peat patch configmap peat-move-pods --type merge -p '{"data":{"probe":"some-other-pod"}}' >/dev/null
 sleep 3
 refused_exec 'an exec into a compute no move lists' 'is not one' "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1'
-k -n peat patch configmap peat-move-execs --type merge -p "{\"data\":{\"probe\":\"$guard_pod\"}}" >/dev/null
+k -n peat patch configmap peat-move-pods --type merge -p "{\"data\":{\"probe\":\"$guard_pod\"}}" >/dev/null
 sleep 3
 refused_exec 'a command other than psql or the move script, in a listed pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- ls /
 refused_exec 'bash with a script of its own, in a listed pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- bash -c id
@@ -416,7 +455,15 @@ echo "  allowed: psql in a listed pod"
 if out=$(k --as=system:serviceaccount:peat-system:peat-operator -n peat-compute exec "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1' 2>&1); then fail "the operator's account was let exec"; fi
 grep -qF "runs no exec" <<< "$out" || fail "the operator's exec was refused, but not by its rule: $out"
 echo "  refused: an exec by the operator's account, into a listed pod"
-k -n peat delete configmap peat-move-execs >/dev/null
+# the list deleted by hand: the guard touches no account but the control layer's (an exec as the cluster's admin into a pod outside the
+# platform's namespaces), the control layer is still held to psql in a compute, and the operator makes the list again
+k -n peat delete configmap peat-move-pods >/dev/null
+[ "$(k -n store exec deploy/minio -- echo reached)" = reached ] || fail "with the exec guard's list missing, the cluster's admin could not exec into a pod outside the platform"
+echo "  allowed: an exec by the cluster's admin outside the platform, the list missing"
+refused_exec 'a command other than psql or the move script, the list missing' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- ls /
+t0=$(date +%s); until k -n peat get configmap peat-move-pods >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'the operator did not make the list peat-move-pods again'; sleep 3; done
+k -n peat patch configmap peat-move-pods --type merge -p '{"data":{"probe":null}}' >/dev/null
+echo "  the list made again by the operator"
 
 step "a database moved from Postgres 18 to 19 under its own name (P2), with a second database and a second role of its own"
 dbobj mv18 'pgVersion: 18'
@@ -467,7 +514,7 @@ case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but 
 [ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'the second role, its password or its database did not come with the move'
 settings_kept 'in the move'
 [ "$(k -n shop get database mv18-pg18 -o jsonpath='{.status.pgVersion}')" = 18 ] || fail 'the old copy mv18-pg18 was not kept'
-if k -n peat get configmap peat-move-execs -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
+if k -n peat get configmap peat-move-pods -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
 echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, the settings, its old copy mv18-pg18 kept on 18"
 echo "  $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: the old version stopped [0-9]* ms after the last look at it' | tail -1)"
 
@@ -522,7 +569,7 @@ sssql 'create table w (id int primary key)'
 curl -fsS -X POST localhost:18080/db/ss18/stop >/dev/null || fail 'ss18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=ss18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'ss18 did not stop'; sleep 2; done
 k -n shop patch database ss18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
-t0=$(date +%s); until ss_pod=$(k -n peat-compute get pods -l compute=ss18 -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null) && [ -n "$ss_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
+t0=$(date +%s); until ss_pod=$(ready_pod peat-compute compute=ss18) && [ -n "$ss_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 [ "$(k -n shop get database ss18 -o jsonpath='{.status.phase}')" = Moving ] || fail 'the source was started, but the door is not shut'
 # straight to the source, a session that writes a row every 0.3 s and prints each one written (psql stops at the first error)
 k -n peat-compute port-forward "pod/$ss_pod" 25432:5432 >>"$work/tunnel-ss.log" 2>&1 &
@@ -564,7 +611,7 @@ swsql "create table big as select g as id, md5(g::text) as note from generate_se
 curl -fsS -X POST localhost:18080/db/sw18/stop >/dev/null || fail 'sw18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=sw18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'sw18 did not stop'; sleep 2; done
 k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
-t0=$(date +%s); until sw_pod=$(k -n peat-compute get pods -l compute=sw18 -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
+t0=$(date +%s); until sw_pod=$(ready_pod peat-compute compute=sw18) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 k -n peat-compute port-forward "pod/$sw_pod" 25433:5432 >>"$work/tunnel-sw.log" 2>&1 &
 pids+=($!); sw_tunnel=$!
 tunnel_up 25433

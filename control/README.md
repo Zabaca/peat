@@ -91,6 +91,11 @@ directory is mounted unchecked, so the container runtime makes a missing one on 
 `/var/lib/peat` and paths under `/var/mnt` (a disk Talos mounts there) then work with `create: true`, and an existing directory with
 `create: false`.
 
+The storage controller names itself to its peers by its pod's address (`http://$(POD_IP):1234`, from the downward API). On a cluster
+whose pods have only IPv6 addresses that is not a valid URL (it needs brackets, which the downward API cannot add, and the controller
+takes no address but a URL); such a cluster is not supported yet: it needs a wrapper that writes the address before the controller
+starts.
+
 ## The objects
 
 A whole install is one `Platform` (cluster-scoped, one per cluster) and its databases are `Database` objects (namespaced). Every field, its
@@ -155,10 +160,16 @@ What a move leaves out of the copy and the comparison, matched by exact name, ne
 A person's role granted to `app`, and a person's role's membership in `neon_superuser`, are copied.
 
 What guards it:
-- The control layer may exec only into a compute's container in a pod listed in the ConfigMap `peat-move-execs`, only `psql` or
-  `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). An admission
-  rule enforces it; with no list, no exec passes.
-- The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-execs`
+- The control layer may exec only into a compute's container in a pod listed in the ConfigMap `peat-move-pods`, only `psql` or
+  `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). Two admission
+  rules enforce it: one the shape (namespace, container, command), one the list, which the operator makes empty and keeps. Neither
+  judges any account but the control layer's, whatever exists or is missing: an API server reads a rule's parameter before the rule's
+  own conditions, so the list's rule lets a missing list through. With the list deleted (by hand, or by the control layer's own account,
+  whose Role may delete ConfigMaps in the platform namespace), until the operator makes it again, the control layer is held to the shape
+  alone; a move that finds it missing fails, and goes on when asked again (a resumed attempt that finds it missing as it starts waits
+  instead, and goes on by itself once the operator has made it again). The list was `peat-move-execs` before, made by the control
+  layer: one an earlier release left behind is an orphan, read by nothing, and may be deleted.
+- The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-pods`
   among them, so a control layer that misbehaves can list any compute. The list bounds what a move does, not what the account could do.
 - The rule does not bound `psql`'s arguments, so in a listed pod the control layer may run any SQL as the local superuser, and so any
   shell command in that container (`\!`, `-o '|command'`, `COPY ... TO PROGRAM`).

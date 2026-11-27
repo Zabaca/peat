@@ -37,7 +37,9 @@ import {
   secondaryWarmProblem,
   seedCompletion,
   seedDecision,
+  callerVerdict,
   seedGroup,
+  shardLocations,
   seedIds,
   staleErrorProblem,
   startVerdict,
@@ -231,7 +233,21 @@ describe('who may call which route', () => {
     expect(decide).toContain("?? 'unknown'")
     expect(decide).toContain("catch { return 'unknown' }")
     expect(decide).not.toContain("return 'gateway'")
-    expect(control).toContain('if (cls && !CALLER_ROUTES[cls]!.some(')
+    expect(control).toContain("const verdict = cls ? callerVerdict(CALLER_ROUTES, cls, req.method, path) : 'pass'")
+    // an address in no class calling what a piece may (a storage controller's first notification, before its pod's address is listed) is
+    // asked to call again (503, retried by the controller), never admitted; what no piece may call is refused
+    expect(callerVerdict(routes, 'unknown', 'PUT', '/hook/notify-attach')).toBe('again')
+    expect(callerVerdict(routes, 'unknown', 'GET', '/compute/current')).toBe('again')
+    expect(callerVerdict(routes, 'unknown', 'GET', '/healthz')).toBe('pass')
+    expect(callerVerdict(routes, 'unknown', 'POST', '/db')).toBe('refuse')
+    expect(callerVerdict(routes, 'compute', 'PUT', '/hook/notify-attach')).toBe('refuse')
+    expect(callerVerdict(routes, 'controller', 'PUT', '/hook/notify-attach')).toBe('pass')
+    expect(control).toContain("status: 503, headers: { 'content-type': 'application/json', 'retry-after': '1' }")
+    // the exec guard's list is the operator's: a missing one fails the move's listing, never made by this layer (the operator would find
+    // an object it did not make and keep the Platform Installing)
+    const listing = control.slice(control.indexOf('async function listExecs'), control.indexOf('async function readyPod'))
+    expect(listing).toContain("if (r.status === 404 && pods) throw new Error(")
+    expect(listing).not.toContain("'POST'")
     expect(control).toContain("labelSelector=app%3Dpeat-compute`), 'list compute pods'")
     // names that reach an API path are held to a pattern, and a name with a slash or `..` matches neither
     const DB = /^[a-z][a-z0-9-]{0,30}$/
@@ -311,6 +327,21 @@ describe('the safekeepers: closing, seeding, moving, deciding', () => {
     expect(closeDecision([on, unknown]).close).toBe(false)
     expect(control).toContain('closeDecision(reads)')
     expect(control).toContain('if (fin.close) {')
+  })
+
+  test('the locations of a shard with an error, as the controller and each pageserver give them; none when a pageserver did not answer', () => {
+    const debug = [
+      { tenant_shard_id: 't1', generation: 3, intent: { attached: 1, secondary: [2] }, observed: { locations: { 1: { conf: { mode: 'AttachedSingle', generation: 3 } }, 2: { conf: { mode: 'Secondary', generation: null } }, 3: null } } },
+      { tenant_shard_id: 't2', generation: 1, intent: { attached: 2, secondary: [] }, observed: { locations: {} } },
+    ]
+    const held = { 1: new Map([['t1', { attached: true, generation: 3 }]]), 2: new Map([['t1', { attached: false, generation: null }]]) }
+    expect(shardLocations(debug, held, new Set(['t1']))).toEqual(new Map([['t1', {
+      generation: 3,
+      intent: { attached: 1, secondary: [2] },
+      observed: { 1: { mode: 'AttachedSingle', generation: 3 }, 2: { mode: 'Secondary', generation: null }, 3: undefined },
+      held: { 1: { attached: true, generation: 3 }, 2: { attached: false, generation: null } },
+    }]]))
+    expect(shardLocations(debug, { ...held, 3: undefined }, new Set(['t1'])).size).toBe(0)
   })
 
   test('a seeding that stopped half way is finished, and a member replaced away is not made again', () => {
