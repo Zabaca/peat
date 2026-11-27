@@ -2105,12 +2105,20 @@ describe('a wake dials the woken server by its own address once it takes logins'
   test('ten callers share one wake and one asking: one read of the Cluster, one patch, every caller passed to the pod`s address', async () => {
     const made = await direct({}, 2)
     const { api, gateway, client, pg } = made
-    comes(made, 20, 60)
-    const clients = Array.from({ length: 10 }, (_, i) => {
+    // The server comes only once all ten callers are on the wake, not on a timer: a caller the gateway accepted after a wake had settled would make a second one (seen once in CI on
+    // 2026-11-27, a loaded runner accepting the tenth caller after the 60 ms the server took). The first caller makes the wake; the other nine join it as they are accepted.
+    const call = (i: number) => {
       const c = client()
       c.write(`caller-${i}`)
       return c
-    })
+    }
+    const clients = [call(0)]
+    await until(() => api.count('wake') === 1)
+    for (let i = 1; i < 10; i++) clients.push(call(i))
+    await until(() => sample(gateway, 'pg_gateway_connections_total') === 10)
+    expect(sample(gateway, 'pg_gateway_connections_total')).toBe(10)
+    api.pods.set(POD_KEY, podRow())
+    void pg.listen()
     await Promise.all(clients.map((c, i) => c.hears(`caller-${i}`.length)))
     expect(api.count('wake')).toBe(1)
     expect(api.count('get ')).toBe(1)
