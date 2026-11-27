@@ -16,6 +16,7 @@
 import { durationMs } from '../api/schema'
 import { GROUP, controlUser, frontDoor, placement, toEnv, type Names } from '../names'
 import { SAFEKEEPER_RESOURCES } from '../storage-spec'
+import { MOVE_EXECS_CONFIG_MAP, MOVE_SCRIPT, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL } from '../move'
 import type { Resolved } from './platform'
 import { TOKENS, type Holder } from './keys'
 
@@ -371,7 +372,9 @@ export function controlAccount(r: Resolved): Manifest[] {
   return [
     { apiVersion: 'v1', kind: 'ServiceAccount', metadata: meta(r, CONTROL_ACCOUNT, n.namespace) },
     ...role(r, n.namespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['secrets', 'configmaps'], CRUD), rule(['apps'], ['statefulsets'], ['get', 'list', 'create', 'update', 'delete']), rule(['batch'], ['jobs'], ['get']), rule(['coordination.k8s.io'], ['leases'], ['get', 'list', 'create', 'update', 'patch'])]),
-    ...role(r, n.computeNamespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['secrets'], CRUD), rule(['apps'], ['deployments'], CRUD), rule(['cert-manager.io'], ['certificates'], CRUD)]),
+    // pods/exec: the major-version move's copy runs psql and its fixed script in a move's two computes (the exec guard bounds it); an exec
+    // over a WebSocket is a GET, so it needs get as well as create
+    ...role(r, n.computeNamespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['pods/exec'], ['create', 'get']), rule([''], ['secrets'], CRUD), rule(['apps'], ['deployments'], CRUD), rule(['cert-manager.io'], ['certificates'], CRUD)]),
     ...role(r, n.dbNamespace, [rule([''], ['services'], ['get', 'list', 'create', 'update', 'delete'])]),
     ...role(r, n.gatewayNamespace, [rule([''], ['pods'], ['get', 'list', 'delete'])]),
     { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: meta(r, `${CONTROL_ACCOUNT}-nodes`), rules: [rule([''], ['nodes'], ['get', 'list', 'patch'])] },
@@ -420,6 +423,7 @@ export function controlPolicies(r: Resolved): Manifest[] {
   const inPeat = (app: string) => piece(ns, app)
   const computes = piece(n.computeNamespace, 'peat-compute')
   const gateways = piece(n.gatewayNamespace, 'peat-gateway')
+  const moveTarget = { ...inNamespace(n.computeNamespace), podSelector: { matchLabels: { app: 'peat-compute', [MOVE_TARGET_LABEL]: 'target' } } }
   return [
     policy(r, ns, 'peat-control', [{ from: [inPeat('storage-controller'), inPeat('safekeeper'), gateways, computes, OPERATOR_PODS, SCRAPER], ports: tcp(PORTS.control) }], [
       DNS, API_SERVER,
@@ -431,8 +435,12 @@ export function controlPolicies(r: Resolved): Manifest[] {
       { to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(10250) },
       STORE(r),
     ]),
-    policy(r, n.computeNamespace, 'peat-compute', [{ from: [gateways], ports: tcp(5432) }, { from: [inPeat('peat-control')], ports: tcp(3080, 5432) }],
+    policy(r, n.computeNamespace, 'peat-compute', [{ from: [gateways], ports: tcp(5432) }, { from: [inPeat('peat-control')], ports: tcp(3080, 5432) }, { from: [moveTarget], ports: tcp(5432) }],
       [DNS, { to: [inPeat('pageserver')], ports: tcp(PORTS.pageserverPg) }, { to: [inPeat('safekeeper')], ports: tcp(PORTS.safekeeperPg) }, { to: [inPeat('peat-control')], ports: tcp(PORTS.control) }]),
+    // a move's target compute (its own label, set by its own template) reads its source on 5432; no other compute reaches another
+    { apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy', metadata: meta(r, 'peat-move-target', n.computeNamespace), spec: { podSelector: { matchLabels: { [MOVE_TARGET_LABEL]: 'target' } }, policyTypes: ['Egress'], egress: [{ to: [computes], ports: tcp(5432) }] } },
+    // the move's script, which only a move's target compute mounts: the control layer's account cannot write a ConfigMap here
+    { apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(r, MOVE_SCRIPT_CONFIG_MAP, n.computeNamespace), data: { 'copy.sh': MOVE_SCRIPT } },
   ]
 }
 
@@ -505,13 +513,18 @@ export function keeperPrep(r: Resolved, image = r.images.storage): Manifest[] {
  *     the one before while an upgrade is under way), no host namespaces, nothing privileged or with added capabilities, no host port, only
  *     the default account, no unconfined seccomp profile, and a hostPath only on the safekeepers' volume: the safekeeper's shape.
  *   - Services: ClusterIP or ExternalName only, no external IPs, and an ExternalName only in the database namespace and only to the front door.
+ *   - Deployments: only in the compute namespace, of the compute images (`computeImages`), with no host namespace, nothing privileged, no
+ *     host port or volume and no account token. A change that keeps every image of a compute is not judged on its images: a compute made
+ *     on the release before an upgrade keeps that image until its next start, and is stopped on it.
  */
 export const NODE_POLICY = 'peat-control-keeps-to-peat-nodes'
 export const STATEFULSET_POLICY = 'peat-control-statefulsets-keep-to-the-safekeeper'
 export const SERVICE_POLICY = 'peat-control-services-stay-inside'
+export const COMPUTE_POLICY = 'peat-control-computes-of-the-compute-images'
+export const EXEC_POLICY = 'peat-control-exec-only-for-a-move'
 export const NODE_SPEC_FIELDS = ['configSource', 'externalID', 'podCIDR', 'podCIDRs', 'providerID', 'unschedulable'] as const
 
-export function guards(r: Resolved, storageImages: string[] = [r.images.storage]): Manifest[] {
+export function guards(r: Resolved, storageImages: string[] = [r.images.storage], computeImages: string[] = [r.images.compute[18], r.images.compute[19]]): Manifest[] {
   const n = r.names
   const user = controlUser(n)
   const byControl = [{ name: 'by-the-control-layer', expression: `request.userInfo.username == '${user}'` }]
@@ -524,6 +537,7 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
   const pod = 'object.spec.template.spec'
   const all = (list: string, e: string) => `(!has(${pod}.${list}) || ${pod}.${list}.all(c, ${e}))`
   const containers = (e: string) => `${all('containers', e)} && ${all('initContainers', e)}`
+  const imagesOf = (o: 'object' | 'oldObject', list: string) => `(has(${o}.spec.template.spec.${list}) ? dyn(${o}.spec.template.spec.${list}.map(c, c.image)) : dyn([]))`
   const falseOrUnset = (path: string) => `(!has(${path}) || ${path} == false)`
   const skVolume = r.spec.safekeepers.storage.hostPath!.path
   const skVolumeTypes = r.spec.safekeepers.storage.hostPath!.create ? `['Directory', 'DirectoryOrCreate']` : `['Directory']`
@@ -595,6 +609,46 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
       },
     },
     binding(SERVICE_POLICY),
+    {
+      apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', metadata: meta(r, COMPUTE_POLICY),
+      spec: {
+        failurePolicy: 'Fail',
+        matchConstraints: { resourceRules: [{ apiGroups: ['apps'], apiVersions: ['v1'], operations: ['CREATE', 'UPDATE'], resources: ['deployments'] }] },
+        matchConditions: byControl,
+        // a compute made on the release before keeps its image until its next start, so a change that keeps every image (a stop) is let through: only a new image is judged
+        variables: [{ name: 'keepsImages', expression: `request.operation == 'UPDATE' && ${['containers', 'initContainers'].map((list) => `${imagesOf('object', list)} == ${imagesOf('oldObject', list)}`).join(' && ')}` }],
+        validations: [
+          { expression: `object.metadata.namespace == '${n.computeNamespace}'`, message: `the control layer's account may make a Deployment only in ${n.computeNamespace} (a database's compute)` },
+          { expression: `variables.keepsImages || (${containers(`c.image in [${[...new Set(computeImages)].map((i) => `'${i}'`).join(', ')}]`)})`, message: "the control layer's account may make a Deployment only of the platform's compute images (a change that keeps a compute's images is not judged on them)" },
+          { expression: `${falseOrUnset(`${pod}.hostNetwork`)} && ${falseOrUnset(`${pod}.hostPID`)} && ${falseOrUnset(`${pod}.hostIPC`)}`, message: "the control layer's account may not make a compute that uses the host's network, PID or IPC namespace" },
+          { expression: containers(`(!has(c.securityContext) || ${falseOrUnset('c.securityContext.privileged')})`), message: "the control layer's account may not make a compute with a privileged container" },
+          { expression: `(!has(${pod}.volumes) || ${pod}.volumes.all(v, has(v.secret) || has(v.emptyDir) || has(v.configMap)))`, message: "a compute mounts secrets, configMaps and emptyDirs only (no host path, no network volume)" },
+          { expression: `(!has(${pod}.serviceAccountName) || ${pod}.serviceAccountName == 'default') && has(${pod}.automountServiceAccountToken) && ${pod}.automountServiceAccountToken == false`, message: "a compute runs as the default account, with no service account token" },
+          { expression: containers('(!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))'), message: "a compute opens no host port" },
+        ],
+      },
+    },
+    binding(COMPUTE_POLICY),
+    {
+      // an exec is a CONNECT: the policy sees its options (the container and the command) and the pod's name, not the pod; the pods a move
+      // may exec into are listed, for the move's length, by the control layer in the ConfigMap peat-move-execs (the parameter: none, and
+      // every exec is refused). What it does not bound: psql's arguments are free, so within a listed pod the account may run any SQL as the
+      // pod's local superuser while the move lasts.
+      apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', metadata: meta(r, EXEC_POLICY),
+      spec: {
+        failurePolicy: 'Fail',
+        paramKind: { apiVersion: 'v1', kind: 'ConfigMap' },
+        matchConstraints: { resourceRules: [{ apiGroups: [''], apiVersions: ['v1'], operations: ['CONNECT'], resources: ['pods/exec', 'pods/attach'] }] },
+        matchConditions: byControl,
+        validations: [
+          { expression: `request.namespace == '${n.computeNamespace}' && request.resource.resource == 'pods' && request.subResource == 'exec'`, message: `the control layer's account may exec only into a compute, in ${n.computeNamespace} (never attach)` },
+          { expression: "has(params.data) && params.data.exists(m, request.name in params.data[m].split(' '))", messageExpression: "'the control layer may exec only into a pod a move under way lists: ' + request.name + ' is not one'" },
+          { expression: "object.container == 'compute'", message: "the control layer's account may exec only into a compute's container" },
+          { expression: `size(object.command) > 0 && (object.command[0] == 'psql' || (size(object.command) > 1 && object.command[0] == 'bash' && object.command[1] == '${MOVE_SCRIPT_PATH}'))`, messageExpression: `'the control layer may run psql or bash ${MOVE_SCRIPT_PATH} only, not ' + (size(object.command) > 0 ? object.command[0] : 'nothing')` },
+        ],
+      },
+    },
+    { apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicyBinding', metadata: meta(r, EXEC_POLICY), spec: { policyName: EXEC_POLICY, validationActions: ['Deny'], paramRef: { name: MOVE_EXECS_CONFIG_MAP, namespace: n.namespace, parameterNotFoundAction: 'Deny' } } },
   ]
 }
 
@@ -607,7 +661,7 @@ const stamped = (ms: Manifest[], release: (m: Manifest) => string): Manifest[] =
 
 /** Every object of the platform, in the order it is applied: the base first, the guards before the account they hold. */
 export function render(r: Resolved, kept: Record<string, string>, at: ImagesAt = () => r.images, storageImages: string[] = [r.images.storage]): Manifest[] {
-  return stamped([...base(r), ...keySecrets(r, kept), ...guards(r, [...new Set(storageImages)]), ...storage(r, at), ...keeperPrep(r, at('control').storage), ...control(r, at('control')), ...gateways(r, at('gateways'))], (m) => at(pieceOf(m)).release)
+  return stamped([...base(r), ...keySecrets(r, kept), ...guards(r, [...new Set(storageImages)], [...new Set([r.images.compute[18], r.images.compute[19], at('control').compute[18], at('control').compute[19]])]), ...storage(r, at), ...keeperPrep(r, at('control').storage), ...control(r, at('control')), ...gateways(r, at('gateways'))], (m) => at(pieceOf(m)).release)
 }
 
 export { SAFEKEEPER_RESOURCES }

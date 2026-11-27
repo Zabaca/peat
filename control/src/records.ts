@@ -64,7 +64,7 @@ async function apply(d: Deps, collection: string, name: string, obj: any): Promi
 export function fromStatus(o: any): Db | null {
   const s = o?.status, r = s?.record
   if (!s?.tenant || !r) return null
-  return { name: o.metadata.name, namespace: o.metadata.namespace, tenant: s.tenant, timeline: s.timeline, parent: r.parent ?? '', from: r.from ?? '', root: r.root === true, mode: r.mode === 'replica' ? 'replica' : 'primary', port: Number(r.port ?? 0), created: s.createdAt ?? '', pg: pgVersionOf(s.pgVersion === undefined ? undefined : String(s.pgVersion)), closed: s.phase === 'Closed' }
+  return { name: o.metadata.name, namespace: o.metadata.namespace, tenant: s.tenant, timeline: s.timeline, parent: r.parent ?? '', from: r.from ?? '', root: r.root === true, mode: r.mode === 'replica' ? 'replica' : 'primary', port: Number(r.port ?? 0), created: s.createdAt ?? '', pg: pgVersionOf(s.pgVersion === undefined ? undefined : String(s.pgVersion)), closed: s.phase === 'Closed' || s.phase === 'Moving' }
 }
 /** The record in its ConfigMap. A record from before Database objects has no namespace (its object goes in the database namespace) and no `from`. */
 export function fromConfigMap(cm: any, dbNs: string): Db {

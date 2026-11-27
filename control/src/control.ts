@@ -22,6 +22,10 @@ import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
 import { DB_API, HELD_SELECTOR, beginMaking, knownDb, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 import { parseWindows, windowAt } from './quiet-hours'
+import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_EXECS_CONFIG_MAP, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, compareSides, endOutsideSessionsSql, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
+import { exec, type ExecDeps } from './exec'
+import { durationMs } from './api/schema'
+import { PG_VERSIONS } from './storage-spec'
 
 const NAMES = fromEnv()
 const NS = NAMES.namespace // the control layer, the storage, the records, the leases
@@ -336,8 +340,9 @@ async function refreshSpec(d: Db): Promise<void> {
   await kube('PATCH', `/api/v1/namespaces/${CNS}/secrets/compute-${d.name}`, { stringData: { 'config.json': JSON.stringify(cfg) } }, 'application/merge-patch+json')
 }
 
-const computePodTemplate = (d: Db) => {
-  const labels = { app: 'peat-compute', compute: d.name, tenant: d.tenant }
+/** A compute's pod. A move's target (`moveTarget`) carries the label its network rule selects and mounts the move's script at /move. */
+const computePodTemplate = (d: Db, moveTarget = false) => {
+  const labels = { app: 'peat-compute', compute: d.name, tenant: d.tenant, ...(moveTarget ? { [MOVE_TARGET_LABEL]: 'target' } : {}) }
   return {
     metadata: { labels },
     spec: {
@@ -367,13 +372,14 @@ const computePodTemplate = (d: Db) => {
         // Ready means the login works: compute_ctl starts Postgres first and creates the spec's role and database a little later (longer under load), and a pod that is only listening answers a client with
         // "password authentication failed" (found 2026-11-17, making databases in batches of ten); so the probe asks Postgres whether the role and database exist (an exec probe judges only the exit code, so the answer is piped to grep: the first version of it passed on an empty answer). A tcp probe on 5432 was the first version.
         readinessProbe: { exec: { command: ['sh', '-c', `psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc "select 1 from pg_roles r, pg_database d where r.rolname = 'app' and r.rolpassword is not null and d.datname = 'app'" | grep -q 1`] }, periodSeconds: 1, timeoutSeconds: 3 },
-        volumeMounts: [{ name: 'config', mountPath: '/config' }, { name: 'pgdata', mountPath: '/var/db/postgres' }, { name: 'tls', mountPath: '/tls', readOnly: true }, { name: 'hba', mountPath: '/hba', readOnly: true }],
+        volumeMounts: [{ name: 'config', mountPath: '/config' }, { name: 'pgdata', mountPath: '/var/db/postgres' }, { name: 'tls', mountPath: '/tls', readOnly: true }, { name: 'hba', mountPath: '/hba', readOnly: true }, ...(moveTarget ? [{ name: 'move', mountPath: '/move', readOnly: true }] : [])],
       }],
       volumes: [
         { name: 'config', secret: { secretName: `compute-${d.name}` } },
         { name: 'pgdata', emptyDir: { sizeLimit: PGDATA_LIMIT } }, // a tenant's temporary files must not fill the machine's 30 GiB system disk (the pod is evicted at the limit)
         { name: 'tls', secret: { secretName: tlsSecret(d.name), defaultMode: 0o440 } },
         { name: 'hba', configMap: { name: 'peat-pg-hba' } },
+        ...(moveTarget ? [{ name: 'move', configMap: { name: MOVE_SCRIPT_CONFIG_MAP } }] : []),
       ],
     },
   }
@@ -437,7 +443,7 @@ class ClosedDb extends Error {}
  * Returns the pod's name when a pod already exists, else the Deployment's. A closed database is refused, except for the platform's own
  * one-off start (`evenClosed`: a safekeeper replacement's first start of a timeline never written, which no client reaches).
  */
-async function startCompute(d: Db, opts: { evenClosed?: boolean } = {}): Promise<string> {
+async function startCompute(d: Db, opts: { evenClosed?: boolean; moveTarget?: boolean } = {}): Promise<string> {
   const existing = await livePod(d.name)
   const dep = await kube('GET', depPath(d.name))
   if (existing && dep.status === 200 && dep.json.spec.replicas === 1) return existing.metadata.name
@@ -456,7 +462,7 @@ async function startCompute(d: Db, opts: { evenClosed?: boolean } = {}): Promise
       apiVersion: 'apps/v1', kind: 'Deployment',
       // `peat-pg` is the database's Postgres version: a move of every Deployment to a new compute image selects by it (`-l peat-compute-deploy,peat-pg!=19`), so that one version's image is never set on the other's databases
       metadata: { name: `compute-${d.name}`, namespace: CNS, labels: { 'peat-compute-deploy': 'true', 'peat-pg': String(d.pg), compute: d.name } },
-      spec: { replicas: 1, revisionHistoryLimit: 0, selector: { matchLabels: { app: 'peat-compute', compute: d.name } }, strategy: { type: 'RollingUpdate', rollingUpdate: { maxSurge: 1, maxUnavailable: 1 } }, template: computePodTemplate(d) },
+      spec: { replicas: 1, revisionHistoryLimit: 0, selector: { matchLabels: { app: 'peat-compute', compute: d.name } }, strategy: { type: 'RollingUpdate', rollingUpdate: { maxSurge: 1, maxUnavailable: 1 } }, template: computePodTemplate(d, opts.moveTarget) },
     }), `create deployment compute-${d.name}`)
   }
   markAwake(d, true)
@@ -610,12 +616,14 @@ async function reconcileComputes() {
   // the Database objects, leaves the record, and a serving compute is not killed for that
   const dbs = new Map((await listDbs()).map((d) => [d.name, d]))
   const recs = await readRecords(RECORDS)
+  // and a move's own compute, by the move under way that made it
+  const targets = moveTargets(await dbObjects())
   const live = new Set<string>()
   await Promise.all(pods.map(async (p) => {
     if (p.metadata.deletionTimestamp && !(p.spec?.nodeName && nodeStates.get(p.spec.nodeName)?.dead)) return
     live.add(p.metadata.uid)
     const name = p.metadata.labels?.compute as string
-    const d = knownDb(name, dbs, recs)
+    const d = knownDb(name, dbs, recs) ?? targets.get(name) ?? null
     const age = (Date.now() - Date.parse(p.metadata.creationTimestamp)) / 1000
     try {
       if (!d) return await replaceCompute(p, null, 'unknown: no database record')
@@ -1435,12 +1443,285 @@ async function restartStaleComputes() {
   }
 }
 
+// ---- the move to a newer Postgres version under the database's own name (move.ts says what and why)
+// One procedure per database, run in the background of the acting layer and checkpointed in status.move, so a long copy blocks nothing
+// and a layer that restarts goes on: a move found under way starts its copy again from a fresh timeline (or, past the switch, finishes
+// it). Every exit takes back what it made for the copy: the temporary role, the target compute, the target timeline when it was not
+// switched to, the pods listed for exec.
+const MOVE_STATES_DONE = ['done', 'failed', 'back', 'refused']
+const movesRunning = new Map<string, Promise<void>>()
+const execDeps = (): ExecDeps => ({ server: API, token: () => readFileSync(`${SA}/token`, 'utf8').trim(), ca: readFileSync(`${SA}/ca.crt`, 'utf8') })
+const lines = (s: string) => s.split('\n').map((l) => l.trim()).filter(Boolean)
+/** An exec in a move's compute; a failure is said with its stderr (the move never passes a secret in a command or prints its stdin). */
+async function inCompute(pod: string, command: string[], stdin: string, what: string, timeoutMs = 3_600_000): Promise<string> {
+  // an exec refused before it starts (the guard's list read a moment before it was written) answers with no status: asked again, a few times
+  let r = await exec(execDeps(), CNS, pod, 'compute', command, stdin, timeoutMs)
+  for (let i = 0; i < 5 && r.code === -1 && !r.status; i++) { await new Promise((res) => setTimeout(res, 1000)); r = await exec(execDeps(), CNS, pod, 'compute', command, stdin, timeoutMs) }
+  if (r.code !== 0) throw new Error(`${what}: ${(r.stderr || r.stdout).trim().slice(-400)}`)
+  return r.stdout
+}
+const localPsql = (pod: string, db: string, sql: string, what: string) => inCompute(pod, ['psql', '-h', '127.0.0.1', '-U', 'cloud_admin', '-d', db, '-X', '-At', '-v', 'ON_ERROR_STOP=1', '-f', '-'], sql, what)
+/** The pods a move may exec into, listed under its database for the exec guard (none: its entry removed). */
+async function listExecs(key: string, pods: string[] | null): Promise<void> {
+  const path = `/api/v1/namespaces/${NS}/configmaps/${MOVE_EXECS_CONFIG_MAP}`
+  const r = await kube('PATCH', path, { data: { [key]: pods ? pods.join(' ') : null } }, 'application/merge-patch+json')
+  if (r.status === 404 && pods) ok(await kube('POST', `/api/v1/namespaces/${NS}/configmaps`, { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: MOVE_EXECS_CONFIG_MAP, namespace: NS }, data: { [key]: pods.join(' ') } }), 'list the move\'s pods', [409])
+  else ok(r, 'list the move\'s pods', [404])
+}
+/** The ready compute pod of a database, waited for (a start may pull the image first). */
+async function readyPod(name: string, waitS = 300): Promise<any> {
+  for (let i = 0; i < waitS; i += 2) {
+    const p = await livePod(name)
+    if (p && podReady(p) && p.status?.podIP) return p
+    await new Promise((res) => setTimeout(res, 2000))
+  }
+  throw new Error(`the compute of ${name} was not ready in ${waitS} s`)
+}
+/** A move's own compute, as a record: on its new timeline in the database's tenant, with the database's login. */
+const targetOf = (d: Db, mv: MoveStatus): Db => ({ name: mv.target!, namespace: d.namespace, tenant: d.tenant, timeline: mv.toTimeline!, parent: d.root ? d.name : d.parent, from: d.name, root: false, mode: 'primary', port: 0, created: new Date().toISOString(), pg: mv.to!, closed: false })
+/** Every move under way's own compute, by name: the compute reconciler knows them as it knows a database. */
+const moveTargets = (objects: any[]): Map<string, Db> => new Map(objects.flatMap((o) => {
+  const mv: MoveStatus | undefined = o.status?.move, d = recordOf(o)
+  return d && mv?.target && mv.toTimeline && mv.state && !MOVE_STATES_DONE.includes(mv.state) ? [[mv.target, targetOf(d, mv)] as [string, Db]] : []
+}))
+/** Drops every move role left on a compute (an attempt that ended without its own cleanup); the pod must be listed for exec. */
+async function dropMoveRoles(pod: string): Promise<void> {
+  const roles = lines(await localPsql(pod, 'postgres', MOVE_ROLES_SQL, 'list the move roles'))
+  if (roles.length) await localPsql(pod, 'postgres', dropRolesSql(roles), 'drop the move roles')
+}
+/** What a move made for its copy taken back: the target compute and its objects, its timeline unless the database runs on it now, the roles. */
+async function cleanupMove(ns: string, name: string, mv: MoveStatus, key: string): Promise<void> {
+  if (mv.target) {
+    await stopCompute(mv.target, true).catch(() => {})
+    for (const path of [depPath(mv.target), `/api/v1/namespaces/${CNS}/secrets/compute-${mv.target}`, `/api/v1/namespaces/${CNS}/secrets/${tlsSecret(mv.target)}`, `/apis/cert-manager.io/v1/namespaces/${CNS}/certificates/${tlsSecret(mv.target)}`]) await del(path)
+  }
+  const d = recordOf(ok(await kube('GET', dbObjectPath(ns, name)), `read ${name}`, [404]).json)
+  if (d && mv.toTimeline && d.timeline !== mv.toTimeline) ok(await storcon('DELETE', `/v1/tenant/${d.tenant}/timeline/${mv.toTimeline}`), 'remove the copy\'s timeline', [404])
+  // a role left on the source (an attempt the layer's restart cut short) is dropped there: it is a superuser login
+  const src = await livePod(name)
+  if (src && podReady(src)) { await listExecs(key, [src.metadata.name]); await dropMoveRoles(src.metadata.name).catch((e) => console.log(`move ${ns}/${name}: drop the move roles: ${e}`)) }
+  await listExecs(key, null)
+}
+
+/** Runs (or goes on with) the move of one database. */
+async function runMove(ns: string, name: string): Promise<void> {
+  const key = `${ns}.${name}`
+  const read = async () => ok(await kube('GET', dbObjectPath(ns, name)), `read ${name}`).json
+  let o = await read()
+  let mv: MoveStatus = o.status?.move ?? {}
+  const write = async (m: Partial<MoveStatus>, more: Record<string, unknown> = {}) => {
+    mv = { ...mv, ...m }
+    await patchDbStatus(ns, name, { move: mv, ...more })
+  }
+  const doorBack = () => (o.spec?.closed ? { phase: 'Closed', message: 'closed: every connection is refused until it is opened' } : { phase: 'Ready', message: 'ready: it sleeps until a client connects' })
+  if (!mv.state || MOVE_STATES_DONE.includes(mv.state)) {
+    const a = moveAction(o, PG_VERSIONS)
+    if (a.do !== 'start') return
+    const d = recordOf(o)!
+    const answered = { ...(o.status?.answered ?? {}), ...(a.rehearsal ? { rehearseMove: a.request } : {}), ...(o.spec?.requests?.retryMove ? { retryMove: o.spec.requests.retryMove } : {}) }
+    const fresh: MoveStatus = { from: d.pg, to: a.to, rehearsal: a.rehearsal, request: a.request, state: 'preparing', startedAt: new Date().toISOString(), message: `${a.rehearsal ? 'rehearsing the move' : 'moving'} to Postgres ${a.to}` }
+    try { computeImageFor(a.to, COMPUTE_IMAGES) } catch (e) { return void (await write({ ...fresh, state: 'refused', message: String(e) }, { answered })) }
+    const old = oldNameOf(name, d.pg)
+    if (!a.rehearsal && ((await getDb(old)) || (await readRecords(RECORDS)).has(old))) return void (await write({ ...fresh, state: 'refused', message: `the old copy's name ${old} is taken: delete that database, then ask again (requests.retryMove)` }, { answered }))
+    let target = targetNameOf(hex32())
+    while ((await getDb(target)) || (await readRecords(RECORDS)).has(target)) target = targetNameOf(hex32())
+    // a fresh status.move: what an earlier one said is cleared, not merged with it
+    mv = {}
+    await write({ from: null, to: null, rehearsal: null, request: null, state: null, target: null, toTimeline: null, oldDatabase: null, startedAt: null, switchedAt: null, deleteOldAfter: null, seconds: null, equal: null, message: null } as any)
+    await write({ ...fresh, target, ...(a.rehearsal ? {} : { oldDatabase: old }) }, { answered })
+  }
+  if (mv.state === 'switching') return finishSwitch(ns, name)
+  // the copy, from the start (again, after a restart): a fresh timeline for it, so nothing on the target is ever cleared
+  await cleanupMove(ns, name, mv, key)
+  await write({ state: 'preparing', toTimeline: hex32() })
+  o = await read()
+  const d = recordOf(o)!
+  let role = '', srcPod = ''
+  try {
+    if (!mv.rehearsal) {
+      // the door: new connections refused (the routes and the starts read Moving as closed), open sessions ended by the stop
+      await patchDbStatus(ns, name, { phase: 'Moving', message: `moving to Postgres ${mv.to}: every connection is refused until the copy is compared and switched` })
+      await new Promise((res) => setTimeout(res, MOVE_SETTLE_MS))
+      await stopCompute(name, true)
+    }
+    await startCompute(d, { evenClosed: true })
+    srcPod = (await readyPod(name)).metadata.name
+    const src = await livePod(name)
+    // the new version's root timeline, in the same tenant: a branch cannot change version
+    ok(await storcon('POST', `/v1/tenant/${d.tenant}/timeline`, { new_timeline_id: mv.toTimeline, pg_version: mv.to }), `make a Postgres ${mv.to} timeline`, [409])
+    const t = targetOf(d, mv)
+    await startCompute(t, { evenClosed: true, moveTarget: true })
+    const tgtPod = (await readyPod(t.name)).metadata.name
+    await listExecs(key, [srcPod, tgtPod])
+    // the temporary role on the source: a superuser login of four connections, valid for minutes and renewed
+    role = `${MOVE_ROLE_PREFIX}${randomBytes(6).toString('hex')}`
+    const password = randomBytes(32).toString('hex')
+    const leftovers = lines(await localPsql(srcPod, 'postgres', MOVE_ROLES_SQL, 'list the move roles'))
+    await localPsql(srcPod, 'postgres', makeRoleSql(role, password, 10, leftovers), 'make the move role')
+    const renew = setInterval(() => { void localPsql(srcPod, 'postgres', renewRoleSql(role, 10), 'renew the move role').catch(() => {}) }, 180_000)
+    const script = (mode: string, args: string[], more = '') => inCompute(tgtPod, ['bash', MOVE_SCRIPT_PATH, mode, String(src.status.podIP), role, ...args], `${password}\n${more}`, `${mode}${args.length ? ` ${args[0]}` : ''}`)
+    let seconds = 0
+    try {
+      await write({ state: 'copying' })
+      const t0 = Date.now()
+      // the roles (their verifiers, attributes, memberships), then every database: those the compute makes are loaded into, the rest made first
+      const globals = filterGlobals(await script('globals', []))
+      await localPsql(tgtPod, 'postgres', globals.sql, 'make the roles on the new version')
+      const dbs = lines(await localPsql(srcPod, 'postgres', DATABASES_SQL, 'list the databases'))
+      for (const db of dbs) {
+        if (!(COMPUTE_DATABASES as readonly string[]).includes(db)) await script('shell', [db])
+        await script('load', [db])
+      }
+      // the settings the dumps leave out (the compute's own databases', and the platform login's), made on the new version as the source holds them
+      const settings = await localPsql(srcPod, 'postgres', SETTINGS_COPY_SQL, 'read the settings')
+      if (settings.trim()) await localPsql(tgtPod, 'postgres', settings, 'make the settings on the new version')
+      seconds = Math.round((Date.now() - t0) / 1000)
+      await write({ state: 'comparing', seconds })
+      // A session that got in after the door shut (a gateway whose read of the routes failed keeps the old route; a pooled client
+      // reconnects once the source is started for the copy) is ended before the comparison, so what it wrote is compared; one there again
+      // before the switch fails the move (below). Its writes are then on the old side, never lost under an "equal".
+      if (!mv.rehearsal) {
+        const ended = Number(lines(await localPsql(srcPod, 'postgres', endOutsideSessionsSql(role), 'end the sessions that got in after the door shut'))[0] ?? 0)
+        if (ended) console.log(`move ${ns}/${name}: ${ended} session(s) that got in after the door shut ended before the comparison`)
+      }
+      // each side read on its own compute, by its own superuser: what the copy made against what it was made from
+      const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(srcPod, db, sql, `read ${db} on the old version`), await localPsql(tgtPod, db, sql, `read ${db} on the new version`)]
+      const sides: Sides = { databases: await both('postgres', DATABASES_SQL), roles: await both('postgres', ROLES_SQL), fingerprints: {} }
+      for (const db of dbs) sides.fingerprints[db] = await both(db, fingerprintSql(db))
+      const c = compareSides(sides)
+      if (!c.same) throw new Error(`the copy is not the same: ${c.why}`)
+      await write({ equal: true, message: `copied in ${seconds} s and compared equal: ${c.databases} databases, ${c.roles} roles, ${c.tables} tables, ${c.rows} rows` })
+    } finally {
+      clearInterval(renew)
+      await localPsql(srcPod, 'postgres', dropRolesSql([role]), 'drop the move role').catch((e) => console.log(`move ${ns}/${name}: drop ${role}: ${e}`))
+    }
+    if (!mv.rehearsal) {
+      const again = lines(await localPsql(srcPod, 'postgres', outsideSessionsSql(role), 'look for sessions on the old version'))
+      if (again.length) throw new Error(`a session got in after the door shut (${again.slice(0, 3).join(', ')}): what it wrote may not be in the copy`)
+    }
+    if (mv.rehearsal) {
+      await cleanupMove(ns, name, mv, key)
+      await write({ state: 'done', message: `rehearsed: ${mv.message}; nothing was switched` })
+      return
+    }
+    await write({ state: 'switching' })
+    await finishSwitch(ns, name)
+  } catch (e) {
+    console.log(`move ${ns}/${name}: ${e}`)
+    await cleanupMove(ns, name, mv, key).catch((e2) => console.log(`move ${ns}/${name}: clean up: ${e2}`))
+    await write({ state: 'failed', message: `${String(e).slice(0, 400)}; nothing was switched (requests.retryMove asks again)` }, mv.rehearsal ? {} : doorBack())
+  }
+}
+
+/** The switch: the database's record to the new timeline and version (its ConfigMap first), its old timeline kept as a stopped database. */
+async function finishSwitch(ns: string, name: string): Promise<void> {
+  const key = `${ns}.${name}`
+  const o = ok(await kube('GET', dbObjectPath(ns, name)), `read ${name}`).json
+  const mv: MoveStatus = o.status.move
+  const d = recordOf(o)!
+  if (d.timeline !== mv.toTimeline) {
+    // the source first: nothing it takes after the comparison is on the copy
+    await stopCompute(name, true)
+    await stopCompute(mv.target!, true)
+    const old = mv.oldDatabase!
+    const oldRec: Db = { name: old, namespace: ns, tenant: d.tenant, timeline: d.timeline, parent: d.root ? d.name : d.parent, from: name, root: false, mode: 'primary', port: await claimPort(RECORDS, old, d.timeline, PORT_BASE, await usedPorts()), created: d.created, pg: d.pg, closed: false }
+    // the old copy's object first, marked as being copied so the loop leaves it alone until its record is written
+    ok(await kube('POST', `${DB_API}/namespaces/${ns}/databases`, { apiVersion: `${GROUP}/v1alpha1`, kind: 'Database', metadata: { name: old, namespace: ns, finalizers: [FINALIZER], annotations: { [COPYING]: 'true' } }, spec: { pgVersion: d.pg, parent: name } }), `keep ${old}`, [409])
+    await saveDb(oldRec, { phase: 'Ready', message: `the copy of ${name} on Postgres ${d.pg} its move left, asleep: deleted after keepOldFor` })
+    ok(await kube('PATCH', dbObjectPath(ns, old), { metadata: { annotations: { [COPYING]: null } } }, 'application/merge-patch+json'), `release ${old}`)
+    await apply(`/api/v1/namespaces/${DB_NS}/services`, old, nameService(old))
+    await saveDb({ ...d, timeline: mv.toTimeline!, pg: mv.to! })
+    // the next start makes the compute again on the new version's image, its spec written afresh
+    await del(depPath(name))
+  }
+  await cleanupMove(ns, name, { ...mv, toTimeline: undefined }, key)
+  const keep = durationMs(String(o.spec?.keepOldFor ?? '30d'))
+  const at = new Date()
+  await patchDbStatus(ns, name, { move: { ...mv, state: 'done', switchedAt: at.toISOString(), deleteOldAfter: new Date(at.getTime() + keep).toISOString(), message: `moved to Postgres ${mv.to} under its own name: ${mv.message ?? ''}; the old copy is ${mv.oldDatabase}` }, ...(o.spec?.closed ? { phase: 'Closed', message: 'closed: every connection is refused until it is opened' } : { phase: 'Ready', message: `ready on Postgres ${mv.to}: it sleeps until a client connects` }) })
+  console.log(`move ${ns}/${name}: on Postgres ${mv.to}; the old copy is ${mv.oldDatabase}`)
+}
+
+/**
+ * The way back from the last move, while its old copy is kept: the door shut, the database compared with its old copy, and only if they
+ * are the same (nothing written since the move) the record pointed back at the old timeline and version, the old copy's object taken away
+ * without its data, and the new timeline held as a deleted database's is. A database written since is refused: copying it down to the older
+ * version is not done here (a newer dump need not load on an older server); the message says what to do by hand.
+ */
+async function runMoveBack(ns: string, name: string, request: string): Promise<void> {
+  const key = `${ns}.${name}`
+  const o = ok(await kube('GET', dbObjectPath(ns, name)), `read ${name}`).json
+  const mv: MoveStatus = o.status?.move ?? {}
+  const answered = { ...(o.status?.answered ?? {}), moveBack: request }
+  const refuse = (why: string) => patchDbStatus(ns, name, { answered, message: `the way back was refused: ${why}` })
+  if (mv.state !== 'done' || mv.rehearsal || !mv.oldDatabase) return refuse('there is no move to go back from')
+  const oldDb = (await dbObjects()).find((x) => x.metadata.name === mv.oldDatabase && x.metadata.namespace === ns)
+  const oldRec = oldDb ? recordOf(oldDb) : null
+  if (!oldRec) return refuse(`its old copy ${mv.oldDatabase} is gone`)
+  const d = recordOf(o)!
+  const doorBack = o.spec?.closed ? { phase: 'Closed' } : { phase: 'Ready' }
+  try {
+    await patchDbStatus(ns, name, { answered, phase: 'Moving', message: `going back to Postgres ${mv.from}: every connection is refused until it is compared` })
+    await new Promise((res) => setTimeout(res, MOVE_SETTLE_MS))
+    await stopCompute(name, true)
+    await startCompute(d, { evenClosed: true })
+    await startCompute(oldRec, { evenClosed: true })
+    const cur = (await readyPod(name)).metadata.name, old = (await readyPod(oldRec.name)).metadata.name
+    await listExecs(key, [cur, old])
+    // as for the move: a session on the database that got in after the door shut is ended before the comparison, and one there again
+    // before the switch back fails it (what it wrote would be on the timeline that is given up)
+    const ended = Number(lines(await localPsql(cur, 'postgres', endOutsideSessionsSql(''), 'end the sessions that got in after the door shut'))[0] ?? 0)
+    if (ended) console.log(`move back ${ns}/${name}: ${ended} session(s) that got in after the door shut ended before the comparison`)
+    const both = async (db: string, sql: string): Promise<[string, string]> => [await localPsql(old, db, sql, `read ${db} on the old copy`), await localPsql(cur, db, sql, `read ${db}`)]
+    const sides: Sides = { databases: await both('postgres', DATABASES_SQL), roles: await both('postgres', ROLES_SQL), fingerprints: {} }
+    for (const db of lines(sides.databases[1])) sides.fingerprints[db] = await both(db, fingerprintSql(db))
+    const c = compareSides(sides)
+    if (c.same) {
+      const again = lines(await localPsql(cur, 'postgres', outsideSessionsSql(''), 'look for sessions'))
+      if (again.length) throw new Error(`a session got in after the door shut (${again.slice(0, 3).join(', ')}): what it wrote would not go back`)
+    }
+    await listExecs(key, null)
+    await stopCompute(name, true)
+    await stopCompute(oldRec.name, true)
+    if (!c.same) {
+      await patchDbStatus(ns, name, { ...doorBack, message: `the way back was refused: the database was written since the move (${c.why}). To go back by hand: copy it into ${mv.oldDatabase} with pg_dump, then ask again` })
+      return
+    }
+    // the switch back: the old timeline is the database's again, and its old copy's object goes without its data
+    await saveDb({ ...d, timeline: oldRec.timeline, pg: oldRec.pg })
+    await kube('DELETE', `/api/v1/namespaces/${NS}/configmaps/db-${oldRec.name}`)
+    ok(await kube('PATCH', dbObjectPath(ns, oldRec.name), { metadata: { finalizers: null } }, 'application/merge-patch+json'), `release ${oldRec.name}`, [404])
+    ok(await kube('DELETE', dbObjectPath(ns, oldRec.name)), `remove ${oldRec.name}`, [404])
+    await del(`/api/v1/namespaces/${DB_NS}/services/${oldRec.name}`)
+    if (oldRec.port) await del(`/api/v1/namespaces/${NS}/configmaps/port-${oldRec.port}`)
+    for (const path of [depPath(oldRec.name), `/api/v1/namespaces/${CNS}/secrets/compute-${oldRec.name}`]) await del(path)
+    // the new version's timeline is held as a deleted database's data is, then removed
+    await hold(RECORDS, { ...d, name: `${name}`, timeline: d.timeline, root: false, port: 0 }, deleteAfter(DELETE_HOLD))
+    await saveDb({ ...d, timeline: oldRec.timeline, pg: oldRec.pg })
+    await del(depPath(name))
+    await patchDbStatus(ns, name, { ...doorBack, move: { ...mv, state: 'back', message: `back on Postgres ${mv.from}: the database equalled its old copy; the Postgres ${mv.to} timeline is held` }, message: `back on Postgres ${mv.from}` })
+  } catch (e) {
+    await listExecs(key, null).catch(() => {})
+    await patchDbStatus(ns, name, { ...doorBack, message: `the way back failed, nothing was switched: ${String(e).slice(0, 300)}` }).catch(() => {})
+  }
+}
+/** Old copies whose keepOldFor is over are deleted (their data then held, as any deleted database's). */
+async function deleteOldCopies(all: any[]): Promise<void> {
+  for (const o of all) {
+    const mv: MoveStatus | undefined = o.status?.move
+    if (mv?.state !== 'done' || !mv.oldDatabase || !mv.deleteOldAfter || Date.parse(mv.deleteOldAfter) > Date.now()) continue
+    const old = all.find((x) => x.metadata.name === mv.oldDatabase && x.metadata.namespace === o.metadata.namespace && !x.metadata.deletionTimestamp)
+    if (old) { console.log(`move: ${old.metadata.namespace}/${old.metadata.name}: kept for ${o.spec?.keepOldFor ?? '30d'}, deleted`); await kube('DELETE', dbObjectPath(old.metadata.namespace, old.metadata.name)) }
+  }
+}
+
 // ---- the Database objects: made, closed, opened, stopped and deleted as they ask (databaseAction, databases.ts, decides)
 const finalize = (o: any) => kube('PATCH', dbObjectPath(o.metadata.namespace, o.metadata.name), { metadata: { finalizers: [...(o.metadata.finalizers ?? []), FINALIZER] } }, 'application/merge-patch+json')
 const unfinalize = (o: any) => kube('PATCH', dbObjectPath(o.metadata.namespace, o.metadata.name), { metadata: { finalizers: (o.metadata.finalizers ?? []).filter((f: string) => f !== FINALIZER) } }, 'application/merge-patch+json')
 const working = new Set<string>()
 /** How long a close waits between refusing new starts and stopping the compute: longer than any control layer pod's cache of the records. */
 const CLOSE_SETTLE_MS = 1500
+/** How long a move's door waits before the source is stopped and started for the copy: longer than two of a gateway's reads of the routes (every 5 s), so every gateway whose reads go right has dropped the route. */
+const MOVE_SETTLE_MS = 12_000
 async function reconcileDatabases() {
   if (!isLeader) return
   forgetDbs()
@@ -1448,15 +1729,22 @@ async function reconcileDatabases() {
   const recs = await readRecords(RECORDS)
   const records = new Map([...recs].map(([n, r]) => [n, { namespace: r.db.namespace }]))
   const busy = await replacementOpen()
+  await deleteOldCopies(all).catch((e) => console.log(`move: delete old copies: ${e}`))
   for (const o of all) {
     const key = `${o.metadata.namespace}/${o.metadata.name}`
-    if (working.has(key)) continue
+    if (working.has(key) || movesRunning.has(key)) continue
     const ns = o.metadata.namespace, name = o.metadata.name
     // a record the status holds and the platform's ConfigMaps lost is written again from the status
     const s = recordOf(o)
     if (s && !o.metadata.deletionTimestamp && !o.metadata.annotations?.[COPYING] && !recs.has(name)) await writeRecord(RECORDS, s).then(() => console.log(`database: ${key}: its record written again from its status`), (e) => console.log(`database ${key}: write its record: ${e}`))
     const act = databaseAction(o, all, { replacementOpen: busy, records })
     if (act.do === 'none') continue
+    // a move and its way back run in the background (a copy may take long), one at a time for a database
+    if (act.do === 'move' || act.do === 'moveBack') {
+      const run = (act.do === 'move' ? runMove(ns, name) : runMoveBack(ns, name, act.request)).catch((e) => console.log(`move ${key}: ${e}`)).finally(() => movesRunning.delete(key))
+      movesRunning.set(key, run)
+      continue
+    }
     working.add(key)
     try {
       if (act.do === 'finalize') ok(await finalize(o), `finalize ${key}`)
@@ -1476,6 +1764,9 @@ async function reconcileDatabases() {
         await endMaking(RECORDS, name).catch((e) => console.log(`database ${key}: release its claim: ${e}`)) // the database works: a claim left behind goes with its delete
         console.log(`database: ${key} made (${act.kind}${act.from ? ` of ${act.from}` : ''})`)
       } else if (act.do === 'delete') {
+        // a move under way is taken back first: its target compute, its timeline, its role
+        const mv: MoveStatus | undefined = o.status?.move
+        if (mv?.state && !MOVE_STATES_DONE.includes(mv.state)) await cleanupMove(ns, name, mv, `${ns}.${name}`).catch((e) => console.log(`database ${key}: clean up its move: ${e}`))
         const rec = recs.get(name)?.db
         const d = s ?? (rec && rec.namespace === ns ? rec : null)
         await patchDbStatus(ns, name, { phase: 'Deleting', message: 'deleting' }).catch(() => {})
@@ -2070,7 +2361,13 @@ Bun.serve({
           if ('refused' in r) return json({ error: `cannot start ${name}: the machines are full: ${r.refused}`, refused: r.refused }, 503)
           return json(r)
         }
-        if (req.method === 'POST' && m[2] === 'stop') { await stopCompute(name); return json({ stopped: name }) }
+        if (req.method === 'POST' && m[2] === 'stop') {
+          // a move's copy needs its source awake: a stop asked meanwhile (the gateways' idle sleep included) waits for the move
+          forgetDbs()
+          const mvState = (await dbObjects()).find((x) => x.metadata.name === name)?.status?.move?.state
+          if (mvState && !MOVE_STATES_DONE.includes(mvState)) return json({ error: `${name} is being moved: it is stopped when the move ends` }, 409)
+          await stopCompute(name); return json({ stopped: name })
+        }
         if (req.method === 'GET') return json({ ...d, pod: (await livePod(name))?.metadata?.name ?? null })
       }
       if (req.method === 'GET' && path === '/dbs') return json(await listDbs())

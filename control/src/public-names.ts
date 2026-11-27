@@ -162,6 +162,9 @@ export function pythonProseOf(text: string): string {
   return out.join('')
 }
 
+/** The roots of an admission rule's CEL expressions, whose fields read like names. */
+const CEL_ROOTS = new Set(['params', 'object', 'oldobject', 'request', 'variables'])
+
 const CODE_FILE = /\.(?:[cm]?[jt]sx?|py)$/
 /** Shell scripts and workflows: their jq and JSONPath (`.data.ca`) and their SQL (`w.id = a.id`) name fields, not hosts. */
 const SCRIPT_FILE = /\.(?:sh|ya?ml)$/
@@ -220,6 +223,8 @@ export function publicNameHits(path: string, text: string, exists: (repoPath: st
       // name of this code. In a document or a configuration file (README, YAML, the examples) every host counts.
       const labels = host.split('.')
       if (CODE_FILE.test(path) && (labels.some((l) => l.length === 1) || CODE_PROPERTIES.has(labels.at(-1)!))) continue
+      // in code, a CEL expression of an admission rule reads its roots' fields (params.data, object.spec): names, not hosts
+      if (CODE_FILE.test(path) && CEL_ROOTS.has(labels[0]!)) continue
       if (host === 'peat.zabaca.com' || host.endsWith('.peat.zabaca.com')) continue
       const third = Object.keys(THIRD_PARTY_DOMAINS).find((d) => endsWithDomain(host, d))
       if (!third) { add('host', host); continue }

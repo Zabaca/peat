@@ -3,7 +3,7 @@ import { X509Certificate } from 'node:crypto'
 import { ENTRIES, verifiedScope } from '../src/operator/keys'
 import { PLACEMENTS_CONFIG_MAP, reconcile } from '../src/operator/reconcile'
 import { KEYS_SECRET, MANAGED_BY } from '../src/operator/render'
-import { installManifests } from '../src/install/install'
+import { OPERATOR_EXEC_POLICY, installManifests } from '../src/install/install'
 import { FakeKube } from './fake-kube'
 
 // The operator as an installer meets it: a Platform declared on a cluster of labelled machines, one pass (or a few), and what the cluster
@@ -43,7 +43,7 @@ describe('a first install from one Platform', () => {
     expect(k.get('apps/v1', 'deployments', 'peat', 'peat-control').spec.replicas).toBe(2)
     expect(k.get('apps/v1', 'deployments', 'peat-gateway', 'peat-gateway').spec.replicas).toBe(2)
     expect(k.get('v1', 'services', 'peat-gateway', 'pg-front')).toBeDefined()
-    expect(k.all('validatingadmissionpolicies').map((p) => p.metadata.name).sort()).toEqual(['peat-control-keeps-to-peat-nodes', 'peat-control-services-stay-inside', 'peat-control-statefulsets-keep-to-the-safekeeper'])
+    expect(k.all('validatingadmissionpolicies').map((p) => p.metadata.name).sort()).toEqual(['peat-control-computes-of-the-compute-images', 'peat-control-exec-only-for-a-move', 'peat-control-keeps-to-peat-nodes', 'peat-control-services-stay-inside', 'peat-control-statefulsets-keep-to-the-safekeeper'])
     // the machine not labelled is never used
     expect(JSON.stringify([...k.objects.values()].filter((o) => o.kind !== 'Node'))).not.toContain('other-work')
   })
@@ -458,6 +458,15 @@ describe('a one-machine trial', () => {
 })
 
 describe('the install file', () => {
+  test('the operator holds every right it grants the control layer (the API server refuses to grant one it does not hold)', async () => {
+    const op = (installManifests('img') as any[]).find((m) => m.kind === 'ClusterRole')
+    const holds = (group: string, resource: string, verb: string) => op.rules.some((r: any) => r.apiGroups.includes(group) && (r.resources.includes(resource) || r.resources.includes('*')) && (r.verbs.includes(verb) || r.verbs.includes('*')))
+    k.put(platform())
+    await reconcile(k)
+    const granted = [...k.all('roles'), ...k.all('clusterroles')].filter((x) => x.metadata.name !== 'peat-operator').flatMap((x) => x.rules ?? [])
+    const missing = granted.flatMap((r: any) => r.apiGroups.flatMap((g: string) => r.resources.flatMap((res: string) => r.verbs.filter((v: string) => !holds(g, res, v)).map((v: string) => `${g}/${res} ${v}`))))
+    expect(missing).toEqual([])
+  })
   test('the kinds, the operator\'s namespace, its account and its Deployment of the image given', () => {
     const m = installManifests('ghcr.io/zabaca/peat/control:release-2026-12-01') as any[]
     expect(m.filter((x) => x.kind === 'CustomResourceDefinition').map((x) => x.metadata.name)).toContain('platforms.peat.zabaca.com')
@@ -468,5 +477,11 @@ describe('the install file', () => {
     // it grants nothing it does not hold: no bind, no escalate; and it makes no pod
     for (const r of role.rules as any[]) { expect(r.verbs).not.toContain('bind'); expect(r.verbs).not.toContain('escalate') }
     expect(role.rules.find((r: any) => r.resources.includes('pods')).verbs).not.toContain('create')
+    // the exec it holds to grant is refused it by an admission rule of its own, whatever its RBAC
+    const noExec = m.find((x) => x.kind === 'ValidatingAdmissionPolicy' && x.metadata.name === OPERATOR_EXEC_POLICY)
+    expect(noExec.spec.matchConstraints.resourceRules[0]).toMatchObject({ operations: ['CONNECT'], resources: ['pods/exec', 'pods/attach'] })
+    expect(noExec.spec.matchConditions).toEqual([{ name: 'by-the-operator', expression: "request.userInfo.username == 'system:serviceaccount:peat-system:peat-operator'" }])
+    expect(noExec.spec.validations[0].expression).toBe('false')
+    expect(m.find((x) => x.kind === 'ValidatingAdmissionPolicyBinding' && x.metadata.name === OPERATOR_EXEC_POLICY).spec).toEqual({ policyName: OPERATOR_EXEC_POLICY, validationActions: ['Deny'] })
   })
 })
