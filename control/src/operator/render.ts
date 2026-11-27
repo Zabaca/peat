@@ -276,6 +276,8 @@ export function storagePolicies(r: Resolved): Manifest[] {
 
 /** The pieces an upgrade moves one at a time, in its order: the controller (with the broker), each pageserver, each safekeeper (the control layer's), the gateways, the control layer. */
 export type Piece = string
+/** The control layer's settings naming each version's compute image (read back by the operator from the live control layer). */
+export const COMPUTE_IMAGE_ENV = { 18: 'COMPUTE_IMAGE', 19: 'COMPUTE_IMAGE_PG19' } as const
 export const pageserverPiece = (id: number): Piece => `pageserver-w${id}`
 /** The images a piece is rendered at: the Platform's release, unless an upgrade under way says otherwise for that piece. */
 export type ImagesAt = (piece: Piece) => Resolved['images']
@@ -305,8 +307,8 @@ export function controlEnv(r: Resolved, images = r.images): { name: string; valu
   return [
     ...toEnv(n),
     { name: 'FRONT_DOOR', value: frontDoor(n) },
-    { name: 'COMPUTE_IMAGE', value: images.compute[18] },
-    { name: 'COMPUTE_IMAGE_PG19', value: images.compute[19] },
+    { name: COMPUTE_IMAGE_ENV[18], value: images.compute[18] },
+    { name: COMPUTE_IMAGE_ENV[19], value: images.compute[19] },
     { name: 'STORAGE_IMAGE', value: images.storage },
     // the release the safekeepers it makes are stamped with
     { name: 'RELEASE', value: images.release },

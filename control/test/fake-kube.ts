@@ -12,6 +12,13 @@ function merge(into: any, patch: any): any {
   return out
 }
 
+/** An empty list is not stored, as a real API server stores none (its fields are omitempty): a test sees what a real one keeps. */
+function dropEmptyLists(v: any): any {
+  if (Array.isArray(v)) return v.map(dropEmptyLists)
+  if (!v || typeof v !== 'object') return v
+  return Object.fromEntries(Object.entries(v).filter(([, x]) => !(Array.isArray(x) && x.length === 0)).map(([k, x]) => [k, dropEmptyLists(x)]))
+}
+
 /** `/api/v1/namespaces/a/pods/b` into its parts. */
 function parse(path: string): { group: string; ns: string | null; plural: string; name: string | null; sub: string | null } {
   const p = path.replace(/^\/(api|apis)\//, '').split('/')
@@ -33,6 +40,7 @@ export class FakeKube implements Kube {
 
   private keyOf(group: string, ns: string | null, plural: string, name: string) { return `${group}|${ns ?? ''}|${plural}|${name}` }
   put(o: any) {
+    o = dropEmptyLists(o)
     const plural = pluralOf(o.kind)
     const group = o.apiVersion
     const stored = { ...clone(o), metadata: { creationTimestamp: new Date(1_800_000_000_000 + this.rv * 1000).toISOString(), uid: `uid-${this.rv}`, generation: 1, ...clone(o.metadata), resourceVersion: String(this.rv++) } }
@@ -84,7 +92,7 @@ export class FakeKube implements Kube {
       return { status: 200, json: clone(live) }
     }
     // a Job's pod template cannot change, as the API server has it (422)
-    const jobTemplateChanged = (o: any) => plural === 'jobs' && live && o?.spec?.template && JSON.stringify(o.spec.template) !== JSON.stringify(live.spec?.template)
+    const jobTemplateChanged = (o: any) => plural === 'jobs' && live && o?.spec?.template && JSON.stringify(dropEmptyLists(o.spec.template)) !== JSON.stringify(live.spec?.template)
     if ((method === 'PUT' || (method === 'PATCH' && contentType === 'application/apply-patch+yaml')) && jobTemplateChanged(parsed)) return { status: 422, json: { message: 'spec.template: field is immutable' } }
     if (method === 'PATCH' && contentType === 'application/apply-patch+yaml') {
       const o = parsed as any

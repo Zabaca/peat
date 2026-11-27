@@ -24,7 +24,9 @@ controller and the broker; each pageserver, drained first (its shards moved to t
 gateways; the control layer. The whole platform is checked before and after every step (every piece ready, every pageserver Active, every
 shard attached, nothing reconciling, every secondary copy warm, every safekeeper answering). A check that does not pass within
 `upgrades.checkTimeout` (a duration, `10m` by default) halts the upgrade with the step and the reason in the status (`peat status`); it stays halted until `peat retry`
-(it goes on from that step) or until the earlier release is set back (only what had moved goes back, last first, with the same checks).
+(it goes on from that step) or until the earlier release is set back (only what had moved goes back, last first, with the same checks,
+except that the check before each step back leaves out that step's own piece and its own storage readings: it is the broken piece the way
+back mends). A drain asked again when its node reads Active also restarts one a person cancelled, until `upgrades.checkTimeout` halts it.
 No step starts inside `upgrades.quietHours`: an upgrade under way waits at the next step boundary. A compute takes the new image at its
 next start, or, awake, inside `upgrades.restartHours`, one at a time. The state is in `status.upgrade`, so a restarted operator goes on.
 
@@ -34,9 +36,13 @@ A platform installed another way is taken over by naming its objects in the Plat
 compares each with what it would make (the fields it sets, the annotations it sets, a Secret's values): one it would not change is
 taken over as it is, and is the operator's from then on, listed or not; one it would change is left alone, marked adopted, and the change
 is listed in `status.pendingChanges` until `requests.applyPending` asks for it (taking it off the list applies nothing). A change of a
-field that cannot change in place (a selector, a StatefulSet's volume claims) is listed as one that cannot be applied. While anything is
-pending the platform reads Installing, not Ready. An entry that names nothing the operator makes is said in the status. It never deletes
-what it did not make or adopt.
+field that cannot change in place (a Deployment's or StatefulSet's selector, a StatefulSet's volume claims, serviceName or
+podManagementPolicy, a Job's template, a Service's clusterIP, a binding's roleRef) is listed as one that cannot be applied. A change to a
+pageserver's pods is not applied by `requests.applyPending`: the ordered upgrade makes it, when the release or the images change, and its
+step applies the new images to the adopted object as it does to any other. Once any piece runs, a changed release goes through the ordered
+steps, from the images the live pieces run when no release has been recorded yet. While anything is pending the platform reads Installing,
+not Ready (the release is recorded all the same once every piece is ready). An entry that names nothing the operator makes is said in the
+status. It never deletes what it did not make or adopt.
 
 ## Databases
 
