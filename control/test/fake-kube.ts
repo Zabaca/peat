@@ -83,6 +83,9 @@ export class FakeKube implements Kube {
       live.status = next
       return { status: 200, json: clone(live) }
     }
+    // a Job's pod template cannot change, as the API server has it (422)
+    const jobTemplateChanged = (o: any) => plural === 'jobs' && live && o?.spec?.template && JSON.stringify(o.spec.template) !== JSON.stringify(live.spec?.template)
+    if ((method === 'PUT' || (method === 'PATCH' && contentType === 'application/apply-patch+yaml')) && jobTemplateChanged(parsed)) return { status: 422, json: { message: 'spec.template: field is immutable' } }
     if (method === 'PATCH' && contentType === 'application/apply-patch+yaml') {
       const o = parsed as any
       const data = o.stringData ? { data: Object.fromEntries(Object.entries(o.stringData).map(([a, v]) => [a, Buffer.from(String(v)).toString('base64')])) } : {}

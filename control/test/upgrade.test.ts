@@ -76,12 +76,15 @@ let k: FakeKube
 let clock: Date
 let unsettled: string[]
 const calls: string[] = []
+/** The storage controller's nodes, played here: a drain asked puts a node to PauseForRestart (done), a fill puts it back to Active. */
+const scheduling = new Map<number, string>()
 const storage: Storage = {
   problems: async () => [...unsettled],
-  drain: async (id) => { calls.push(`drain ${id}`) },
-  drained: async () => ({ done: true, why: '' }),
-  fill: async (id) => { calls.push(`fill ${id}`) },
-  filled: async () => ({ done: true, why: '' }),
+  node: async (id) => ({ availability: 'Active', scheduling: scheduling.get(id) ?? 'Active' }),
+  drain: async (id) => { calls.push(`drain ${id}`); scheduling.set(id, 'PauseForRestart') },
+  drained: async (id) => (scheduling.get(id) === 'PauseForRestart' ? { done: true, why: '' } : { done: false, why: `node ${id} scheduling is ${scheduling.get(id) ?? 'Active'}` }),
+  fill: async (id) => { calls.push(`fill ${id}`); scheduling.set(id, 'Active') },
+  filled: async (id) => (scheduling.get(id) === 'PauseForRestart' ? { done: false, why: 'paused' } : { done: true, why: '' }),
 }
 const platform = (release: string, more: Record<string, unknown> = {}) => ({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Platform', metadata: { name: 'peat' }, spec: { release, objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's' }, upgrades: { checkTimeout: '1m' }, ...more } })
 const statusOf = () => k.get('peat.zabaca.com/v1alpha1', 'platforms', null, 'peat').status
@@ -101,6 +104,7 @@ beforeEach(async () => {
   clock = new Date('2026-12-01T12:00:00Z')
   unsettled = []
   calls.length = 0
+  scheduling.clear()
   k.put(platform('release-a'))
   await pass()
   for (const [i, m] of ['machine-1', 'machine-2', 'machine-3'].entries()) k.put({ apiVersion: 'apps/v1', kind: 'StatefulSet', metadata: { name: `safekeeper-w${i + 1}`, namespace: 'peat', labels: { 'peat-sk': 'true' } }, spec: { replicas: 1, template: { spec: { nodeSelector: { 'kubernetes.io/hostname': m }, containers: [{ image: 'ghcr.io/zabaca/peat/storage:release-a' }] } } } })
@@ -196,6 +200,8 @@ describe('adoption', () => {
     const pendingChange = (statusOf().pendingChanges as any[]).find((x) => x.name === 'storage-broker')
     expect(pendingChange.change).toContain('.spec.template.spec.containers[0].image: "ghcr.io/zabaca/peat/storage:older" would be "ghcr.io/zabaca/peat/storage:release-a"')
     expect(k.get('apps/v1', 'deployments', 'peat', 'storage-broker').metadata.labels['peat.zabaca.com/adopted']).toBe('true')
+    // what runs is not yet what is declared: not Ready
+    expect(statusOf().phase).toBe('Installing')
     // off the list it is still the operator's, still as it was: nothing restarts by a change of the list
     respec('release-a')
     await pass()
@@ -223,5 +229,125 @@ describe('adoption', () => {
     expect(r.refused.some((x) => x.includes('Deployment/peat/storage-controller'))).toBe(false)
     expect(k.get('v1', 'configmaps', 'peat-system', 'peat-owned').data['Deployment.peat.storage-controller']).toBe(`uid:${ctl.metadata.uid}`)
     expect(statusOf().pendingChanges.find((x: any) => x.name === 'storage-controller')).toBeUndefined()
+  })
+})
+
+describe('the review\'s faults, each played', () => {
+  test('going back past a pageserver that never becomes ready on the new image: the way back mends it, it does not wait for it', async () => {
+    respec('release-b')
+    // pageserver-w1 on release-b never becomes ready
+    const broken = () => { for (const o of k.all('statefulsets').filter((x) => x.metadata.name === 'pageserver-w1' && x.spec.template.spec.containers[0].image.endsWith(':release-b'))) o.status = { readyReplicas: 0, replicas: 1 }; const pod = k.get('v1', 'pods', 'peat', 'pageserver-w1-0'); if (pod?.spec.containers[0].image.endsWith(':release-b')) pod.status = { conditions: [] } }
+    for (let i = 0; i < 30 && statusOf().phase !== 'Halted'; i++) { await pass(); broken() }
+    expect(statusOf().phase).toBe('Halted')
+    expect(statusOf().upgrade.step).toBe('pageserver-w1')
+    respec('release-a')
+    for (let i = 0; i < 40 && !(statusOf().phase === 'Ready' && statusOf().release === 'release-a'); i++) { await pass(); broken() }
+    expect(statusOf()).toMatchObject({ phase: 'Ready', release: 'release-a' })
+    expect(image('statefulsets', 'peat', 'pageserver-w1')).toBe('ghcr.io/zabaca/peat/storage:release-a')
+  })
+  test('the drain is asked only once the status says draining; a drain the controller ended is asked again', async () => {
+    respec('release-b')
+    for (let i = 0; i < 30 && statusOf().upgrade?.step !== 'pageserver-w1'; i++) await pass()
+    // the pass whose check passed recorded draining and asked nothing yet
+    expect(statusOf().upgrade.phase).toBe('draining')
+    expect(calls).toEqual([])
+    // the drain asked, then ended by the controller (its own restart): the node reads Active again, and the drain is asked again
+    storage.drained = async () => ({ done: false, why: 'shards still attached' })
+    await pass()
+    expect(calls).toEqual(['drain 1'])
+    scheduling.set(1, 'Active')
+    await pass()
+    expect(calls).toEqual(['drain 1', 'drain 1'])
+    storage.drained = async (id) => (scheduling.get(id) === 'PauseForRestart' ? { done: true, why: '' } : { done: false, why: 'draining' })
+  })
+  test('a node left Draining or PauseForRestart by an earlier attempt at the step does not fail its own check', async () => {
+    respec('release-b')
+    for (let i = 0; i < 30 && !(statusOf().upgrade?.moved ?? []).includes('controller'); i++) await pass()
+    expect(statusOf().upgrade.step).toBeUndefined()
+    // the next pass begins pageserver-w1 with its check: its own node's scheduling is no problem there, another node's is
+    unsettled = ['node 1 scheduling is "PauseForRestart"']
+    await pass()
+    expect(statusOf().upgrade).toMatchObject({ step: 'pageserver-w1', phase: 'draining' })
+    unsettled = ['node 2 scheduling is "Draining"']
+    respec('release-b')
+    const u = statusOf().upgrade
+    k.get('peat.zabaca.com/v1alpha1', 'platforms', null, 'peat').status.upgrade = { ...u, phase: 'precheck' }
+    await pass()
+    expect(statusOf().upgrade.phase).toBe('precheck')
+    expect(statusOf().upgrade.lastCheck.message).toContain('node 2 scheduling')
+    unsettled = []
+  })
+  test('an object adopted cleanly and still listed is the operator\'s: the upgrade\'s change is applied, never held as pending', async () => {
+    respec('release-a', { adopt: [{ kind: 'StatefulSet', namespace: 'peat', name: 'pageserver-w1' }] })
+    await pass(); await pass()
+    expect(statusOf().pendingChanges).toEqual([])
+    respec('release-b', { adopt: [{ kind: 'StatefulSet', namespace: 'peat', name: 'pageserver-w1' }] })
+    for (let i = 0; i < 80 && (i === 0 || statusOf().phase !== 'Ready'); i++) await pass()
+    expect(statusOf()).toMatchObject({ phase: 'Ready', release: 'release-b', pendingChanges: [] })
+    expect(image('statefulsets', 'peat', 'pageserver-w1')).toBe('ghcr.io/zabaca/peat/storage:release-b')
+  })
+  test('a pod is deleted for a restart only once its template carries the new image', async () => {
+    respec('release-b')
+    for (let i = 0; i < 30 && !(statusOf().upgrade?.step === 'pageserver-w1' && statusOf().upgrade?.phase === 'restarting'); i++) await pass()
+    // the template held back (as a pending change would hold it)
+    const sts = k.get('apps/v1', 'statefulsets', 'peat', 'pageserver-w1')
+    sts.spec.template.spec.containers[0].image = 'ghcr.io/zabaca/peat/storage:release-a'
+    const pod = k.get('v1', 'pods', 'peat', 'pageserver-w1-0')
+    const r = await reconcile(k, { storage: () => storage, now: () => clock })
+    expect(k.calls.filter((c) => c === 'DELETE /api/v1/namespaces/peat/pods/pageserver-w1-0')).toEqual([])
+    expect(k.get('v1', 'pods', 'peat', 'pageserver-w1-0').metadata.uid).toBe(pod.metadata.uid)
+    expect(r.phase).toBe('Upgrading')
+  })
+  test('with safekeepers outside, the keeper-prep Job is made again on the new image (a Job\'s template cannot change)', async () => {
+    respec('release-a', { safekeepers: { outside: { machines: ['machine-3'] } } })
+    await pass()
+    const before = k.get('batch/v1', 'jobs', 'peat', 'keeper-prep')
+    expect(before).toBeDefined()
+    respec('release-b', { safekeepers: { outside: { machines: ['machine-3'] } } })
+    for (let i = 0; i < 80 && (i === 0 || statusOf().phase !== 'Ready'); i++) await pass()
+    expect(statusOf()).toMatchObject({ phase: 'Ready', release: 'release-b' })
+    const after = k.get('batch/v1', 'jobs', 'peat', 'keeper-prep')
+    expect(after.metadata.uid).not.toBe(before.metadata.uid)
+    expect(after.spec.template.spec.containers[0].image).toBe('ghcr.io/zabaca/peat/storage:release-b')
+  })
+  test('adoption compares the annotations the operator sets and a Secret\'s values: a difference there is pending, not written', () => {
+    expect(differences({ metadata: { annotations: { 'lb.example/ip': '192.0.2.6', 'peat.zabaca.com/release': 'b' } } }, { metadata: { annotations: { 'lb.example/ip': '192.0.2.5', 'peat.zabaca.com/release': 'a', 'other.example/x': '1' } } }))
+      .toEqual(['.metadata.annotations.lb.example/ip: "192.0.2.5" would be "192.0.2.6"'])
+    expect(differences({ stringData: { 'auth_public_key.pem': 'mine' } }, { data: { 'auth_public_key.pem': Buffer.from('theirs').toString('base64') } })).toEqual(['.data.auth_public_key.pem: its value would change'])
+    expect(differences({ stringData: { k: 'same' } }, { data: { k: Buffer.from('same').toString('base64') } })).toEqual([])
+  })
+})
+
+describe('the review\'s smaller points', () => {
+  test('a keeper waits while a keeper replacement is open, and carries the release it now runs', async () => {
+    respec('release-b')
+    for (let i = 0; i < 40 && !(statusOf().upgrade?.moved ?? []).includes('pageserver-w2'); i++) await pass()
+    k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'sk-replacement-2', namespace: 'peat', labels: { 'peat-sk-open': 'true' } }, data: {} })
+    for (let i = 0; i < 3; i++) await pass()
+    expect(statusOf().upgrade).toMatchObject({ step: 'safekeeper-w1', phase: 'precheck' })
+    expect(statusOf().upgrade.lastCheck.message).toContain('a keeper replacement is open: sk-replacement-2')
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|configmaps|sk-replacement-2'))!)
+    for (let i = 0; i < 80 && statusOf().phase !== 'Ready'; i++) await pass()
+    expect(k.get('apps/v1', 'statefulsets', 'peat', 'safekeeper-w1').metadata.annotations['peat.zabaca.com/release']).toBe('release-b')
+  })
+  test('the same release name with other images starts an upgrade too', async () => {
+    respec('release-a', { images: { storage: 'registry.example.com/storage:pinned' } })
+    await pass()
+    expect(statusOf().phase).toBe('Upgrading')
+  })
+  test('a third release halts with how to go on: set it again and retry', async () => {
+    respec('release-b')
+    await pass()
+    respec('release-c')
+    await pass()
+    const halted = statusOf().upgrade.halted
+    expect(halted.reason).toContain('set release-b again and run peat retry to go on, or set release-a to go back')
+    await pass()
+    expect(statusOf().upgrade.halted.at).toBe(halted.at)
+  })
+  test('pending changes keep the platform from Ready; an adopt entry naming nothing is said', async () => {
+    respec('release-a', { adopt: [{ kind: 'Deployment', namespace: 'peat', name: 'nothing-like-it' }] })
+    await pass()
+    expect(statusOf().message).toContain('adopt names Deployment/peat/nothing-like-it, which the platform does not make')
   })
 })

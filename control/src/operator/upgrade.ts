@@ -11,6 +11,7 @@
 import type { Window } from '../quiet-hours'
 import { describeWindow, windowAt } from '../quiet-hours'
 import type { Images } from './platform'
+import { pageserverPiece } from './render'
 
 export type Phase = 'precheck' | 'draining' | 'applying' | 'restarting' | 'waiting' | 'filling' | 'postcheck'
 export interface UpgradeState {
@@ -24,7 +25,7 @@ export interface UpgradeState {
   moved: string[]
   step?: string
   phase?: Phase
-  /** When the current phase began: its wait is bounded by the Platform's upgrades.checkSeconds. */
+  /** When the current phase began: its wait is bounded by the Platform's upgrades.checkTimeout. */
   since?: string
   startedAt: string
   halted?: { at: string; step: string; reason: string }
@@ -33,11 +34,17 @@ export interface UpgradeState {
   complete?: boolean
 }
 
+/** A pageserver's step is its piece (render.ts names it); the pageserver a step is of (0: not a pageserver's). */
+export const pageserverStep = pageserverPiece
+export const pageserverOf = (step: string): number => (/^pageserver-w\d+$/.test(step) ? Number(step.slice('pageserver-w'.length)) : 0)
+
 /** The steps of an upgrade, in order. Safekeepers are the control layer's StatefulSets, named here as the cluster has them. */
 export function stepsOf(pageservers: number[], safekeepers: string[]): string[] {
   const sk = [...safekeepers].sort((a, b) => Number(a.replace(/\D/g, '')) - Number(b.replace(/\D/g, '')))
-  return ['controller', ...[...pageservers].sort((a, b) => a - b).map((id) => `pageserver-w${id}`), ...sk, 'gateways', 'control']
+  return ['controller', ...[...pageservers].sort((a, b) => a - b).map(pageserverStep), ...sk, 'gateways', 'control']
 }
+/** The same images, field by field (a status read back from the API server need not keep the order its fields were written in). */
+const sameImages = (a: Images, b: Images) => a.storage === b.storage && a.control === b.control && String(a.compute?.[18]) === String(b.compute?.[18]) && String(a.compute?.[19]) === String(b.compute?.[19])
 
 /** Whether the current step's own images have been applied (so it renders at its target). */
 const applied = (p: Phase | undefined) => p !== undefined && p !== 'precheck' && p !== 'draining'
@@ -76,11 +83,14 @@ export function decide(o: {
   const now = o.now.toISOString()
   let u = o.state && !o.state.complete ? { ...o.state } : undefined
   if (!u) {
-    if (!o.running || o.running.release === o.release) return { kind: 'none' }
+    // a changed release, or the same release name with other images (an install that pins them)
+    if (!o.running || (o.running.release === o.release && sameImages(o.running.images, o.images))) return { kind: 'none' }
     u = { from: o.running.release, to: o.release, fromImages: o.running.images, toImages: o.images, direction: 'forward', steps: o.steps, moved: [], startedAt: now }
   }
   if (o.release !== u.to && o.release !== u.from) {
-    return { kind: 'halt', state: { ...u, halted: { at: now, step: u.step ?? '(between steps)', reason: `the release ${o.release} was set while the upgrade from ${u.from} to ${u.to} is under way: set ${u.to} to go on or ${u.from} to go back` } } }
+    const reason = `the release ${o.release} was set while the upgrade from ${u.from} to ${u.to} is under way: set ${u.to} again and run peat retry to go on, or set ${u.from} to go back`
+    // halted once for it: the time it halted is kept, not written again every pass
+    return { kind: 'halt', state: { ...u, halted: u.halted?.reason === reason ? u.halted : { at: now, step: u.step ?? '(between steps)', reason } } }
   }
   const wanted = o.release === u.to ? 'forward' : 'back'
   if (wanted !== u.direction) {
@@ -108,7 +118,7 @@ export function decide(o: {
 
 /** What a step is made of, by its piece: the phases it goes through, in order. */
 export function phasesOf(step: string, pageserverCount: number): Phase[] {
-  if (step.startsWith('pageserver-w')) return pageserverCount > 1 ? ['precheck', 'draining', 'applying', 'restarting', 'filling', 'postcheck'] : ['precheck', 'applying', 'restarting', 'postcheck']
+  if (pageserverOf(step)) return pageserverCount > 1 ? ['precheck', 'draining', 'applying', 'restarting', 'filling', 'postcheck'] : ['precheck', 'applying', 'restarting', 'postcheck']
   return ['precheck', 'applying', 'waiting', 'postcheck']
 }
 export function nextPhase(step: string, phase: Phase, pageserverCount: number): Phase | 'done' {

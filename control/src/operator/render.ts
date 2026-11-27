@@ -205,7 +205,7 @@ export function pageserver(r: Resolved, at: { id: number; node: string }, image 
   const n = r.names
   const id = at.id
   const labels = { app: 'pageserver', 'node-id': String(id) }
-  const host = `pageserver-w${id}-0.pageserver.${n.namespace}.svc.cluster.local`
+  const host = `${pageserverPiece(id)}-0.pageserver.${n.namespace}.svc.cluster.local`
   const vol = r.spec.pageservers.storage.hostPath!
   const script = `set -eu
 id=${id}
@@ -231,7 +231,7 @@ TOML
 printf '{"host":"%s","http_host":"%s","http_port":${PORTS.pageserverHttp},"port":${PORTS.pageserverPg},"availability_zone_id":"%s"}' "$host" "$host" "$NODE_NAME" > /data/.neon/metadata.json
 `
   return {
-    apiVersion: 'apps/v1', kind: 'StatefulSet', metadata: meta(r, `pageserver-w${id}`, n.namespace),
+    apiVersion: 'apps/v1', kind: 'StatefulSet', metadata: meta(r, pageserverPiece(id), n.namespace),
     spec: {
       serviceName: 'pageserver', replicas: 1, updateStrategy: { type: 'OnDelete' }, selector: { matchLabels: labels },
       template: { metadata: { labels }, spec: platformPod(n, {

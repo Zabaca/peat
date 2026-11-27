@@ -185,7 +185,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
     direction: str('forward, or back (the earlier release set again: only what had moved goes back, in reverse order).', { enum: ['forward', 'back'] }),
     step: str('The step it is on.'), steps: list('Every step, in order.', str('A step.')), moved: list('The pieces on the release it goes to, in the order they moved.', str('A step.')),
     phase: str('Where the step is: precheck, draining, applying, restarting, waiting, filling, postcheck.', { enum: ['precheck', 'draining', 'applying', 'restarting', 'waiting', 'filling', 'postcheck'] }),
-    since: str('When the step\'s phase began: its wait is bounded by upgrades.checkSeconds.', { format: 'date-time' }),
+    since: str('When the step\'s phase began: its wait is bounded by upgrades.checkTimeout.', { format: 'date-time' }),
     fromImages: imagesSchema('The images it started from.'), toImages: imagesSchema('The images it goes to.'),
     complete: bool('Whether it is done.'),
     startedAt: str('When it started.', { format: 'date-time' }),

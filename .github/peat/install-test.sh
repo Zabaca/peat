@@ -199,8 +199,16 @@ EOF
 # reconnects ten times a second), so each runs in a loop that starts it again, its errors kept for the failure dump, and every step
 # from here on first checks that both answer.
 tunnel() { # tunnel <name> <namespace> <service> <ports>
-  ( while :; do k -n "$2" port-forward "svc/$3" "$4" >>"$work/tunnel-$1.log" 2>&1; echo "$(date -u +%H:%M:%S) ended; started again" >>"$work/tunnel-$1.log"; sleep 1; done ) &
+  # (|| true: under set -e an ended kubectl would end the loop with it)
+  ( while :; do k -n "$2" port-forward "svc/$3" "$4" >>"$work/tunnel-$1.log" 2>&1 || true; echo "$(date -u +%H:%M:%S) ended; started again" >>"$work/tunnel-$1.log"; sleep 1; done ) &
   pids+=($!)
+  eval "tunnel_$1=$!"
+}
+# a port-forward is held to the one pod it picked: after that pod goes (a rollout), its kubectl is ended so the loop starts it on a new one
+retunnel() { # retunnel <name> <port>
+  local pid; eval "pid=\$tunnel_$1"
+  pkill -P "$pid" 2>/dev/null || true
+  sleep 2; tunnel_up "$2"
 }
 tunnel_up() { # tunnel_up <port>: it accepts a connection within 30 s
   local t0; t0=$(date +%s)
@@ -351,9 +359,11 @@ if [ -n "${UPGRADE_FROM:-}" ]; then
   upg() { PGPASSWORD="$upg_password" psql "host=upg.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/ca.crt connect_timeout=5" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
   t0=$(date +%s); until upg 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'upg did not answer'; sleep 3; done
   upg 'create table w (id int primary key, at timestamptz default now())'
-  : > "$work/acked"; : > "$work/reads"
-  ( i=0; while [ ! -f "$work/stop" ]; do i=$((i + 1)); if upg "insert into w (id) values ($i)" >/dev/null 2>&1; then echo "$i" >> "$work/acked"; fi; sleep 0.1; done ) & pids+=($!)
-  ( while [ ! -f "$work/stop" ]; do if upg 'select count(*) from w' >/dev/null 2>&1; then date +%s >> "$work/reads"; fi; sleep 1; done ) & pids+=($!)
+  # a table larger than the compute's cache, so every read asks the pageservers for pages (a count of a small table would be served from memory)
+  upg "create table big as select g, repeat(md5(g::text), 8) as pad from generate_series(1, 400000) g"
+  : > "$work/acked"; : > "$work/acked-at"; : > "$work/reads"
+  ( i=0; while [ ! -f "$work/stop" ]; do i=$((i + 1)); if upg "insert into w (id) values ($i)" >/dev/null 2>&1; then echo "$i" >> "$work/acked"; date +%s >> "$work/acked-at"; fi; sleep 0.1; done ) & pids+=($!)
+  ( while [ ! -f "$work/stop" ]; do if upg "select count(*), sum(length(pad)) from big where g % 97 = $((RANDOM % 97))" >/dev/null 2>&1; then date +%s >> "$work/reads"; fi; sleep 1; done ) & pids+=($!)
   sleep 10
   t0=$(date +%s)
   k patch platform peat --type merge -p "{\"spec\":{\"release\":\"ci\",\"images\":{\"storage\":\"$storage\",\"control\":\"$control\",\"compute\":{\"18\":\"$compute18\",\"19\":\"$compute19\"}}}}"
@@ -372,8 +382,20 @@ if [ -n "${UPGRADE_FROM:-}" ]; then
   missing=$(upg "select count(*) from unnest(array[$(paste -sd, "$work/acked")]::int[]) a(id) where not exists (select 1 from w where w.id = a.id)")
   [ "$missing" = 0 ] || fail "$missing acknowledged inserts are missing after the upgrade ($acked acknowledged, $stored stored)"
   max_gap=$(awk 'NR > 1 && $1 - p > m { m = $1 - p } { p = $1 } END { print m + 0 }' "$work/reads")
+  max_write_gap=$(awk 'NR > 1 && $1 - p > m { m = $1 - p } { p = $1 } END { print m + 0 }' "$work/acked-at")
+  # the proof's bound (P3): no gap a reader or a writer sees passes 30 seconds
+  [ "$max_gap" -le 30 ] || fail "a reader waited $max_gap s during the upgrade (the bound is 30)"
+  [ "$max_write_gap" -le 30 ] || fail "a writer waited $max_write_gap s during the upgrade (the bound is 30)"
   k get platform peat -o jsonpath='{range .status.pieces[*]}  {.kind} {.name} {.release}{"\n"}{end}'
-  echo "  the upgrade took $upgrade_s s; $acked inserts acknowledged, none missing ($stored stored); the reader's longest gap $max_gap s"
+  # a database woken after the upgrade runs the new compute image (the control layer and the gateways rolled: their tunnels start again)
+  retunnel control 18080; retunnel front 15432
+  curl -fsS -X POST localhost:18080/db/upg/stop >/dev/null || fail 'upg was not stopped'
+  t0=$(date +%s); while k -n peat-compute get pods -l compute=upg -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'upg did not go to sleep'; sleep 2; done
+  # the first start on the new compute image may pull it first
+  t0=$(date +%s); until upg 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'upg did not wake after the upgrade'; sleep 3; done
+  woke_on=$(k -n peat-compute get pods -l compute=upg -o jsonpath='{.items[0].spec.containers[0].image}')
+  [ "$woke_on" = "$compute19" ] || fail "upg woke on $woke_on, not the new compute image $compute19"
+  echo "  the upgrade took $upgrade_s s; $acked inserts acknowledged, none missing ($stored stored); the longest gaps: a reader's $max_gap s, a writer's $max_write_gap s; upg woke on the new compute image"
 fi
 
-echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s${upgrade_s:+, an upgrade in $upgrade_s s (the longest gap a reader saw: $max_gap s)}"
+echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s${upgrade_s:+, an upgrade in $upgrade_s s (the longest gaps: $max_gap s reading, $max_write_gap s writing)}"
