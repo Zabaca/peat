@@ -76,8 +76,8 @@ enum Command {
         /// Remove what the destination holds first
         #[arg(long)]
         replace: bool,
-        /// With --replace: the destination is meant to be emptied (a source with no pageserver is
-        /// copied, and nothing the destination loses is counted)
+        /// With --replace, from a source with no pageserver: the destination is meant to be
+        /// emptied (refused from a source with pageservers; name losses with --accept-older)
         #[arg(long, requires = "replace")]
         empty_destination: bool,
         /// With --replace: records (`<Kind>/<name>`: Tenant/<tenant id>, Timeline/<name>) the

@@ -181,8 +181,9 @@ pub async fn compare(
 pub struct CopyOptions {
     /// Remove what the destination holds first (`--replace`).
     pub replace: bool,
-    /// With `replace`: the destination is meant to be emptied, so a source with no pageserver is
-    /// copied, and nothing the destination loses is counted (`--empty-destination`).
+    /// With `replace`, from a source with no pageserver: the destination is meant to be emptied,
+    /// and nothing it loses is counted (`--empty-destination`). Refused from a source that holds
+    /// pageservers, whose losses are named with `accept_older`.
     pub empty_destination: bool,
     /// With `replace`: records (`<Kind>/<name>`) the destination holds that the source lowers or
     /// drops, each meant to go (`--accept-older`).
@@ -243,6 +244,15 @@ pub async fn copy(
                  destination; give --empty-destination too if that is meant",
                 records.counts()
             )));
+        }
+        // --empty-destination is for an empty source only: from a source with pageservers, the
+        // records it would drop are named with --accept-older
+        if !records.pageservers.is_empty() && empty_destination {
+            return Ok(Outcome::Refused(
+                "--empty-destination is for a source with no pageserver, and this one holds \
+                 some: name each record (<Kind>/<name>) meant to go with --accept-older instead"
+                    .to_string(),
+            ));
         }
         // Nothing the destination holds is lowered or dropped unless each is named as meant
         // (opened for writing, so a new Postgres has its tables to be read)

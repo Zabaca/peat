@@ -1184,6 +1184,24 @@ async fn a_replacing_copy_refuses_to_empty_or_lower_the_destination() {
         r.contains(&format!("Tenant/{TENANT_C} shard 0/0: not in the source")),
         "{r}"
     );
+    // --empty-destination from a source with pageservers: refused, pointing to --accept-older
+    let r = refused(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            emptying.clone(),
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(
+        r.contains("--empty-destination is for a source with no pageserver"),
+        "{r}"
+    );
+    assert!(r.contains("--accept-older"), "{r}");
     // Each loss is accepted by name: one named, the other still refused
     let b = format!("Tenant/{TENANT_B}");
     let c3 = format!("Tenant/{TENANT_C}");
