@@ -314,6 +314,7 @@ describe('the copy of records into Database objects', () => {
   })
   test('a held database whose namespace is gone is refused and its held data kept; a record whose object cannot be made is refused and the rest go on', async () => {
     const d = root('orders', hex('5'), { timeline: hex('6'), namespace: 'gone' })
+    sc.add(hex('5'), hex('6'))
     await hold(deps, d, new Date('2026-12-08T00:00:00Z'))
     k.forcedOnce.set('POST /apis/peat.zabaca.com/v1alpha1/namespaces/gone/databases', { status: 404, json: { message: 'namespaces "gone" not found' } }) // as the API server answers
     const r = await copyRecords(deps, { dry: false, held: ['orders'] })
@@ -343,6 +344,67 @@ describe('the copy of records into Database objects', () => {
   })
 })
 
+describe('the held restore and ports', () => {
+  const oldRecord = (name: string, data: Record<string, string>) => k.put({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: `db-${name}`, namespace: 'peat', labels: { 'peat-record': 'true' } }, data: { created: '2026-10-01T00:00:00Z', pg: '18', namespace: 'peat-db', ...data } })
+  test('records from before port claims: a held branch keeps its port, a branch made during the hold gets another, and the held one comes back on its own', async () => {
+    oldRecord('lake', { tenant: hex('1'), timeline: hex('2'), parent: '', root: 'true', mode: 'primary', port: '15010' })
+    oldRecord('lake-dev', { tenant: hex('1'), timeline: hex('3'), parent: 'lake', root: 'false', mode: 'primary', port: '15011' })
+    sc.add(hex('1'), hex('2')); sc.add(hex('1'), hex('3'), hex('2'))
+    await ensureLogin(deps, 'lake', hex('1'), () => 'pw')
+    expect((await copyRecords(deps, { dry: false })).countsEqual).toBe(true)
+    expect(cm('port-15011')).toBeUndefined() // no claims: the records are from before them
+    const dev = fromStatus(k.get('peat.zabaca.com/v1alpha1', 'databases', 'peat-db', 'lake-dev'))!
+    await hold(deps, dev, new Date('2026-12-08T00:00:00Z'))
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|databases|lake-dev'))!)
+    expect(cm('port-15011').data.owner).toBe('lake-dev')
+    // a branch made during the hold: 15011 is claimed, so it gets the next
+    const used = new Set([...(await readRecords(deps)).values()].map((r) => r.db.port))
+    expect(await claimPort(deps, 'lake-x', hex('4'), 15010, used)).toBe(15012)
+    const r = await copyRecords(deps, { dry: false, held: ['lake-dev'] })
+    expect(r.restored).toEqual([`lake-dev@${hex('3')}`])
+    expect(fromStatus(k.get('peat.zabaca.com/v1alpha1', 'databases', 'peat-db', 'lake-dev'))!.port).toBe(15011)
+  })
+  test('a held database whose port a live database holds now is refused', async () => {
+    const dev = root('lake-dev', hex('1'), { timeline: hex('3'), root: false, parent: 'lake', from: 'lake', port: 15011, namespace: 'peat-db' })
+    sc.add(hex('1'), hex('2')); sc.add(hex('1'), hex('3'), hex('2'))
+    await ensureLogin(deps, 'lake', hex('1'), () => 'pw')
+    object('lake', 'peat-db'); await save(deps, root('lake', hex('1'), { timeline: hex('2'), namespace: 'peat-db' }))
+    await hold(deps, dev, new Date('2026-12-08T00:00:00Z'))
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|configmaps|port-15011'))!) // as a claim-less hold left it
+    object('lake-x', 'peat-db'); await save(deps, root('lake-x', hex('1'), { timeline: hex('4'), root: false, parent: 'lake', from: 'lake', port: 15011, namespace: 'peat-db' }))
+    const r = await copyRecords(deps, { dry: false, held: ['lake-dev'] })
+    expect(r.refused).toEqual([{ name: 'lake-dev', why: 'its port 15011 is another database\'s now' }])
+    expect(heldNames()).toEqual([`held-lake-dev-${hex('3')}`])
+  })
+  test('two held roots of one name asked back together: the first comes back, the second is refused', async () => {
+    sc.add(hex('1'), hex('2')); sc.add(hex('5'), hex('6'))
+    const a = root('orders', hex('1'), { timeline: hex('2'), namespace: 'peat-db' }), b = root('orders', hex('5'), { timeline: hex('6'), namespace: 'peat-db', port: 15011 })
+    await hold(deps, a, new Date('2026-12-08T00:00:00Z'), new Date('2026-12-01T00:00:00Z'))
+    await hold(deps, b, new Date('2026-12-08T00:00:00Z'), new Date('2026-12-02T00:00:00Z'))
+    const r = await copyRecords(deps, { dry: false, held: [`orders@${hex('2')}`, `orders@${hex('6')}`] })
+    expect(r.restored).toEqual([`orders@${hex('2')}`])
+    expect(r.refused).toEqual([{ name: `orders@${hex('6')}`, why: 'the name is in use now: delete that database first' }])
+    expect(heldNames()).toEqual([`held-orders-${hex('6')}`])
+  })
+  test('a restore that fails after its object is made takes back the object and the record, and keeps the held data', async () => {
+    sc.add(hex('1'), hex('2'))
+    await hold(deps, root('orders', hex('1'), { timeline: hex('2'), namespace: 'peat-db' }), new Date('2026-12-08T00:00:00Z'))
+    k.forcedOnce.set(`DELETE /api/v1/namespaces/peat/configmaps/held-orders-${hex('2')}`, { status: 500, json: { message: 'down' } })
+    const r = await copyRecords(deps, { dry: false, held: ['orders'] })
+    expect(r.refused.map((x) => x.name)).toEqual(['orders'])
+    expect(k.get('peat.zabaca.com/v1alpha1', 'databases', 'peat-db', 'orders')).toBeUndefined()
+    expect(cm('db-orders')).toBeUndefined()
+    expect(heldNames()).toEqual([`held-orders-${hex('2')}`])
+  })
+  test('a held database whose timeline is no longer in the store (a replica of a purged branch) is refused', async () => {
+    sc.add(hex('1'), hex('2'))
+    await ensureLogin(deps, 'orders', hex('1'), () => 'pw')
+    object('orders', 'peat-db'); await save(deps, root('orders', hex('1'), { timeline: hex('2'), namespace: 'peat-db' }))
+    await hold(deps, root('orders-ro', hex('1'), { timeline: hex('3'), root: false, parent: 'orders', from: 'orders-dev', mode: 'replica', port: 0, namespace: 'peat-db' }), null)
+    expect((await copyRecords(deps, { dry: false, held: ['orders-ro'] })).refused).toEqual([{ name: 'orders-ro', why: 'its timeline is no longer in the store' }])
+  })
+})
+
 describe('a make under a name whose earlier database lost its record', () => {
   test('refused while the earlier data is in the store and nothing else names it; allowed when it is held, recorded or gone', async () => {
     await ensureLogin(deps, 'orders', hex('1'), () => 'pw')
@@ -350,6 +412,9 @@ describe('a make under a name whose earlier database lost its record', () => {
     sc.add(hex('1'), hex('2'))
     expect(await orphanedTenant(deps, 'orders', hex('5'))).toBe(hex('1'))
     expect(await orphanedTenant(deps, 'orders', hex('1'))).toBeNull() // the make's own (a second pass)
+    // a branch of it still recorded does not name it: the root's record is the one lost
+    object('orders-dev', 'shop'); await save(deps, root('orders-dev', hex('1'), { timeline: hex('3'), root: false, parent: 'orders', from: 'orders' }))
+    expect(await orphanedTenant(deps, 'orders', hex('5'))).toBe(hex('1'))
     await hold(deps, root('orders', hex('1'), { timeline: hex('2') }), new Date('2026-12-08T00:00:00Z'))
     expect(await orphanedTenant(deps, 'orders', hex('5'))).toBeNull() // held: a delete, not a loss
   })
