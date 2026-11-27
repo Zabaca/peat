@@ -46,14 +46,20 @@ export async function runStep(k: Kube, r: Resolved, storage: Storage, u: Upgrade
   }
   const pageserverId = pageserverOf(step)
   const ownNode = new RegExp(`\\bnode ${pageserverId}\\b`)
+  const keeperId = /^safekeeper-w(\d+)$/.exec(step)?.[1]
 
   if (phase === 'precheck' || phase === 'postcheck') {
     // the step's own piece is left out of the check before it: on the way back it is the broken piece the way back mends (so it can never
     // be ready first), and its node may still read Draining or PauseForRestart from an earlier attempt at this step
     const own = (name: string) => piecesOf(step).includes(name)
     const back = phase === 'precheck' && u.direction === 'back'
-    const storageProblems = (await storage.problems(back && pageserverId ? psIds.filter((x) => x !== pageserverId) : psIds).catch((e) => [String(e)]))
-      .filter((x) => !(phase === 'precheck' && pageserverId && (back ? ownNode.test(x) : /^node \d+ scheduling is/.test(x) && ownNode.test(x))))
+    // the storage readings that are the step's own piece's, left out on the way back: at the controller's step every reading (they all go
+    // through the controller, which may be the broken piece); at a pageserver's, its node's; at a keeper's, its own answer (the others
+    // must still answer: a write needs two of three)
+    const ownReading = (x: string) => (pageserverId ? ownNode.test(x) : keeperId ? x === `safekeeper ${keeperId} does not answer` : false)
+    const read = await storage.problems(back && pageserverId ? psIds.filter((x) => x !== pageserverId) : psIds).then((x) => ({ problems: x, failed: false }), (e) => ({ problems: [String(e)], failed: true }))
+    const storageProblems = back && step === 'controller' && read.failed ? []
+      : read.problems.filter((x) => !(phase === 'precheck' && (back ? ownReading(x) : pageserverId && /^node \d+ scheduling is/.test(x) && ownNode.test(x))))
     const problems = [...notReady.filter((x) => !(back && own(x))).map((x) => `${x} is not ready`), ...storageProblems]
     // a keeper is restarted only with the others answering (a write needs two of three) and no keeper replacement open (the control layer
     // is moving a member)
@@ -68,15 +74,20 @@ export async function runStep(k: Kube, r: Resolved, storage: Storage, u: Upgrade
     return advance(`${step}: the check passed`, { lastCheck })
   }
   if (phase === 'draining') {
-    const n = await storage.node(pageserverId)
-    // a pageserver that is not available has nothing attached to drain (the controller moved its shards when it went): on the way back the
-    // broken one is restarted at once
-    if (n && n.availability !== 'Active' && u.direction === 'back') return advance(`pageserver ${pageserverId} is not available: nothing to drain`)
-    const d = await storage.drained(pageserverId)
-    if (d.done) return advance(`pageserver ${pageserverId} drained`)
-    // asked again whenever the node reads Active: a drain the controller ended (its own restart, a cancel) is started again
-    if (n && n.scheduling === 'Active') await storage.drain(pageserverId)
-    return wait(`draining: ${d.why}`)
+    // a reading or a drain the controller refuses (no node to drain to, the controller restarting) is a wait, bounded by checkTimeout: the
+    // upgrade halts there, never aborts every pass
+    try {
+      const n = await storage.node(pageserverId)
+      // an offline pageserver has nothing attached to drain (the controller moved its shards when it went): on the way back the broken one
+      // is restarted at once (WarmingUp is not offline: it may serve shards)
+      if (n && n.availability === 'Offline' && u.direction === 'back') return advance(`pageserver ${pageserverId} is offline: nothing to drain`)
+      const d = await storage.drained(pageserverId)
+      if (d.done) return advance(`pageserver ${pageserverId} drained`)
+      // asked again whenever the node reads Active: a drain the controller ended (its own restart) is started again; so is one a person
+      // cancelled, until checkTimeout halts the upgrade
+      if (n && n.scheduling === 'Active') await storage.drain(pageserverId)
+      return wait(`draining: ${d.why}`)
+    } catch (e) { return wait(`draining: ${String(e).slice(0, 200)}`) }
   }
   if (phase === 'applying') {
     // the operator's own pieces were rendered at the step's images in this pass; a safekeeper is the control layer's StatefulSet, changed here

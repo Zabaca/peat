@@ -359,13 +359,15 @@ describe('keeping it as declared', () => {
     expect(k.get('batch/v1', 'jobs', 'peat', 'keeper-prep')).toBeUndefined()
     expect(k.get('batch/v1', 'jobs', 'peat', 'someone-elses')).toBeDefined()
   })
-  test('a release changed reaches every piece the operator makes (the ordered upgrade replaces this in a later change)', async () => {
+  test('a release changed before the platform was ever Ready still goes through the ordered upgrade: the pieces that run are where it starts', async () => {
     k.put(platform())
     await reconcile(k)
+    // not Ready (nothing rolled out in this API server), so no release was recorded; the live pieces say what runs
+    expect(k.get('peat.zabaca.com/v1alpha1', 'platforms', null, 'peat').status.release).toBeUndefined()
     k.put(platform({ release: 'release-2026-12-15' }))
-    await reconcile(k)
-    expect(k.get('apps/v1', 'deployments', 'peat', 'storage-controller').spec.template.spec.containers[0].image).toBe('ghcr.io/zabaca/peat/storage:release-2026-12-15')
-    expect(k.get('apps/v1', 'deployments', 'peat', 'peat-control').spec.template.spec.containers[0].image).toBe('ghcr.io/zabaca/peat/control:release-2026-12-15')
+    const r = await reconcile(k)
+    expect(r.phase).toBe('Upgrading')
+    expect(k.get('apps/v1', 'deployments', 'peat', 'peat-control').spec.template.spec.containers[0].image).toBe('ghcr.io/zabaca/peat/control:release-2026-12-01')
   })
 })
 
