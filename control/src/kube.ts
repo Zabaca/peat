@@ -11,15 +11,18 @@ export interface Kube {
   request(method: string, path: string, body?: unknown, contentType?: string): Promise<Answer>
   /** The namespace the login points at (a pod's own, or the kubeconfig context's). */
   namespace: string
+  /** Where it acts, for a person to read: the kubeconfig context and its server. */
+  where?: string
 }
 
 const SA = '/var/run/secrets/kubernetes.io/serviceaccount'
 
-interface Conn { server: string; ca?: string; cert?: string; key?: string; insecure?: boolean; token: () => string | undefined; namespace: string }
+interface Conn { server: string; ca?: string; cert?: string; key?: string; insecure?: boolean; token: () => string | undefined; namespace: string; where?: string }
 
 function client(c: Conn): Kube {
   return {
     namespace: c.namespace,
+    ...(c.where ? { where: c.where } : {}),
     async request(method, path, body, contentType = 'application/json') {
       const token = c.token()
       const r = await fetch(`${c.server}${path}`, {
@@ -54,15 +57,22 @@ const file = (p: string | undefined, base: string) => (p ? readFileSync(p.starts
 
 /** The first kubeconfig file of KUBECONFIG (or ~/.kube/config), and the context to use. */
 export function fromKubeconfig(opts: { path?: string; context?: string; namespace?: string } = {}): Kube {
-  const path = opts.path ?? (process.env['KUBECONFIG'] ?? '').split(':').find(Boolean) ?? join(homedir(), '.kube', 'config')
-  if (!existsSync(path)) throw new Error(`no kubeconfig at ${path}: set KUBECONFIG, or log in to the cluster as kubectl would`)
-  const cfg = Bun.YAML.parse(readFileSync(path, 'utf8')) as any
-  const base = path.replace(/\/[^/]*$/, '') || '.'
-  const ctxName = opts.context ?? cfg['current-context']
-  const ctx = (cfg.contexts ?? []).find((c: any) => c.name === ctxName)?.context
+  // a list of files joined by ':' is read as kubectl reads it: each name (context, cluster, user) from the first file that has it, the
+  // current context from the first file that sets one; a file's relative paths are relative to that file
+  const paths = (opts.path ?? (process.env['KUBECONFIG'] || join(homedir(), '.kube', 'config'))).split(':').filter(Boolean)
+  const files = paths.filter((p) => existsSync(p)).map((p) => ({ cfg: (Bun.YAML.parse(readFileSync(p, 'utf8')) ?? {}) as any, base: p.replace(/\/[^/]*$/, '') || '.' }))
+  if (!files.length) throw new Error(`no kubeconfig at ${paths.join(':')}: set KUBECONFIG, or log in to the cluster as kubectl would`)
+  const named = (list: 'contexts' | 'clusters' | 'users', name: string): { value: any; base: string } | undefined => {
+    for (const f of files) { const hit = (f.cfg[list] ?? []).find((x: any) => x.name === name); if (hit) return { value: hit[list.slice(0, -1)], base: f.base } }
+    return undefined
+  }
+  const ctxName = opts.context ?? files.map((f) => f.cfg['current-context']).find(Boolean)
+  const ctx = named('contexts', ctxName)?.value
   if (!ctx) throw new Error(`the kubeconfig has no context ${JSON.stringify(ctxName)}`)
-  const cluster = (cfg.clusters ?? []).find((c: any) => c.name === ctx.cluster)?.cluster
-  const user = (cfg.users ?? []).find((u: any) => u.name === ctx.user)?.user ?? {}
+  const clusterHit = named('clusters', ctx.cluster), userHit = named('users', ctx.user)
+  const cluster = clusterHit?.value
+  const user = userHit?.value ?? {}
+  const base = userHit?.base ?? files[0]!.base, clusterBase = clusterHit?.base ?? files[0]!.base
   if (!cluster?.server) throw new Error(`the kubeconfig's context ${ctxName} names no cluster with a server`)
   let cached: { token: string; until: number } | undefined
   const token = (): string | undefined => {
@@ -82,12 +92,13 @@ export function fromKubeconfig(opts: { path?: string; context?: string; namespac
   }
   return client({
     server: String(cluster.server).replace(/\/$/, ''),
-    ca: b64(cluster['certificate-authority-data']) ?? file(cluster['certificate-authority'], base),
+    ca: b64(cluster['certificate-authority-data']) ?? file(cluster['certificate-authority'], clusterBase),
     cert: b64(user['client-certificate-data']) ?? file(user['client-certificate'], base),
     key: b64(user['client-key-data']) ?? file(user['client-key'], base),
     insecure: cluster['insecure-skip-tls-verify'] === true,
     token,
     namespace: opts.namespace ?? ctx.namespace ?? 'default',
+    where: `context ${ctxName} at ${String(cluster.server).replace(/\/$/, '')}`,
   })
 }
 

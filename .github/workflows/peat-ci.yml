@@ -405,6 +405,48 @@ jobs:
       - name: Tests (the public-names check among them)
         run: bun test
 
+      # The peat command as one file per platform (Bun compiles the program with its runtime), kept with the run and attached to a
+      # release tag (command-release, below). Not on pull requests: each target downloads a runtime of its own; the install test
+      # compiles the command for its own runner and drives that file, on pull requests too.
+      - name: The peat command, one file per platform
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p "$RUNNER_TEMP/peat-command"
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            bun build src/cli/peat.ts --compile --target="bun-$target" --outfile "$RUNNER_TEMP/peat-command/peat-$target"
+          done
+          (cd "$RUNNER_TEMP/peat-command" && sha256sum peat-* > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          name: peat-command
+          path: ${{ runner.temp }}/peat-command
+          retention-days: 7
+
+  # A release tag gets the peat command's four files and their SHA256SUMS on its GitHub release (made if there is none). The only
+  # job with write access to the repository's contents, and only on a release-* tag, which only admins create. (No such tag exists yet.)
+  command-release:
+    name: the peat command on the release
+    if: startsWith(github.ref, 'refs/tags/release-')
+    needs: control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: peat-command
+          path: peat-command
+      - name: Attach the files to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --notes "The peat command for Linux and macOS, with SHA256SUMS."
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber peat-command/peat-* peat-command/SHA256SUMS
+
   # The install test (.github/peat/install-test.sh): a whole platform installed from the install
   # file and one Platform on a throwaway kind cluster on the runner, a database made, written,
   # read back with verify-full, put to sleep and woken by a connection. On a pull request it

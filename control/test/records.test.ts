@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { COPYING } from '../src/databases'
-import { TENANT_ANNOTATION, beginMaking, claimPort, copyRecords, endMaking, ensureLogin, fromConfigMap, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save, unfinishedMake, type Db, type Deps } from '../src/records'
+import { TENANT_ANNOTATION, beginMaking, knownDb, claimPort, copyRecords, endMaking, ensureLogin, fromConfigMap, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save, unfinishedMake, type Db, type Deps } from '../src/records'
 import { FakeKube } from './fake-kube'
 
 // A database's record kept twice (its object's status and a ConfigMap in the platform namespace), the hold of a deleted one's data, its
@@ -69,6 +69,24 @@ describe('the record, in the status and in the platform namespace', () => {
   test('a record from before Database objects reads as one of the database namespace, with no parent it was made from', () => {
     const old = fromConfigMap({ metadata: { name: 'db-lake', creationTimestamp: '2026-10-01T00:00:00Z' }, data: { tenant: hex('a'), timeline: hex('b'), parent: '', root: 'true', mode: 'primary', port: '15011', pg: '18' } }, 'peat-db')
     expect(old).toMatchObject({ name: 'lake', namespace: 'peat-db', from: '', created: '2026-10-01T00:00:00Z', pg: 18, port: 15011 })
+  })
+})
+
+describe('a database known to the compute reconciler', () => {
+  test('by its status, or by the platform\'s record when the status is wiped or no Database object exists yet (a switch before the copy)', async () => {
+    const d = root('orders', hex('a'))
+    object('orders', 'shop')
+    await save(deps, d)
+    const statuses = (objs: any[]) => new Map(objs.map(fromStatus).filter((x): x is Db => x !== null).map((x) => [x.name, x]))
+    expect(knownDb('orders', statuses(k.all('databases')), await readRecords(deps))).toEqual(d)
+    // a wiped status
+    k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status = {}
+    expect(knownDb('orders', statuses(k.all('databases')), await readRecords(deps))).toEqual(d)
+    // records and no Database objects at all
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|databases|orders'))!)
+    expect(knownDb('orders', statuses(k.all('databases')), await readRecords(deps))).toEqual(d)
+    // nothing knows it
+    expect(knownDb('lake', statuses(k.all('databases')), await readRecords(deps))).toBeNull()
   })
 })
 

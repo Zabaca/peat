@@ -20,7 +20,7 @@ import { ancestorFor, olderTimelineFor, ownMemberProbe, recoverDecision, recover
 import { GROUP, controlUrl, fromEnv, frontDoor, parseLabel, placement } from './names'
 import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
-import { DB_API, HELD_SELECTOR, beginMaking, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
+import { DB_API, HELD_SELECTOR, beginMaking, knownDb, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 
 const NAMES = fromEnv()
 const NS = NAMES.namespace // the control layer, the storage, the records, the leases
@@ -597,13 +597,16 @@ async function reconcileComputes() {
   if (!isLeader) return
   await reapHaPods()
   const pods = ok(await kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=app%3Dpeat-compute`), 'list compute pods').json.items as any[]
+  // a database is known by its object's status or by the platform's record of it: a status wiped, or a switch before the copy has made
+  // the Database objects, leaves the record, and a serving compute is not killed for that
   const dbs = new Map((await listDbs()).map((d) => [d.name, d]))
+  const recs = await readRecords(RECORDS)
   const live = new Set<string>()
   await Promise.all(pods.map(async (p) => {
     if (p.metadata.deletionTimestamp && !(p.spec?.nodeName && nodeStates.get(p.spec.nodeName)?.dead)) return
     live.add(p.metadata.uid)
     const name = p.metadata.labels?.compute as string
-    const d = dbs.get(name) ?? null
+    const d = knownDb(name, dbs, recs)
     const age = (Date.now() - Date.parse(p.metadata.creationTimestamp)) / 1000
     try {
       if (!d) return await replaceCompute(p, null, 'unknown: no database record')
@@ -1434,7 +1437,10 @@ async function reconcileDatabases() {
       else if (act.do === 'refuse') { if (o.status?.message !== act.why) await patchDbStatus(ns, name, s ? { message: act.why } : { phase: 'Failed', message: act.why }) }
       else if (act.do === 'wait') { if (o.status?.message !== act.why) await patchDbStatus(ns, name, { ...(s ? {} : { phase: 'Creating' }), message: act.why }) }
       else if (act.do === 'rebuild') {
-        await saveDb(recs.get(name)!.db, o.spec?.closed ? { phase: 'Closed', message: "closed: its status was written again from the platform's record of it" } : { phase: 'Ready', message: "ready: its status was written again from the platform's record of it" })
+        // the requests its spec holds now count as answered: the status that said so is gone, and a stop answered before the wipe is not
+        // run again on a database a client may be using (a request not yet answered when the status went is dropped: ask again)
+        const answered = Object.fromEntries(Object.entries(o.spec?.requests ?? {}).filter(([, v]) => typeof v === 'string' && v))
+        await saveDb(recs.get(name)!.db, { ...(o.spec?.closed ? { phase: 'Closed', message: "closed: its status was written again from the platform's record of it" } : { phase: 'Ready', message: "ready: its status was written again from the platform's record of it" }), ...(Object.keys(answered).length ? { answered } : {}) })
         await endMaking(RECORDS, name).catch((e) => console.log(`database ${key}: release its claim: ${e}`))
         console.log(`database: ${key}: its status written again from its record`)
       } else if (act.do === 'make') {
