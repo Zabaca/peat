@@ -73,6 +73,9 @@ export function fromConfigMap(cm: any, dbNs: string): Db {
 }
 const recordData = (r: Db) => ({ tenant: r.tenant, timeline: r.timeline, parent: r.parent, from: r.from, root: String(r.root), mode: r.mode, port: String(r.port), created: r.created, pg: String(r.pg), namespace: r.namespace })
 
+/** A database by name: its object's status (`fromStatuses`), else the platform's record of it, else null (nothing knows it). */
+export const knownDb = (name: string, fromStatuses: Map<string, Db>, records: Map<string, { db: Db }>): Db | null => fromStatuses.get(name) ?? records.get(name)?.db ?? null
+
 /** Every record in the platform namespace, by name, with its ConfigMap. */
 export async function readRecords(d: Deps): Promise<Map<string, { db: Db; cm: any }>> {
   const items = ok(await d.kube('GET', `${cms(d)}?labelSelector=${RECORD_LABEL}%3Dtrue`), 'list the records').json.items as any[]

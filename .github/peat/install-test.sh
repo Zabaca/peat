@@ -27,7 +27,7 @@ since() { echo "$(( $(date +%s) - $1 ))"; }
 pids=()
 finish() {
   rc=$?
-  for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+  for p in "${pids[@]}"; do pkill -P "$p" 2>/dev/null || true; kill "$p" 2>/dev/null || true; done
   if [ "$rc" != 0 ]; then
     echo "::group::the cluster as the test left it"
     k get platform -o yaml 2>/dev/null | sed -n '/^  status:/,$p' || true
@@ -36,6 +36,7 @@ finish() {
     for ns in peat-system peat peat-gateway peat-compute; do
       for p in $(k -n "$ns" get pods -o name 2>/dev/null); do echo "--- $ns $p"; k -n "$ns" logs "$p" --all-containers --tail=80 2>/dev/null || true; done
     done
+    for f in "$work"/tunnel-*.log; do [ -f "$f" ] && { echo "--- $(basename "$f")"; tail -40 "$f"; }; done
     echo "::endgroup::"
   fi
   [ "${KEEP:-}" = 1 ] || "$kind" delete cluster --name "$cluster" >/dev/null 2>&1 || true
@@ -192,10 +193,23 @@ spec:
   objectStore: { endpoint: "http://minio.store.svc:9000", bucket: peat, credentialsSecret: peat-store }
 EOF
 
+# The tunnels to the control layer and the front door. kubectl port-forward ends when its stream is lost (seen under a client that
+# reconnects ten times a second), so each runs in a loop that starts it again, its errors kept for the failure dump, and every step
+# from here on first checks that both answer.
+tunnel() { # tunnel <name> <namespace> <service> <ports>
+  ( while :; do k -n "$2" port-forward "svc/$3" "$4" >>"$work/tunnel-$1.log" 2>&1; echo "$(date -u +%H:%M:%S) ended; started again" >>"$work/tunnel-$1.log"; sleep 1; done ) &
+  pids+=($!)
+}
+tunnel_up() { # tunnel_up <port>: it accepts a connection within 30 s
+  local t0; t0=$(date +%s)
+  until (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; do [ "$(since "$t0")" -lt 30 ] || fail "the tunnel to port $1 does not answer"; sleep 1; done
+}
+step() { echo "== $*"; tunnel_up 18080; tunnel_up 15432; }
+
 echo "== a database, through the control layer"
-k -n peat port-forward svc/peat-control 18080:8080 >/dev/null 2>&1 & pids+=($!)
-k -n peat-gateway port-forward svc/pg-front 15432:5432 >/dev/null 2>&1 & pids+=($!)
-sleep 3
+tunnel control peat peat-control 18080:8080
+tunnel front peat-gateway pg-front 15432:5432
+tunnel_up 18080; tunnel_up 15432
 made=$(curl -fsS -X POST localhost:18080/db -H 'content-type: application/json' -d '{"name":"first"}') || fail "the control layer did not make a database"
 echo "  $made" | cut -c1-300
 k -n peat-db get configmap peat-ca -o jsonpath='{.data.ca\.crt}' > "$work/ca.crt"
@@ -210,7 +224,7 @@ sql "insert into t select g, md5(g::text) from generate_series(1, 100000) g"
 [ "$(sql 'select count(*) from t')" = 100000 ] || fail 'the rows written were not read back'
 echo "  first answer $first_s s after the make; 100000 rows written and read back with verify-full"
 
-echo "== asleep, then woken by a connection"
+step "asleep, then woken by a connection"
 curl -fsS -X POST localhost:18080/db/first/stop >/dev/null || fail 'the stop was refused'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=first -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'the compute did not go'; sleep 2; done
 t0=$(date +%s)
@@ -219,7 +233,7 @@ wake_s=$(since "$t0")
 [ "$count" = 100000 ] || fail "after the wake the count was $count"
 echo "  woken in $wake_s s by a connection; the rows are all there"
 
-echo "== a database as an object, in a namespace of its own"
+step "a database as an object, in a namespace of its own"
 k create namespace shop
 dbobj() { k apply -f - <<EOF
 apiVersion: peat.zabaca.com/v1alpha1
@@ -250,7 +264,7 @@ sleep 2; moment=$(date -u +%Y-%m-%dT%H:%M:%SZ); sleep 2
 shop 'insert into items select generate_series(1001, 3000)' "$shop_host"
 echo "  orders: made as an object, its login and the authority's certificate published in shop, 3000 rows (1000 before $moment)"
 
-echo "== a branch and a restore to a moment"
+step "a branch and a restore to a moment"
 dbobj orders-dev 'parent: orders'
 dbobj orders-then "parent: orders, at: \"$moment\""
 phase_is orders-dev Ready 120
@@ -263,7 +277,7 @@ then_count=$(shop 'select count(*) from items' orders-then.peat-db.svc)
 [ "$(shop 'select count(*) from items' "$shop_host")" = 3000 ] || fail 'the parent changed'
 echo "  the branch reads 3000 rows; the restore to $moment reads 1000; orders still 3000"
 
-echo "== its status wiped, then written again from the platform's record"
+step "its status wiped, then written again from the platform's record"
 before=$(k -n shop get database orders -o jsonpath='{.status.tenant}/{.status.timeline}/{.status.record.port}')
 k -n shop patch database orders --subresource=status --type merge -p '{"status":null}'
 phase_is orders Ready 60
@@ -273,7 +287,7 @@ after=$(k -n shop get database orders -o jsonpath='{.status.tenant}/{.status.tim
 t0=$(date +%s); until [ "$(shop 'select count(*) from items' "$shop_host" 2>/dev/null)" = 3000 ]; do [ "$(since "$t0")" -lt 60 ] || fail 'after the status was written again, orders does not read its rows'; sleep 2; done
 echo "  the same tenant, timeline and port, and the 3000 rows, $(since "$t0") s later"
 
-echo "== closed with a client reconnecting, then opened"
+step "closed with a client reconnecting, then opened"
 # a pooled client: a connection every 100 ms, so one arrives the moment the close ends the sessions
 ( while :; do shop 'select 1' "$shop_host" >/dev/null 2>&1 || true; sleep 0.1; done ) &
 pool=$!
@@ -282,6 +296,7 @@ k -n shop patch database orders --type merge -p '{"spec":{"closed":true}}'
 phase_is orders Closed 60
 sleep 10
 kill "$pool" 2>/dev/null || true; wait "$pool" 2>/dev/null || true
+tunnel_up 15432
 [ "$(k -n peat-compute get deployment compute-orders -o jsonpath='{.spec.replicas}')" = 0 ] || fail 'a client reconnecting as the database closed woke it'
 if k -n peat-compute get pods -l compute=orders -o name 2>/dev/null | grep -q .; then fail 'a closed database still runs a compute'; fi
 [ "$(k -n shop get database orders -o jsonpath='{.status.awake}')" = false ] || fail 'a closed database reads awake'
@@ -291,14 +306,14 @@ phase_is orders Ready 60
 t0=$(date +%s); until shop 'select count(*) from items' "$shop_host" >/dev/null 2>&1; do [ "$(since "$t0")" -lt 120 ] || fail 'an opened database did not admit a connection'; sleep 3; done
 echo "  the compute stopped and stayed stopped with a client reconnecting; a connection refused while closed, admitted once opened"
 
-echo "== deleted: the compute at once, the data held"
+step "deleted: the compute at once, the data held"
 k -n shop delete database orders-then --timeout=120s
 if k -n peat-compute get deployment compute-orders-then >/dev/null 2>&1; then fail 'the compute of a deleted database is still there'; fi
 held=$(k -n peat get configmap -l peat-held=true -o jsonpath='{range .items[?(@.data.name=="orders-then")]}{.data.deleteAfter}{end}')
 [ -n "$held" ] || fail 'no hold was recorded for the deleted data'
 echo "  orders-then deleted: its compute gone, its data held until $held"
 
-echo "== the peat command, through the test's own login"
+step "the peat command, through the test's own login"
 peatc() { (cd "$root/control" && bun src/cli/peat.ts "$@"); }
 peatc make cli-made -n shop --timeout 120 || fail 'peat make failed'
 peatc list -n shop | grep -q '^shop/cli-made  Ready' || fail 'peat list does not show the database it made'
