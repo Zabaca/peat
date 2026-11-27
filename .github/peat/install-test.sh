@@ -27,6 +27,11 @@ export KUBECONFIG="$work/kubeconfig"
 k() { kubectl --context "kind-$cluster" "$@"; }
 started=$(date +%s)
 since() { echo "$(( $(date +%s) - $1 ))"; }
+# the name of a pod that is ready and not on its way out: a deleted pod is replaced at once (a Deployment's Recreate holds only for a
+# rollout), and the old one can still read ready beside the new one
+ready_pod() { # ready_pod <namespace> <label selector>
+  k -n "$1" get pods -l "$2" -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null | awk 'NF == 1 { print $1; exit }'
+}
 pids=()
 finish() {
   rc=$?
@@ -281,7 +286,7 @@ if [ "$records" = kubernetes ]; then
   step "the storage controller's pod deleted and made again: the new one leads at its own address, the copy current, a new database attached"
   old_ctl=$(k -n peat get pods -l app=storage-controller -o jsonpath='{.items[0].metadata.name}')
   k -n peat delete pod "$old_ctl" --wait=false >/dev/null
-  t0=$(date +%s); until new_ctl=$(k -n peat get pods -l app=storage-controller -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null) && [ -n "$new_ctl" ] && [ "$new_ctl" != "$old_ctl" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'no new storage controller was ready in 180 s'; sleep 2; done
+  t0=$(date +%s); until new_ctl=$(ready_pod peat app=storage-controller) && [ -n "$new_ctl" ] && [ "$new_ctl" != "$old_ctl" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'no new storage controller was ready in 180 s'; sleep 2; done
   new_ip=$(k -n peat get pod "$new_ctl" -o jsonpath='{.status.podIP}')
   # the Leader record names the new pod by its own address, not the Service's
   t0=$(date +%s); until case "$(k -n peat get leaders.storagecontroller.peat.zabaca.com leader -o jsonpath='{.spec.address}' 2>/dev/null)" in "http://$new_ip:1234"*) true;; *) false;; esac; do
@@ -564,7 +569,7 @@ sssql 'create table w (id int primary key)'
 curl -fsS -X POST localhost:18080/db/ss18/stop >/dev/null || fail 'ss18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=ss18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'ss18 did not stop'; sleep 2; done
 k -n shop patch database ss18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
-t0=$(date +%s); until ss_pod=$(k -n peat-compute get pods -l compute=ss18 -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null) && [ -n "$ss_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
+t0=$(date +%s); until ss_pod=$(ready_pod peat-compute compute=ss18) && [ -n "$ss_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 [ "$(k -n shop get database ss18 -o jsonpath='{.status.phase}')" = Moving ] || fail 'the source was started, but the door is not shut'
 # straight to the source, a session that writes a row every 0.3 s and prints each one written (psql stops at the first error)
 k -n peat-compute port-forward "pod/$ss_pod" 25432:5432 >>"$work/tunnel-ss.log" 2>&1 &
@@ -606,7 +611,7 @@ swsql "create table big as select g as id, md5(g::text) as note from generate_se
 curl -fsS -X POST localhost:18080/db/sw18/stop >/dev/null || fail 'sw18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=sw18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'sw18 did not stop'; sleep 2; done
 k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
-t0=$(date +%s); until sw_pod=$(k -n peat-compute get pods -l compute=sw18 -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
+t0=$(date +%s); until sw_pod=$(ready_pod peat-compute compute=sw18) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 k -n peat-compute port-forward "pod/$sw_pod" 25433:5432 >>"$work/tunnel-sw.log" 2>&1 &
 pids+=($!); sw_tunnel=$!
 tunnel_up 25433

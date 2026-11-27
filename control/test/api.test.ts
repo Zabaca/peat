@@ -120,6 +120,20 @@ describe('the CustomResourceDefinitions', () => {
       'at is the moment of a parent', 'not both', 'parent cannot change', 'at cannot change', 'replicaOf cannot change', 'pgVersion is never lowered',
     ]) expect([message, text.includes(message)]).toEqual([message, true])
   })
+  test('the store\'s endpoint, region, buckets and prefixes take no quote, newline, $, backtick or backslash (they are written inside quotes into the pieces\' settings)', () => {
+    const store = (o: Record<string, unknown>) => check(platformSpec, { release: 'r', objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's', ...o } })
+    expect(store({})).toEqual([])
+    expect(store({ region: 'auto', records: { bucket: 'records-1', credentialsSecret: 's', prefix: 'storage-controller/' } })).toEqual([])
+    for (const bad of ["it's", 'a\nb', 'a\rb', 'a"b', 'a$b', 'a`b', 'a\\b']) {
+      expect(store({ endpoint: `https://s3.example.com/${bad}` }), bad).toHaveLength(1)
+      expect(store({ region: bad }), bad).toHaveLength(1)
+      expect(store({ bucket: bad }), bad).toHaveLength(1)
+      expect(store({ records: { bucket: 'r', credentialsSecret: 's', prefix: bad } }), bad).toHaveLength(1)
+      expect(store({ pageservers: { bucket: bad, credentialsSecret: 's' } }), bad).toHaveLength(1)
+    }
+    // the CustomResourceDefinition carries it for the API server
+    expect(JSON.stringify(all)).toContain(JSON.stringify(String.raw`^[^'"$\x60\\\n\r]*$`))
+  })
   test('every duration is written one way: a number and s, m, h or d', () => {
     expect(check(platformSpec, { ...{ release: 'r', objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's' } }, computes: { idleAfter: '30 minutes' } })).toHaveLength(1)
     expect(check(databaseSpec, { idleAfter: '5m', keepOldFor: '30d' })).toEqual([])
