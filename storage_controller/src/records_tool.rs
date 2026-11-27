@@ -175,23 +175,26 @@ pub async fn compare(
     ))
 }
 
-/// Whether a copy may replace what the destination holds, and what it may lose doing so.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Replace {
+/// Whether a copy may replace what the destination holds, what it may lose doing so, and whether
+/// it goes without the bucket.
+#[derive(Clone, Debug, Default)]
+pub struct CopyOptions {
     /// Remove what the destination holds first (`--replace`).
     pub replace: bool,
-    /// With `replace`: the source holds no pageserver, and the destination is meant to be
-    /// emptied (`--empty-destination`).
+    /// With `replace`: the destination is meant to be emptied, so a source with no pageserver is
+    /// copied, and nothing the destination loses is counted (`--empty-destination`).
     pub empty_destination: bool,
-    /// With `replace`: the destination holds a shard at a higher generation than the source, a
-    /// timeline at a higher membership generation, or one the source lacks, and these are meant
-    /// to go (`--accept-older`).
-    pub accept_older: bool,
+    /// With `replace`: records (`<Kind>/<name>`) the destination holds that the source lowers or
+    /// drops, each meant to go (`--accept-older`).
+    pub accept_older: BTreeSet<String>,
+    /// From Kubernetes into Postgres: go without the bucket copy's check of the source
+    /// (`--no-bucket-check`).
+    pub no_bucket_check: bool,
 }
 
-impl From<bool> for Replace {
+impl From<bool> for CopyOptions {
     fn from(replace: bool) -> Self {
-        Replace {
+        CopyOptions {
             replace,
             ..Default::default()
         }
@@ -203,15 +206,16 @@ pub async fn copy(
     stores: &Stores,
     from: Store,
     to: Store,
-    replace: impl Into<Replace>,
+    options: impl Into<CopyOptions>,
     running: &Running,
     accept_remade: &BTreeSet<String>,
 ) -> anyhow::Result<Outcome> {
-    let Replace {
+    let CopyOptions {
         replace,
         empty_destination,
         accept_older,
-    } = replace.into();
+        no_bucket_check,
+    } = options.into();
     if from == Store::Bucket || to == Store::Bucket {
         return Ok(Outcome::Refused(
             "copy moves records between postgres and kubernetes; the bucket is read by restore"
@@ -240,19 +244,32 @@ pub async fn copy(
                 records.counts()
             )));
         }
-        // Nothing the destination holds is lowered or dropped unless that is meant
-        let held = stores.open(to, false).await?.read_all_records().await?;
-        let older = older_than(&records, &held, accept_remade);
-        if !older.is_empty() && !accept_older {
+        // Nothing the destination holds is lowered or dropped unless each is named as meant
+        // (opened for writing, so a new Postgres has its tables to be read)
+        let held = stores.open(to, true).await?.read_all_records().await?;
+        let older: Vec<String> = older_than(&records, &held)
+            .into_iter()
+            .filter(|(key, _)| !accept_remade.contains(key) && !accept_older.contains(key))
+            .map(|(_, what)| what)
+            .collect();
+        if !older.is_empty() && !empty_destination {
             return Ok(Outcome::Refused(format!(
                 "the destination holds what the source would lower or drop: {older:?}; give \
-                 --accept-older too if that is meant"
+                 --accept-older with each record (<Kind>/<name>) meant to go"
             )));
         }
     }
     if to == Store::Postgres {
-        // Back into Postgres: checked against the copy's highest-ever values too when the
-        // bucket is given
+        // Back into Postgres: checked against the copy's highest-ever values too. A Kubernetes
+        // install always has the bucket, so the check is skipped only when asked.
+        if stores.records_copy_storage.is_none() && !no_bucket_check {
+            return Ok(Outcome::Refused(
+                "copy --from kubernetes --to postgres needs --records-copy-storage, to check the \
+                 source against the copy's highest-ever values; give --no-bucket-check to go \
+                 without"
+                    .to_string(),
+            ));
+        }
         if stores.records_copy_storage.is_some() {
             if let Some(old) = stores.bucket().await?.read().await? {
                 let stale = below_highest(&records, &old, accept_remade);
@@ -303,53 +320,74 @@ pub async fn copy(
     Ok(outcome)
 }
 
-/// What `held` (the destination) has that `source` would lower or drop: a shard at a higher
-/// generation or missing from the source, a timeline at a higher membership generation or missing.
-/// Records named in `accept_remade` (remade under their id, so lower) are not counted.
-fn older_than(source: &Records, held: &Records, accept_remade: &BTreeSet<String>) -> Vec<String> {
+/// What `held` (the destination) has that `source` would lower or drop, by record key: a shard at
+/// a higher generation or missing from the source, a timeline at a higher membership generation or
+/// missing. A shard the source holds split (its children, at a higher shard count, each at or
+/// above its generation) is not missing.
+fn older_than(source: &Records, held: &Records) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (name, t) in &held.tenants {
         let key = record_key(TenantSpec::KIND, name);
-        if accept_remade.contains(&key) {
-            continue;
-        }
+        let theirs = source.tenants.get(name);
         for shard in &t.shards {
-            let theirs = source.tenants.get(name).and_then(|s| {
+            let at = format!("{key} shard {}/{}", shard.shard_number, shard.shard_count);
+            let same = theirs.and_then(|s| {
                 s.shards.iter().find(|x| {
                     (x.shard_number, x.shard_count) == (shard.shard_number, shard.shard_count)
                 })
             });
-            let at = format!("{key} shard {}/{}", shard.shard_number, shard.shard_count);
-            match theirs {
-                None => out.push(format!("{at}: not in the source")),
-                Some(s) if s.generation < shard.generation => out.push(format!(
-                    "{at}: generation {:?}, the source has {:?}",
-                    shard.generation, s.generation
+            match same {
+                Some(s) if s.generation < shard.generation => out.push((
+                    key.clone(),
+                    format!(
+                        "{at}: generation {:?}, the source has {:?}",
+                        shard.generation, s.generation
+                    ),
                 )),
                 Some(_) => {}
+                None if theirs.is_some_and(|s| split_covers(&s.shards, shard)) => {}
+                None => out.push((key.clone(), format!("{at}: not in the source"))),
             }
         }
     }
     for (name, t) in &held.timelines {
         let key = record_key(TimelineSpec::KIND, name);
-        if accept_remade.contains(&key) {
-            continue;
-        }
         let Some(m) = &t.membership else { continue };
         match source
             .timelines
             .get(name)
             .and_then(|s| s.membership.as_ref())
         {
-            None => out.push(format!("{key}: not in the source")),
-            Some(s) if s.generation < m.generation => out.push(format!(
-                "{key}: membership generation {}, the source has {}",
-                m.generation, s.generation
+            None => out.push((key.clone(), format!("{key}: not in the source"))),
+            Some(s) if s.generation < m.generation => out.push((
+                key.clone(),
+                format!(
+                    "{key}: membership generation {}, the source has {}",
+                    m.generation, s.generation
+                ),
             )),
             Some(_) => {}
         }
     }
     out
+}
+
+/// Whether `shards` hold `parent` split: its children at a higher shard count (shard `n` of count
+/// `c` has the children `n + k * c` of each larger count), each at or above its generation.
+fn split_covers(
+    shards: &[crate::persistence::kubernetes::objects::ShardRecord],
+    parent: &crate::persistence::kubernetes::objects::ShardRecord,
+) -> bool {
+    // Count 0 is an unsharded tenant: one shard
+    let count = |c: i32| c.max(1);
+    let children: Vec<_> = shards
+        .iter()
+        .filter(|s| {
+            count(s.shard_count) > count(parent.shard_count)
+                && s.shard_number % count(parent.shard_count) == parent.shard_number
+        })
+        .collect();
+    !children.is_empty() && children.iter().all(|c| c.generation >= parent.generation)
 }
 
 /// The tenants and timelines whose generations are below the copy's highest-ever values.

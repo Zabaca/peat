@@ -76,14 +76,19 @@ enum Command {
         /// Remove what the destination holds first
         #[arg(long)]
         replace: bool,
-        /// With --replace: the source holds no pageserver, and the destination is meant to be
-        /// emptied
+        /// With --replace: the destination is meant to be emptied (a source with no pageserver is
+        /// copied, and nothing the destination loses is counted)
         #[arg(long, requires = "replace")]
         empty_destination: bool,
-        /// With --replace: the destination's shards or timelines at higher generations than the
-        /// source's, or that the source lacks, are meant to be lowered or dropped
-        #[arg(long, requires = "replace")]
-        accept_older: bool,
+        /// With --replace: records (`<Kind>/<name>`: Tenant/<tenant id>, Timeline/<name>) the
+        /// destination holds at higher generations than the source's, or that the source lacks,
+        /// each meant to be lowered or dropped
+        #[arg(long, requires = "replace", value_delimiter = ',')]
+        accept_older: Vec<String>,
+        /// From kubernetes into postgres: go without --records-copy-storage, and so without the
+        /// check of the source against the copy's highest-ever values
+        #[arg(long)]
+        no_bucket_check: bool,
         /// Tenants and timelines (`<Kind>/<name>`) remade under their id, whose generations are
         /// below what the copy has seen
         #[arg(long, value_delimiter = ',')]
@@ -207,17 +212,19 @@ async fn run(stores: &Stores, command: Command) -> anyhow::Result<Outcome> {
             replace,
             empty_destination,
             accept_older,
+            no_bucket_check,
             accept_remade,
             running,
         } => {
             let accept: BTreeSet<String> = accept_remade.into_iter().collect();
-            let replace = records_tool::Replace {
+            let options = records_tool::CopyOptions {
                 replace,
                 empty_destination,
-                accept_older,
+                accept_older: accept_older.into_iter().collect(),
+                no_bucket_check,
             };
             let outcome =
-                records_tool::copy(stores, from, to, replace, &running.running(), &accept).await?;
+                records_tool::copy(stores, from, to, options, &running.running(), &accept).await?;
             if outcome == Outcome::Done {
                 println!("copied and compared: equal");
             }
