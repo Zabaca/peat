@@ -22,7 +22,7 @@ import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
 import { DB_API, HELD_SELECTOR, beginMaking, knownDb, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 import { parseWindows, windowAt } from './quiet-hours'
-import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, writtenSince, endOutsideSessionsSql, moveFailure, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
+import { COMPUTE_DATABASES, DATABASES_SQL, MOVE_ROLES_SQL, MOVE_ROLE_PREFIX, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL, ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, backSteps, compareSides, writtenSince, endOutsideSessionsSql, moveFailure, outsideSessionsSql, dropRolesSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, oldNameOf, renewRoleSql, targetNameOf, type MoveStatus, type Sides } from './move'
 import { exec, type ExecDeps } from './exec'
 import { durationMs } from './api/schema'
 import { PG_VERSIONS } from './storage-spec'
@@ -1554,6 +1554,7 @@ async function runMove(ns: string, name: string): Promise<void> {
     await write({ ...fresh, target, ...(a.rehearsal ? {} : { oldDatabase: old }) }, { answered })
   }
   if (mv.state === 'switching') return finishSwitch(ns, name)
+  if (mv.state === 'going-back') return finishMoveBack(ns, name)
   // the copy, from the start (again, after a restart): a fresh timeline for it, so nothing on the target is ever cleared
   await cleanupMove(ns, name, mv, key)
   await write({ state: 'preparing', toTimeline: hex32() })
@@ -1699,36 +1700,59 @@ async function runMoveBack(ns: string, name: string, request: string): Promise<v
   if (ok(await storcon('GET', `/v1/tenant/${oldRec.tenant}/timeline/${oldRec.timeline}`), 'read the old copy\'s timeline', [404]).status === 404) return refuse(`the old copy's timeline is gone`)
   const newer = oldNameOf(name, mv.to)
   if ((await getDb(newer)) || (await readRecords(RECORDS)).has(newer)) return refuse(`the name for the version being left, ${newer}, is taken: delete that database, then ask again`)
-  const doorBack = o.spec?.closed ? { phase: 'Closed' } : { phase: 'Ready' }
+  const until = new Date(Date.now() + durationMs(String(o.spec?.keepOldFor ?? '30d'))).toISOString()
+  // the door shut (starts and routes read Moving as closed), and what the way back needs to finish written first, so a control layer that
+  // restarts goes on with it (state going-back) from wherever it was
+  await patchDbStatus(ns, name, { answered, phase: 'Moving', message: `going back to Postgres ${mv.from}: every connection is refused until it is back`, move: { ...withoutPods(mv), state: 'going-back', oldTimeline: oldRec.timeline, newerDatabase: newer, newerTimeline: d.timeline, deleteNewerAfter: until } })
+  await finishMoveBack(ns, name)
+}
+
+/** Goes on with a way back (state going-back) from what it finds done: each step of backSteps, each safe to repeat. */
+async function finishMoveBack(ns: string, name: string): Promise<void> {
   const t0 = Date.now()
+  const o = ok(await kube('GET', dbObjectPath(ns, name)), `read ${name}`).json
+  const mv: MoveStatus = o.status?.move ?? {}
+  const d = recordOf(o)!
+  const old = mv.oldDatabase!, newer = mv.newerDatabase!
+  const doorBack = o.spec?.closed ? { phase: 'Closed' } : { phase: 'Ready' }
   try {
-    // the door shut (starts and routes read Moving as closed) and the compute stopped: no session goes on on the version being left
-    await patchDbStatus(ns, name, { answered, phase: 'Moving', message: `going back to Postgres ${mv.from}: every connection is refused until it is back` })
-    await stopCompute(name, true)
-    await stopCompute(oldRec.name, true)
-    // the version being left, kept as a database of its own, as the move kept the old one
-    const keep = durationMs(String(o.spec?.keepOldFor ?? '30d'))
-    const until = new Date(Date.now() + keep).toISOString()
-    const newerRec: Db = { name: newer, namespace: ns, tenant: d.tenant, timeline: d.timeline, parent: d.root ? d.name : d.parent, from: name, root: false, mode: 'primary', port: await claimPort(RECORDS, newer, d.timeline, PORT_BASE, await usedPorts()), created: new Date().toISOString(), pg: d.pg, closed: false }
-    ok(await kube('POST', `${DB_API}/namespaces/${ns}/databases`, { apiVersion: `${GROUP}/v1alpha1`, kind: 'Database', metadata: { name: newer, namespace: ns, finalizers: [FINALIZER], annotations: { [COPYING]: 'true' } }, spec: { pgVersion: d.pg, parent: name } }), `keep ${newer}`, [409])
-    await saveDb(newerRec, { phase: 'Ready', message: `what ${name} held on Postgres ${d.pg} when it went back to ${mv.from}, asleep: deleted after keepOldFor` })
-    ok(await kube('PATCH', dbObjectPath(ns, newer), { metadata: { annotations: { [COPYING]: null } } }, 'application/merge-patch+json'), `release ${newer}`)
-    await apply(`/api/v1/namespaces/${DB_NS}/services`, newer, nameService(newer))
-    // the name to the old copy's timeline and version; the old copy's object goes without its data (its timeline is the database's again)
-    await saveDb({ ...d, timeline: oldRec.timeline, pg: oldRec.pg })
-    await kube('DELETE', `/api/v1/namespaces/${NS}/configmaps/db-${oldRec.name}`)
-    ok(await kube('PATCH', dbObjectPath(ns, oldRec.name), { metadata: { finalizers: null } }, 'application/merge-patch+json'), `release ${oldRec.name}`, [404])
-    ok(await kube('DELETE', dbObjectPath(ns, oldRec.name)), `remove ${oldRec.name}`, [404])
-    await del(`/api/v1/namespaces/${DB_NS}/services/${oldRec.name}`)
-    if (oldRec.port) await del(`/api/v1/namespaces/${NS}/configmaps/port-${oldRec.port}`)
-    for (const path of [depPath(oldRec.name), `/api/v1/namespaces/${CNS}/secrets/compute-${oldRec.name}`]) await del(path)
-    // the next start makes the compute again on the old version's image, its spec written afresh
-    await del(depPath(name))
-    const message = `back on Postgres ${mv.from} as of the move (${mv.switchedAt ?? 'its switch'}); what was written since is in ${newer} until ${until}`
-    await patchDbStatus(ns, name, { ...doorBack, move: { ...withoutPods(mv), state: 'back', newerDatabase: newer, deleteNewerAfter: until, seconds: Math.round((Date.now() - t0) / 1000), message }, message })
-    console.log(`move back ${ns}/${name}: ${message}`)
+    const oldObj = ok(await kube('GET', dbObjectPath(ns, old)), `read ${old}`, [404])
+    const newerObj = ok(await kube('GET', dbObjectPath(ns, newer)), `read ${newer}`, [404])
+    const steps = backSteps({ newerObject: newerObj.status === 200, newerRecord: (await readRecords(RECORDS)).has(newer), repointed: d.timeline === mv.oldTimeline, oldCopy: oldObj.status === 200 })
+    for (const step of steps) {
+      if (step === 'stop') {
+        // no session goes on on either side
+        await stopCompute(name, true)
+        await stopCompute(old, true)
+      } else if (step === 'keep-newer') {
+        // the version being left, kept as a database of its own, as the move kept the old one (its object first, marked as being copied)
+        ok(await kube('POST', `${DB_API}/namespaces/${ns}/databases`, { apiVersion: `${GROUP}/v1alpha1`, kind: 'Database', metadata: { name: newer, namespace: ns, finalizers: [FINALIZER], annotations: { [COPYING]: 'true' } }, spec: { pgVersion: mv.to, parent: name } }), `keep ${newer}`, [409])
+        const newerRec: Db = { name: newer, namespace: ns, tenant: d.tenant, timeline: mv.newerTimeline!, parent: d.root ? d.name : d.parent, from: name, root: false, mode: 'primary', port: await claimPort(RECORDS, newer, mv.newerTimeline!, PORT_BASE, await usedPorts()), created: new Date().toISOString(), pg: mv.to!, closed: false }
+        await saveDb(newerRec, { phase: 'Ready', message: `what ${name} held on Postgres ${mv.to} when it went back to ${mv.from}, asleep: deleted after keepOldFor` })
+        ok(await kube('PATCH', dbObjectPath(ns, newer), { metadata: { annotations: { [COPYING]: null } } }, 'application/merge-patch+json'), `release ${newer}`)
+        await apply(`/api/v1/namespaces/${DB_NS}/services`, newer, nameService(newer))
+      } else if (step === 'repoint') {
+        await saveDb({ ...d, timeline: mv.oldTimeline!, pg: mv.from! })
+      } else if (step === 'drop-old') {
+        // the old copy's object goes without its data: its record first, so its deletion takes nothing (its timeline is the database's)
+        await kube('DELETE', `/api/v1/namespaces/${NS}/configmaps/db-${old}`)
+        const port = oldObj.json?.status?.record?.port
+        ok(await kube('PATCH', dbObjectPath(ns, old), { metadata: { finalizers: null } }, 'application/merge-patch+json'), `release ${old}`, [404])
+        ok(await kube('DELETE', dbObjectPath(ns, old)), `remove ${old}`, [404])
+        await del(`/api/v1/namespaces/${DB_NS}/services/${old}`)
+        if (port) await del(`/api/v1/namespaces/${NS}/configmaps/port-${port}`)
+        for (const path of [depPath(old), `/api/v1/namespaces/${CNS}/secrets/compute-${old}`]) await del(path)
+      } else {
+        // the next start makes the compute again on the old version's image, its spec written afresh
+        await del(depPath(name))
+        const message = `back on Postgres ${mv.from} as of the move (${mv.switchedAt ?? 'its switch'}); what was written since is in ${newer} until ${mv.deleteNewerAfter}`
+        await patchDbStatus(ns, name, { ...doorBack, move: { ...withoutPods(mv), state: 'back', seconds: Math.round((Date.now() - t0) / 1000), message }, message })
+        console.log(`move back ${ns}/${name}: ${message}`)
+      }
+    }
   } catch (e) {
-    await patchDbStatus(ns, name, { ...doorBack, message: `the way back failed: ${moveFailure(e).slice(0, 400)}` }).catch(() => {})
+    // the door stays shut and the state going-back: the next pass goes on from where it stopped
+    await patchDbStatus(ns, name, { message: `going back to Postgres ${mv.from}, not finished (goes on at the next pass): ${moveFailure(e).slice(0, 400)}` }).catch(() => {})
   }
 }
 /** Old copies whose keepOldFor is over are deleted (their data then held, as any deleted database's). */
@@ -1797,7 +1821,7 @@ async function reconcileDatabases() {
       } else if (act.do === 'delete') {
         // a move under way is taken back first: its target compute, its timeline, its role
         const mv: MoveStatus | undefined = o.status?.move
-        if (mv?.state && !MOVE_STATES_DONE.includes(mv.state)) await cleanupMove(ns, name, mv, `${ns}.${name}`).catch((e) => console.log(`database ${key}: clean up its move: ${e}`))
+        if (mv?.state && !MOVE_STATES_DONE.includes(mv.state) && mv.state !== 'going-back') await cleanupMove(ns, name, mv, `${ns}.${name}`).catch((e) => console.log(`database ${key}: clean up its move: ${e}`))
         const rec = recs.get(name)?.db
         const d = s ?? (rec && rec.namespace === ns ? rec : null)
         await patchDbStatus(ns, name, { phase: 'Deleting', message: 'deleting' }).catch(() => {})

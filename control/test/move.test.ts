@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exitCodeOf, execPath, frame } from '../src/exec'
-import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, moveFailure, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
+import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, backSteps, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, moveFailure, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
 
 // The move's pure parts: the globals filtered, the two sides compared, the decision of the database loop; and the exec's framing.
 
@@ -141,6 +141,39 @@ describe('the exec a move is granted', () => {
   })
 })
 
+describe('a way back that a restart cuts short', () => {
+  // what each boundary leaves done: the door shut (nothing else), the newer copy kept, the name repointed, the old copy's object gone
+  const boundaries = {
+    'after the door shut': { newerObject: false, newerRecord: false, repointed: false, oldCopy: true },
+    'after the newer copy\'s object': { newerObject: true, newerRecord: false, repointed: false, oldCopy: true },
+    'after the newer copy\'s record': { newerObject: true, newerRecord: true, repointed: false, oldCopy: true },
+    'after the repoint': { newerObject: true, newerRecord: true, repointed: true, oldCopy: true },
+    'after the old copy\'s object went': { newerObject: true, newerRecord: true, repointed: true, oldCopy: false },
+  }
+  test('goes on from each boundary with the steps left, in order, and ends back with the newer copy kept', () => {
+    expect(backSteps(boundaries['after the door shut'])).toEqual(['stop', 'keep-newer', 'repoint', 'drop-old', 'finish'])
+    expect(backSteps(boundaries['after the newer copy\'s object'])).toEqual(['stop', 'keep-newer', 'repoint', 'drop-old', 'finish'])
+    expect(backSteps(boundaries['after the newer copy\'s record'])).toEqual(['stop', 'repoint', 'drop-old', 'finish'])
+    expect(backSteps(boundaries['after the repoint'])).toEqual(['stop', 'drop-old', 'finish'])
+    expect(backSteps(boundaries['after the old copy\'s object went'])).toEqual(['stop', 'finish'])
+    // run to the end from each, step by step: it ends with the newer copy kept, the name on the old timeline, the old copy's object gone
+    for (const [at, start] of Object.entries(boundaries)) {
+      const f = { ...start }
+      for (const step of backSteps(f)) {
+        if (step === 'keep-newer') { f.newerObject = true; f.newerRecord = true }
+        if (step === 'repoint') f.repointed = true
+        if (step === 'drop-old') f.oldCopy = false
+        // at every boundary the newer timeline is some record's (the database's until the newer copy's is written), and the old one too
+        expect(f.newerRecord || !f.repointed, at).toBe(true)
+        expect(f.oldCopy || f.repointed, at).toBe(true)
+      }
+      expect(f, at).toEqual({ newerObject: true, newerRecord: true, repointed: true, oldCopy: false })
+      // asked again at the end: only the stop (a no-op on stopped computes) and the status
+      expect(backSteps(f), at).toEqual(['stop', 'finish'])
+    }
+  })
+})
+
 describe('names', () => {
   test('the target and the old copy', () => {
     expect(targetNameOf('0123456789abcdef')).toBe('mv-0123456789ab')
@@ -166,7 +199,8 @@ describe('the comparison', () => {
   })
   test('a real move\'s check is every table\'s row count; a full one adds a hash of every row, order-independent and of no size limit', () => {
     const counts = fingerprintSql('app', 'counts'), full = fingerprintSql('app', 'full')
-    expect(counts).toContain("'' rows='' || count(*) from %I.%I t")
+    expect(counts).toContain("'' rows='' || count(*) from %s%I.%I t")
+    expect(counts).toContain("case when c.relkind = 'r' then 'only ' else '' end")
     expect(counts).not.toMatch(/hash=|string_agg\(t::text/)
     // each row's md5, its two halves summed as 64-bit numbers: nothing held but two sums (the old hash of every row joined stopped at 1 GB)
     expect(full).toContain("sum((''x'' || substr(md5(t::text), 1, 16))::bit(64)::bigint::numeric)")

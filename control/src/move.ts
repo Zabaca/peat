@@ -148,7 +148,7 @@ export function fingerprintSql(database: string, verify: 'counts' | 'full' = 'fu
   const notSkipped = skip.length ? ` and (n.nspname || '.' || c.relname) not in (${skip.join(', ')})` : ''
   // full: each row's md5 (of the row as text), its two halves summed as 64-bit numbers: order does not matter, a changed, missing or
   // doubled row changes a sum, and nothing is held but two sums (no limit with the table's size, unlike a hash of every row joined).
-  // counts: the row count alone.
+  // counts: the row count alone. A table's own rows only (ONLY): an inheritance parent's children are counted once, as tables of their own.
   const rowsHash = verify === 'full' ? ` || '' hash='' || coalesce(sum((''x'' || substr(md5(t::text), 1, 16))::bit(64)::bigint::numeric)::text, ''-'') || ''/'' || coalesce(sum((''x'' || substr(md5(t::text), 17, 16))::bit(64)::bigint::numeric)::text, ''-'')` : ''
   return `
 select 'database ' || datname || ' owner=' || pg_get_userbyid(datdba) || ' acl=' || coalesce((select string_agg(a::text, ',' order by a::text) from unnest(datacl) a), '-') from pg_database where datname = current_database();
@@ -165,7 +165,7 @@ select 'type ' || n.nspname || '.' || t.typname || ' kind=' || t.typtype::text |
 select 'function ' || n.nspname || '.' || p.proname || ' owner=' || pg_get_userbyid(p.proowner) || ' md5=' || md5(pg_get_functiondef(p.oid)) from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname not in ${SYSTEM} and p.prokind in ('f', 'p') order by 1;
 select 'trigger ' || n.nspname || '.' || c.relname || '.' || t.tgname || ' md5=' || md5(pg_get_triggerdef(t.oid)) from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace where not t.tgisinternal and n.nspname not in ${SYSTEM} order by 1;
 select 'sequence ' || schemaname || '.' || sequencename || ' last=' || coalesce(last_value::text, '-') from pg_sequences where schemaname not in ${SYSTEM} order by 1;
-select format('select %L || '' owner='' || %L || '' acl='' || %L || '' rows='' || count(*)${rowsHash} from %I.%I t', 'table ' || n.nspname || '.' || c.relname, pg_get_userbyid(c.relowner), coalesce((select string_agg(a::text, ',' order by a::text) from unnest(c.relacl) a), '-'), n.nspname, c.relname)
+select format('select %L || '' owner='' || %L || '' acl='' || %L || '' rows='' || count(*)${rowsHash} from %s%I.%I t', 'table ' || n.nspname || '.' || c.relname, pg_get_userbyid(c.relowner), coalesce((select string_agg(a::text, ',' order by a::text) from unnest(c.relacl) a), '-'), case when c.relkind = 'r' then 'only ' else '' end, n.nspname, c.relname)
   from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'm') and n.nspname not in ${SYSTEM} and n.nspname !~ '^pg_'${notSkipped} order by n.nspname, c.relname \\gexec
 `
 }
@@ -260,7 +260,7 @@ export const MOVE_SCRIPT = [
 
 // ---- what the database loop does about a move
 
-export interface MoveStatus { newerDatabase?: string; deleteNewerAfter?: string; verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
+export interface MoveStatus { oldTimeline?: string; newerTimeline?: string; newerDatabase?: string; deleteNewerAfter?: string; verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
 
 /** A pod of the compute namespace as the grant reads it. */
 export interface ComputePod { name: string; labels: Record<string, string>; deleting: boolean }
@@ -285,6 +285,19 @@ export function moveExecPods(db: { metadata: { name: string; deletionTimestamp?:
     return c === name || (c === target && target !== undefined && p.labels[MOVE_TARGET_LABEL] === 'target')
   }).sort().slice(0, 4)
 }
+/** What a way back finds done, read afresh each time it goes on (after a restart, from its state going-back). */
+export interface BackFacts { newerObject: boolean; newerRecord: boolean; repointed: boolean; oldCopy: boolean }
+export type BackStep = 'stop' | 'keep-newer' | 'repoint' | 'drop-old' | 'finish'
+/**
+ * The steps a way back has left, in their order, each safe to repeat: the computes stopped; the version being left kept as a database of
+ * its own (its object and its record, on the newer timeline); the name pointed at the old copy's timeline; the old copy's object taken
+ * away without its data; the status. The newer timeline is held by a record at every boundary (the database's until the newer copy's is
+ * written, that one after), and the old one too (the old copy's until the name is pointed at it).
+ */
+export function backSteps(f: BackFacts): BackStep[] {
+  return ['stop', ...(f.newerObject && f.newerRecord ? [] : ['keep-newer' as const]), ...(f.repointed ? [] : ['repoint' as const]), ...(f.oldCopy ? ['drop-old' as const] : []), 'finish']
+}
+
 export type MoveAction =
   | { do: 'none' }
   | { do: 'start'; to: number; rehearsal: boolean; request: string }

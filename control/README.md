@@ -157,7 +157,9 @@ nothing; `status.move.seconds` is how long the copy took.
 While the old copy is kept, `requests.moveBack` (`peat move <db> --back`) goes back: a return to the frozen copy the move left, which
 nothing prevents. The door is shut and the database's compute stopped (its sessions ended); the version being left is kept as a
 database of its own, `<name>-pg<newer>`, stopped, for `keepOldFor` from then; and the name is pointed at the old copy as it was at the
-move. Nothing is read or compared, so it takes seconds whatever the size. It costs what was written since the move: that is in
+move. Nothing is read or compared, so it takes seconds whatever the size. It writes what it needs to finish (`state: going-back`)
+before its first step, so a control layer that restarts in the middle goes on with it, each step safe to repeat; the door stays shut
+until it is back. It costs what was written since the move: that is in
 `<name>-pg<newer>` until its keep period ends (connect to it by its own name, with the database's login, to read it or copy from it by
 hand). The status says so: back on Postgres N as of the move; what was written since is in `<name>-pg<newer>` until a time. It is
 refused only when it cannot be done: no move to go back from (or one under way), the old copy or its timeline gone, or the name
