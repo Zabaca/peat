@@ -103,6 +103,10 @@ export interface FrontOptions {
   port: number
   /** The local port of a database's own listener (the gateway program's), or null when there is no such database. */
   routePort: (database: string) => Promise<number | null>
+  /** Reads the routes again now (the gateway program's refresh): a database made a moment ago has its listener only from the gateway's next
+   * read of the routes (every few seconds), so a refused dial of a known database asks for that read and dials again, for up to dialWaitMs. */
+  refresh?: () => Promise<void>
+  dialWaitMs?: number
   upstreamHost?: string
   /** How long the compute's answer to the SSLRequest may take: a wake is held up to the gateway's own limit (120 s). */
   upstreamMs?: number
@@ -137,10 +141,18 @@ export function startFront(o: FrontOptions) {
       if (!name || !NAME.test(database)) { counts.refusedNoName++; c.end(ALERT_UNRECOGNIZED_NAME); return }
       const port = await o.routePort(database)
       if (port === null) { counts.refusedUnknown++; c.end(ALERT_UNRECOGNIZED_NAME); return }
-      const up = connect({ host: o.upstreamHost ?? '127.0.0.1', port })
+      const dial = () => new Promise<Socket>((resolve, reject) => { const s = connect({ host: o.upstreamHost ?? '127.0.0.1', port }); s.once('connect', () => resolve(s)); s.once('error', reject) })
+      const t0 = Date.now()
+      let up: Socket
+      for (;;) {
+        try { up = await dial(); break } catch (e) {
+          if (!o.refresh || Date.now() - t0 >= (o.dialWaitMs ?? 8000)) throw e
+          await o.refresh().catch(() => {})
+          await new Promise((res) => setTimeout(res, 250))
+        }
+      }
       up.setNoDelay(true)
       up.on('error', () => c.destroy())
-      await new Promise<void>((resolve, reject) => { up.once('connect', () => resolve()); up.once('error', reject) })
       up.write(SSL_REQUEST)
       const upReader = new Reader(up)
       const answer = await upReader.take(1, upstreamMs)
