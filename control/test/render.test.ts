@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import type { Platform } from '../src/api/v1alpha1'
 import { controlUser, frontDoor } from '../src/names'
-import { makeMissing } from '../src/operator/keys'
+import { AUTH_PRIVATE, makeMissing } from '../src/operator/keys'
+import { storageOf } from '../src/operator/storage'
 import { choosePlacements, resolve, specOf, type Resolved } from '../src/operator/platform'
-import { COMPUTE_POLICY, CONTROL_ACCOUNT, EXEC_POLICY, NODE_POLICY, SECRETS, SERVICE_POLICY, STATEFULSET_POLICY, render, type Manifest } from '../src/operator/render'
+import { COMPUTE_POLICY, CONTROL_ACCOUNT, EXEC_POLICY, EXEC_SHAPE_POLICY, NODE_POLICY, SECRETS, SERVICE_POLICY, STATEFULSET_POLICY, render, type Manifest } from '../src/operator/render'
 
 // What the operator renders for a platform: where each pod runs, what it mounts and reads, what each account may do, what may reach each
 // pod, and the admission rules that hold the control layer's account. Read from the objects, as the API server would receive them.
@@ -78,7 +79,7 @@ describe('where the pods run', () => {
     for (const m of all) if (m.metadata.namespace) expect([m.kind, m.metadata.name, nss.has(m.metadata.namespace)]).toEqual([m.kind, m.metadata.name, true])
     expect(all.filter((m) => !m.metadata.namespace).map((m) => m.kind).sort()).toEqual([
       'ClusterRole', 'ClusterRole', 'ClusterRoleBinding', 'ClusterRoleBinding', 'Namespace', 'Namespace', 'Namespace', 'Namespace',
-      ...Array(5).fill('ValidatingAdmissionPolicy'), ...Array(5).fill('ValidatingAdmissionPolicyBinding'),
+      ...Array(6).fill('ValidatingAdmissionPolicy'), ...Array(6).fill('ValidatingAdmissionPolicyBinding'),
     ])
   })
   test('the namespaces\' pod security: the platform\'s privileged (host directories), the computes\' baseline, the gateways\' and the databases\' restricted', () => {
@@ -88,18 +89,30 @@ describe('where the pods run', () => {
 })
 
 describe('volumes', () => {
-  test('every hostPath is of type Directory unless the Platform asks for create (then DirectoryOrCreate): a volume that did not provision fails the pod', () => {
+  test('every hostPath is of type Directory unless the Platform asks for create (then unchecked, made by the runtime on the machine): a volume that did not provision fails the pod', () => {
     const paths = (ms: Manifest[]) => workloads(ms).flatMap((m) => (podOf(m).volumes ?? []).filter((v: any) => v.hostPath).map((v: any) => v.hostPath))
     expect(paths(all).length).toBeGreaterThan(0)
     for (const h of paths(all)) expect(h.type).toBe('Directory')
     const made = paths(render(resolved({ pageservers: { storage: { hostPath: { path: '/var/lib/peat/pageserver', create: true } } } }), KEPT)).filter((h) => h.path === '/var/lib/peat/pageserver')
-    expect(made.map((h) => h.type)).toEqual(['DirectoryOrCreate', 'DirectoryOrCreate'])
+    expect(made.map((h) => h.type)).toEqual(['', ''])
   })
   test('the pageserver\'s data is a directory of its own in the machine\'s volume, made by a root init container, refused when it holds another node\'s identity', () => {
     const ps = named(all, 'StatefulSet', 'pageserver-w1')
     expect(podOf(ps).initContainers[0]).toMatchObject({ name: 'prep', securityContext: { runAsUser: 0 } })
     expect(podOf(ps).initContainers[1].args[0]).toContain('refusing to start: this directory belongs to')
-    expect(podOf(ps).containers[0].volumeMounts).toContainEqual({ name: 'volume', mountPath: '/data/.neon', subPath: 'neon' })
+    // the machine's volume mounted as itself and its folder `neon` addressed inside: never a subPath, which Talos's kubelet resolves in its own view
+    for (const c of [...podOf(ps).initContainers, ...podOf(ps).containers]) for (const m of c.volumeMounts) expect(m.subPath).toBeUndefined()
+    expect(podOf(ps).containers[0].volumeMounts).toContainEqual({ name: 'volume', mountPath: '/vol' })
+    expect(podOf(ps).containers[0].command).toEqual(['/usr/local/bin/pageserver', '-D', '/vol/neon'])
+    expect(podOf(ps).initContainers[1].args[0]).toContain('echo "id=$id" > /vol/neon/identity.toml')
+    expect(podOf(ps).initContainers[1].args[0]).not.toContain('/data')
+  })
+  test('no workload of the render mounts a host directory through subPath', () => {
+    for (const m of workloads(all)) {
+      const pod = podOf(m)
+      const host = new Set((pod.volumes ?? []).filter((v: any) => v.hostPath).map((v: any) => v.name))
+      for (const c of [...(pod.initContainers ?? []), ...(pod.containers ?? [])]) for (const v of c.volumeMounts ?? []) if (host.has(v.name)) expect(v.subPath, `${m.metadata.name}/${c.name}`).toBeUndefined()
+    }
   })
   test('a compute\'s scratch is capped: the setting reaches the control layer', () => {
     const env = Object.fromEntries((podOf(named(all, 'Deployment', 'peat-control')).containers[0].env as any[]).filter((e) => 'value' in e).map((e) => [e.name, e.value]))
@@ -274,7 +287,14 @@ describe('the storage pieces', () => {
   test('the controller: its records in Kubernetes by default, with a copy in the store; or a Postgres named', () => {
     const cmd = podOf(named(all, 'Deployment', 'storage-controller')).containers[0].command as string[]
     expect(cmd.slice(cmd.indexOf('--records'), cmd.indexOf('--records') + 4)).toEqual(['--records', 'kubernetes', '--records-namespace', 'peat'])
-    expect(cmd[cmd.indexOf('--records-copy-storage') + 1]).toContain("bucket_name='peat-data'")
+    // a TOML document, as the controller reads it (a bare inline table it refuses: "invalid key")
+    const copy = cmd[cmd.indexOf('--records-copy-storage') + 1]!
+    expect(copy).toStartWith('remote_storage={ ')
+    expect(copy).toContain("bucket_name='peat-data'")
+    expect(Bun.TOML.parse(copy)).toMatchObject({ remote_storage: { bucket_name: 'peat-data', prefix_in_bucket: 'storage-controller' } })
+    // the pod's own address in the Leader record, never the Service's (which every controller pod would share)
+    expect(cmd[cmd.indexOf('--address-for-peers') + 1]).toBe('http://$(POD_IP):1234')
+    expect(podOf(named(all, 'Deployment', 'storage-controller')).containers[0].env).toContainEqual({ name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } })
     expect(cmd).toContain('--timelines-onto-safekeepers')
     expect(cmd).toContain('--timeline-safekeeper-count=3')
     const pg = podOf(named(render(resolved({ controller: { records: 'postgres', postgres: { urlSecret: 'records-db' } } }), KEPT), 'Deployment', 'storage-controller')).containers[0]
@@ -291,12 +311,24 @@ describe('the storage pieces', () => {
 describe('the guards', () => {
   const policies = all.filter((m) => m.kind === 'ValidatingAdmissionPolicy')
   const bindings = all.filter((m) => m.kind === 'ValidatingAdmissionPolicyBinding')
-  test('five policies, each bound and denying; the exec guard reads the pods a move lists, and denies when the list is not there', () => {
-    expect(policies.map((p) => p.metadata.name).sort()).toEqual([NODE_POLICY, SERVICE_POLICY, STATEFULSET_POLICY, COMPUTE_POLICY, EXEC_POLICY].sort())
+  test('six policies, each bound and denying; the exec guard\'s list rule reads the pods a move lists, and a missing list never denies anyone', () => {
+    expect(policies.map((p) => p.metadata.name).sort()).toEqual([NODE_POLICY, SERVICE_POLICY, STATEFULSET_POLICY, COMPUTE_POLICY, EXEC_SHAPE_POLICY, EXEC_POLICY].sort())
     for (const p of policies.filter((x) => x.metadata.name !== EXEC_POLICY)) expect(bindings.find((b) => b.metadata.name === p.metadata.name)!.spec).toEqual({ policyName: p.metadata.name, validationActions: ['Deny'] })
-    expect(bindings.find((b) => b.metadata.name === EXEC_POLICY)!.spec).toEqual({ policyName: EXEC_POLICY, validationActions: ['Deny'], paramRef: { name: 'peat-move-execs', namespace: 'peat', parameterNotFoundAction: 'Deny' } })
-    const exec = JSON.stringify(policies.find((p) => p.metadata.name === EXEC_POLICY))
-    for (const k of ["object.command[0] == 'psql'", "object.command[0] == 'bash' && object.command[1] == '/move/copy.sh'", "object.container == 'compute'", "request.namespace == 'peat-compute'"]) expect(exec).toContain(k)
+    // the only parameter: an API server reads it before the matchConditions, so a missing one must let every request through (a Deny
+    // refused every account's exec in the cluster, seen on v1.37.1); the shape rule, with no parameter, holds the control layer meanwhile
+    expect(bindings.find((b) => b.metadata.name === EXEC_POLICY)!.spec).toEqual({ policyName: EXEC_POLICY, validationActions: ['Deny'], paramRef: { name: 'peat-move-pods', namespace: 'peat', parameterNotFoundAction: 'Allow' } })
+    for (const b of bindings.filter((x) => x.spec.paramRef)) expect(b.spec.paramRef.parameterNotFoundAction).toBe('Allow')
+    const list = JSON.stringify(policies.find((p) => p.metadata.name === EXEC_POLICY))
+    expect(list).toContain("has(params.data) && params.data.exists(m, request.name in params.data[m].split(' '))")
+    const shape = JSON.stringify(policies.find((p) => p.metadata.name === EXEC_SHAPE_POLICY))
+    expect(shape).not.toContain('params')
+    for (const k of ["object.command[0] == 'psql'", "object.command[0] == 'bash' && object.command[1] == '/move/copy.sh'", "object.container == 'compute'", "request.namespace == 'peat-compute'"]) expect(shape).toContain(k)
+    // the list is the operator's, made empty and before the binding that reads it
+    const cm = all.findIndex((m) => m.kind === 'ConfigMap' && m.metadata.name === 'peat-move-pods')
+    expect(cm).toBeGreaterThan(-1)
+    expect(all[cm]!.metadata.namespace).toBe('peat')
+    expect((all[cm] as any).data).toBeUndefined()
+    expect(cm).toBeLessThan(all.findIndex((m) => m.kind === 'ValidatingAdmissionPolicyBinding' && m.metadata.name === EXEC_POLICY))
     const compute = JSON.stringify(policies.find((p) => p.metadata.name === COMPUTE_POLICY))
     expect(compute).toContain('compute-pg18:release-2026-12-01')
     expect(compute).toContain('compute-pg19:release-2026-12-01')
@@ -346,5 +378,24 @@ describe('the guards', () => {
 describe('style', () => {
   test('no em dash or en dash in anything rendered', () => {
     for (const ms of [all, trialAll, taintedAll]) expect([0x2013, 0x2014].some((c) => JSON.stringify(ms).includes(String.fromCharCode(c)))).toBe(false)
+  })
+})
+
+describe('the upgrade\'s storage check', () => {
+  // the storage controller and one pageserver, as they answer: a shard that kept the error of a notification refused once (this controller never clears one)
+  const answers = (held: { slug: string; generation: number }) => async (url: string | URL | Request) => {
+    const u = String(url)
+    const body = u.endsWith('/control/v1/node') ? [{ id: 1, availability: 'Active', scheduling: 'Active', listen_http_addr: 'ps1', listen_http_port: 9898 }]
+      : u.endsWith('/control/v1/tenant') ? [{ tenant_id: 't1', policy: { Attached: 0 }, shards: [{ tenant_shard_id: 't1', node_attached: 1, node_secondary: [], last_error: 'Non-retryable error 403 Forbidden', is_reconciling: false, is_pending_compute_notification: false, scheduling_policy: 'Active' }] }]
+      : u.endsWith('/debug/v1/tenant') ? [{ tenant_shard_id: 't1', generation: 3, intent: { attached: 1, secondary: [] }, observed: { locations: { 1: { conf: { mode: 'AttachedSingle', generation: 3 } } } } }]
+      : u === 'http://ps1:9898/v1/tenant' ? [{ id: 't1', attachment_status: { slug: held.slug }, generation: held.generation }]
+      : u.endsWith('/control/v1/safekeeper') ? [] : null
+    return new Response(JSON.stringify(body), { status: body === null ? 404 : 200 })
+  }
+  test('an old error on a shard the controller and its pageserver agree is attached is a leftover, not a halt; where they disagree it is a problem', async () => {
+    expect(await storageOf(r, KEPT[AUTH_PRIVATE]!, answers({ slug: 'attached', generation: 3 }) as typeof fetch).problems([1])).toEqual([])
+    const stale = await storageOf(r, KEPT[AUTH_PRIVATE]!, answers({ slug: 'attached', generation: 2 }) as typeof fetch).problems([1])
+    expect(stale).toHaveLength(1)
+    expect(stale[0]).toContain('has an error that is not a leftover (node 1 itself lists it as attached at generation 2, not attached at generation 3)')
   })
 })

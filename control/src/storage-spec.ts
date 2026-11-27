@@ -37,18 +37,29 @@ export interface SafekeeperOptions {
   /** The hostPath that is the machine's safekeeper volume (its root). */
   volumeRoot: string
   /** Whether that root must exist (`Directory`, the default) or is made (`DirectoryOrCreate`). */
-  volumeType?: 'Directory' | 'DirectoryOrCreate'
+  /** Make the volume's root when it is missing (`hostDir`). */
+  volumeCreate?: boolean
   walBackupParallelJobs: number
   resources: Record<string, unknown>
   /** Labels the object carries beyond its own (the control layer marks the ones it makes). */
   labels?: Record<string, string>
 }
 
+/**
+ * A piece's host directory as a volume. It is mounted as itself, never through `subPath`, and each piece addresses its own folder inside
+ * it: where the kubelet runs in a container of its own (Talos), it resolves a subPath in its own view of the machine, which is not the
+ * one the container runtime mounts. A directory made when missing is mounted unchecked (type ''), so the runtime makes it on the machine
+ * itself: DirectoryOrCreate makes it in the kubelet's view, which on Talos is read-only under /var/mnt and another folder under /var/lib.
+ * One that must exist is checked (Directory), as before.
+ */
+export const hostDir = (path: string, create = false) => ({ path, type: create ? '' : 'Directory' })
+
 /** The command the container runs: the guard, then the safekeeper. */
 export function safekeeperScript(o: Pick<SafekeeperOptions, 'id' | 'namespace' | 'controlUrl' | 'remote' | 'walBackupParallelJobs'>): string {
   return `set -eu
 id=${o.id}
-if [ ! -s /data/identity ]; then
+d=/vol/sk-$id
+if [ ! -s $d/identity ]; then
   i=0
   while :; do
     a=$(curl -sS --max-time 3 "${o.controlUrl}/sk/$id/may-start-empty" 2>/dev/null || true)
@@ -60,12 +71,12 @@ if [ ! -s /data/identity ]; then
     sleep 5
   done
 fi
-if [ -f /data/identity ] && [ "$(cat /data/identity)" != "$id" ]; then
-  echo "refusing to start: this directory belongs to safekeeper $(cat /data/identity), not $id" >&2
+if [ -f $d/identity ] && [ "$(cat $d/identity)" != "$id" ]; then
+  echo "refusing to start: this directory belongs to safekeeper $(cat $d/identity), not $id" >&2
   exit 1
 fi
-echo "$id" > /data/identity
-exec /usr/local/bin/safekeeper -D /data --id "$id" \\
+echo "$id" > $d/identity
+exec /usr/local/bin/safekeeper -D $d --id "$id" \\
   --listen-pg 0.0.0.0:5454 --listen-http 0.0.0.0:7676 \\
   --advertise-pg "safekeeper-w\${id}-0.safekeeper.${o.namespace}.svc.cluster.local:5454" \\
   --availability-zone "sk-\${id}" \\
@@ -80,7 +91,7 @@ exec /usr/local/bin/safekeeper -D /data --id "$id" \\
 export function safekeeperStatefulSet(o: SafekeeperOptions): Record<string, any> {
   const labels = { app: 'safekeeper', 'node-id': String(o.id) }
   const dir = `sk-${o.id}`
-  const volume = { name: 'volume', hostPath: { path: o.volumeRoot, type: o.volumeType ?? 'Directory' } }
+  const volume = { name: 'volume', hostPath: hostDir(o.volumeRoot, o.volumeCreate) }
   return {
     apiVersion: 'apps/v1',
     kind: 'StatefulSet',
@@ -121,7 +132,7 @@ export function safekeeperStatefulSet(o: SafekeeperOptions): Record<string, any>
               resources: o.resources,
               readinessProbe: { httpGet: { path: '/v1/status', port: 7676 }, periodSeconds: 5 },
               volumeMounts: [
-                { name: 'volume', mountPath: '/data', subPath: dir },
+                { name: 'volume', mountPath: '/vol' },
                 { name: 'auth', mountPath: '/auth' },
                 { name: 'tok', mountPath: '/tok' },
               ],
@@ -590,6 +601,28 @@ export interface ShardLocations {
   held: Record<string, { attached: boolean; generation: number | null } | undefined>
 }
 /**
+ * The locations `staleErrorProblem` compares, for the shards that carry an error: the controller's (`GET /debug/v1/tenant`) and what each
+ * pageserver lists (`GET /v1/tenant`, by tenant id). None when a pageserver did not answer (`undefined` in `held`): the shard then stays a
+ * problem.
+ */
+export function shardLocations(debug: any[], held: Record<string, Map<string, { attached: boolean; generation: number | null }> | undefined>, withError: Set<string>): Map<string, ShardLocations> {
+  const out = new Map<string, ShardLocations>()
+  if (Object.values(held).some((h) => h === undefined)) return out
+  for (const d of debug) {
+    const id = String(d.tenant_shard_id)
+    if (!withError.has(id)) continue
+    out.set(id, {
+      generation: typeof d.generation === 'number' ? d.generation : null,
+      intent: { attached: d.intent?.attached ?? null, secondary: (d.intent?.secondary ?? []) as number[] },
+      observed: Object.fromEntries(Object.entries(d.observed?.locations ?? {}).map(([n, v]: [string, any]) => [n, v?.conf ? { mode: String(v.conf.mode), generation: v.conf.generation ?? null } : undefined])),
+      held: Object.fromEntries(Object.entries(held).map(([n, h]) => [n, h!.get(id)])),
+    })
+  }
+  return out
+}
+/** The shards that carry an error (`last_error`), by id. */
+export const shardsWithError = (tenants: any[]): Set<string> => new Set<string>(tenants.flatMap((t) => (t.shards ?? []) as any[]).filter((s) => s.last_error).map((s) => String(s.tenant_shard_id)))
+/**
  * Whether a shard's `last_error` is a leftover: this version of the controller never clears one (a reconcile that succeeds leaves it; only a later error replaces it, and a restart empties it), so after a failed
  * compute notification that was retried and settled the string stays. It is a leftover, and so only a warning, when the shard is not reconciling, has no compute notification pending, **and the controller's intent, what it
  * has observed and what the pageservers themselves hold all agree**: the intended attached node holds it attached at the controller's generation (by the controller's observation and by that pageserver's own list), no other
@@ -701,4 +734,16 @@ export function computeImageFor(pg: number, images: Record<number, string | unde
   const image = images[pg]
   if (!image) throw new Error(`no compute image is set for Postgres ${pg}`)
   return image
+}
+
+/**
+ * What the control layer answers a caller held to `cls` (its pod address's class) calling `method path`: `pass`, `refuse` (403), or
+ * `again` (503, call again) for an address in no class calling what some class may. That is most likely a pod so new that the API server
+ * does not list its address yet: a storage controller sends its first notification within a second of starting, and a 403 is an answer it
+ * never retries and keeps as the shard's last error. `again` admits nothing.
+ */
+export function callerVerdict(routes: Record<string, [string, RegExp][]>, cls: string, method: string, path: string): 'pass' | 'again' | 'refuse' {
+  const may = (c: string) => routes[c]!.some(([m, re]) => m === method && re.test(path))
+  if (may(cls)) return 'pass'
+  return cls === 'unknown' && Object.keys(routes).some((c) => c !== 'unknown' && may(c)) ? 'again' : 'refuse'
 }

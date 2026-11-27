@@ -4,7 +4,7 @@
 import { mintToken } from './keys'
 import type { Resolved } from './platform'
 import { PORTS } from './render'
-import { nodeDrainState, nodeFillState, storageStateReport } from '../storage-spec'
+import { nodeDrainState, nodeFillState, shardLocations, shardsWithError, storageStateReport } from '../storage-spec'
 
 export interface Storage {
   /** Every reason the storage is not settled, empty when it is: every expected pageserver Active, every shard attached to an Active node, nothing reconciling or pending, every secondary warm, every safekeeper answering. */
@@ -51,7 +51,21 @@ export function storageOf(r: Resolved, privatePem: string, fetcher: typeof fetch
       }
       let next = 0
       await Promise.all(Array.from({ length: Math.min(8, asks.length) }, async () => { while (next < asks.length) await asks[next++]!() }))
-      const out = storageStateReport(ns_, ts, expected, statuses).problems
+      // A shard's last error is never cleared by this controller (a notification refused once stays): without the locations every shard
+      // that ever had one halted the upgrade for good. With them it is a leftover, a warning, when nothing is pending and the controller's
+      // intent, what it observes and what each pageserver lists agree on where it is attached (`staleErrorProblem`); else a problem.
+      const withError = shardsWithError(ts)
+      let locations = new Map()
+      if (withError.size > 0) {
+        const held: Record<string, Map<string, { attached: boolean; generation: number | null }> | undefined> = {}
+        await Promise.all(ns_.map(async (n) => {
+          const a = await call(`http://${n.listen_http_addr}:${n.listen_http_port}/v1/tenant`, 'pageserverapi').catch(() => undefined)
+          held[String(n.id)] = a && a.status === 200 && Array.isArray(a.json) ? new Map((a.json as any[]).map((t) => [String(t.id), { attached: t.attachment_status?.slug === 'attached', generation: typeof t.generation === 'number' ? t.generation : null }])) : undefined
+        }))
+        const debug = await storcon('GET', '/debug/v1/tenant').catch(() => undefined)
+        locations = shardLocations(debug && debug.status === 200 && Array.isArray(debug.json) ? debug.json : [], held, withError)
+      }
+      const out = storageStateReport(ns_, ts, expected, statuses, locations).problems
       const sks = await storcon('GET', '/control/v1/safekeeper')
       if (sks.status !== 200 || !Array.isArray(sks.json)) out.push(`the storage controller's safekeepers: ${sks.status}`)
       else for (const sk of (sks.json as any[]).filter((x) => x.scheduling_policy === 'Active')) {

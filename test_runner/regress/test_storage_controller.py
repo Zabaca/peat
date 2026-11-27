@@ -127,9 +127,16 @@ def test_storage_controller_smoke(
     shards_per_tenant = tenant_shard_count // tenant_count
     tenant_ids = set(TenantId.generate() for i in range(0, tenant_count))
 
-    # Creating several tenants should spread out across the pageservers
+    # Creating several tenants should spread out across the pageservers.
+    # Peat: the tenants are made first and their timelines after the count below. The scheduler
+    # ranks pageservers by utilization before shard count, and a pageserver's utilization is the
+    # larger of its shard count and its data against its filesystem's size. On a small filesystem
+    # (Peat's CI gives the test output 11 GB), a new timeline's data outweighs a shard, so with
+    # timelines made as tenants are made the spread followed which pageserver's last heartbeat
+    # reported less data, and the counts below came out 3, 4 and 5 on most runs. Without data
+    # yet, the shard counts decide.
     for tid in tenant_ids:
-        env.create_tenant(tid, shard_count=shards_per_tenant)
+        env.storage_controller.tenant_create(tid, shard_count=shards_per_tenant)
 
     # Tenant listing API should work
     listed_tenants = env.storage_controller.tenant_list()
@@ -163,6 +170,12 @@ def test_storage_controller_smoke(
         # so expect equal number on all pageservers
         assert count == tenant_shard_count / len(env.pageservers), (
             f"Node {node_id} has bad count {count}"
+        )
+
+    # Each tenant's initial timeline, as env.create_tenant would have made it
+    for tid in tenant_ids:
+        env.storage_controller.pageserver_api().timeline_create(
+            pg_version=env.pg_version, tenant_id=tid, new_timeline_id=TimelineId.generate()
         )
 
     # Creating and deleting timelines should work, using identical API to pageserver

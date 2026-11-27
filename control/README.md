@@ -84,6 +84,18 @@ control image against main's published storage images) and on every merge (that 
 built. It needs kind, kubectl, docker, bun and psql; locally, `KIND=<path to kind> .github/peat/install-test.sh <storage> <compute 18>
 <compute 19> <control>` with the control image built into the local Docker.
 
+On Talos the kubelet runs in a container of its own, with its own view of the machine's folders: another folder under `/var/lib`, and
+the machine's own under `/var/mnt`, read-only. So a pageserver and a safekeeper mount their host directory as itself, never through
+`subPath` (which the kubelet resolves in its view), and address their own folder inside it (`neon`, `sk-<id>`); with `create: true` the
+directory is mounted unchecked, so the container runtime makes a missing one on the machine itself. Both the default paths under
+`/var/lib/peat` and paths under `/var/mnt` (a disk Talos mounts there) then work with `create: true`, and an existing directory with
+`create: false`.
+
+The storage controller names itself to its peers by its pod's address (`http://$(POD_IP):1234`, from the downward API). On a cluster
+whose pods have only IPv6 addresses that is not a valid URL (it needs brackets, which the downward API cannot add, and the controller
+takes no address but a URL); such a cluster is not supported yet: it needs a wrapper that writes the address before the controller
+starts.
+
 ## The objects
 
 A whole install is one `Platform` (cluster-scoped, one per cluster) and its databases are `Database` objects (namespaced). Every field, its
@@ -111,15 +123,15 @@ login. Neon has no in-place major upgrade, so a move is a copy, in the control l
 - A new timeline of the newer version is made in the database's own tenant, and a compute of its own (an internal name, `mv-...`) is
   started on it.
 - The door is shut (`phase: Moving`: new connections are refused, open sessions ended) for the copy's length. The control layer waits
-  12 s (two of a gateway's reads of its routes) before it stops the old compute and starts it again for the copy. A gateway whose read
-  failed keeps the old route, so a client may still get in. Before the comparison every session on the old compute that is not the
-  compute's own is ended (what it wrote is compared), and the old compute's counts of rows written are read (`pg_stat_database`). After
-  it, a session still open, or a count that grew (a client that came, wrote and left), fails the move, and the old compute is stopped at
-  once. What remains: a write that lands between that last look and the old compute's shutdown (the stop's calls to the API server, 10 to 12 ms
-  in the install test, then the kubelet's signal to the pod and Postgres's fast shutdown, not measured), and one by a session that ends
-  at the very moment of the look, between leaving the list of sessions and its counts reaching the totals (microseconds). A control layer
-  that restarts during the comparison starts the copy again; once `switching` is recorded the old compute was already stopped after the
-  last look, and nothing starts it again while the door is shut.
+  12 s (two of a gateway's reads of its routes) before it stops the old compute and starts it again for the copy. A gateway whose read failed
+  keeps the old route, so a client may still get in. Before the comparison every session on the old compute that is not the compute's own
+  is ended (what it wrote is compared), and the old compute's counts of rows written are read (`pg_stat_database`). After it, a session
+  still open, or a count that grew (a client that came, wrote and left), fails the move, and the old compute is stopped at once. What
+  remains: a write that lands between that last look and the old compute's shutdown (the stop's calls to the API server, tens of
+  milliseconds in the install test, then the kubelet's signal to the pod and Postgres's fast shutdown, not measured), and one by a session
+  that ends at the very moment of the look, between leaving the list of sessions and its counts reaching the totals (microseconds). A
+  control layer that restarts during the comparison starts the copy again; once `switching` is recorded the old compute was already
+  stopped after the last look, and nothing starts it again while the door is shut.
 - A temporary superuser, `peat_move_<hex>`, is made on the old compute. The new compute reads the old one over TLS as that role,
   verified against the platform's authority:
   - every role (its password's verifier, its attributes, its memberships, its settings), then every database (each object made by
@@ -148,10 +160,16 @@ What a move leaves out of the copy and the comparison, matched by exact name, ne
 A person's role granted to `app`, and a person's role's membership in `neon_superuser`, are copied.
 
 What guards it:
-- The control layer may exec only into a compute's container in a pod listed in the ConfigMap `peat-move-execs`, only `psql` or
-  `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). An admission
-  rule enforces it; with no list, no exec passes.
-- The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-execs`
+- The control layer may exec only into a compute's container in a pod listed in the ConfigMap `peat-move-pods`, only `psql` or
+  `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). Two admission
+  rules enforce it: one the shape (namespace, container, command), one the list, which the operator makes empty and keeps. Neither
+  judges any account but the control layer's, whatever exists or is missing: an API server reads a rule's parameter before the rule's
+  own conditions, so the list's rule lets a missing list through. With the list deleted (by hand, or by the control layer's own account,
+  whose Role may delete ConfigMaps in the platform namespace), until the operator makes it again, the control layer is held to the shape
+  alone; a move that finds it missing fails, and goes on when asked again (a resumed attempt that finds it missing as it starts waits
+  instead, and goes on by itself once the operator has made it again). The list was `peat-move-execs` before, made by the control
+  layer: one an earlier release left behind is an orphan, read by nothing, and may be deleted.
+- The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-pods`
   among them, so a control layer that misbehaves can list any compute. The list bounds what a move does, not what the account could do.
 - The rule does not bound `psql`'s arguments, so in a listed pod the control layer may run any SQL as the local superuser, and so any
   shell command in that container (`\!`, `-o '|command'`, `COPY ... TO PROGRAM`).

@@ -594,6 +594,40 @@ jobs:
         env:
           SHA: ${{ steps.published.outputs.newest }}
           UPGRADE_FROM: ${{ steps.published.outputs.before }}
+          # NOTE(records override): the release this upgrades from predates the Kubernetes records' copy (its storage controller refuses
+          # --records-copy-storage), so this leg keeps its records in Postgres; the default records are the next job's. Drop this line once
+          # `before` is the first published commit of main that contains pull request 40 or a later one.
+          RECORDS: postgres
+        run: .github/peat/install-test.sh "ghcr.io/zabaca/peat/storage:$SHA" "ghcr.io/zabaca/peat/compute-pg18:$SHA" "ghcr.io/zabaca/peat/compute-pg19:$SHA" peat-control:ci
+
+  # The same install on the default records (Kubernetes objects, their copy in the store), fresh, with no upgrade: a default install that
+  # cannot start fails here. While the upgrade above keeps its records in Postgres (its NOTE), this is what tests the default on a pull
+  # request.
+  install-test-pr-default:
+    name: install test (pull request, default records)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+      - name: kind and psql
+        run: .github/peat/install-test-tools.sh
+      - name: The newest published images of main
+        id: published
+        run: .github/peat/published-releases.sh "$(git merge-base HEAD origin/main)" >> "$GITHUB_OUTPUT"
+      - name: The control image of this change
+        run: docker build -f .github/peat/control.Dockerfile -t peat-control:ci control
+      - name: Install a platform on the default records and use it
+        env:
+          SHA: ${{ steps.published.outputs.newest }}
         run: .github/peat/install-test.sh "ghcr.io/zabaca/peat/storage:$SHA" "ghcr.io/zabaca/peat/compute-pg18:$SHA" "ghcr.io/zabaca/peat/compute-pg19:$SHA" peat-control:ci
 
   install-test:

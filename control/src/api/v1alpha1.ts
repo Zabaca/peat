@@ -31,11 +31,14 @@ const storage = (what: string, defPath: string): Schema =>
     }),
     storageClass: obj('A PersistentVolumeClaim per piece, of this storage class.', { name: str('The storage class.'), size: str('The size of each volume (a Kubernetes quantity).') }, { required: ['name', 'size'] }),
   }, { default: { hostPath: { path: defPath, create: false } } })
+/** The store's endpoint, region, buckets and prefixes are written into the pieces' settings inside quotes (a TOML literal string, and the
+ * safekeeper's in a shell's double quotes): a quote, a newline, `$`, a backtick or a backslash would end or change them, so none is taken. */
+const storeText: Partial<Schema> = { pattern: String.raw`^[^'"$\x60\\\n\r]*$` }
 const store = (what: string): Schema =>
   obj(`The bucket ${what} use, when it is not the platform's one bucket.`, {
-    bucket: str('The bucket.'),
+    bucket: str('The bucket.', storeText),
     credentialsSecret: str('A Secret in the platform namespace holding AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for this bucket.'),
-    prefix: str("The folder of the bucket this piece writes under; default the piece's own name."),
+    prefix: str("The folder of the bucket this piece writes under; default the piece's own name.", storeText),
   }, { required: ['bucket', 'credentialsSecret'] })
 const windows = (description: string): Schema =>
   list(description, obj('A window: a start and an end on the clock of a time zone, on the days listed (every day when none are). An end at or before the start runs past midnight.', {
@@ -87,9 +90,9 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
   }, { default: { label: { key: `${GROUP}/machine`, value: 'true' } } }),
   spread: str('machines (the default): keepers on distinct zones, the controller never beside a pageserver, and a placement that breaks these is refused. none: a one-machine trial in which every piece may share a machine; the status says the platform survives no machine\'s loss.', { enum: ['machines', 'none'], default: 'machines' }),
   objectStore: obj('The S3-compatible store that holds the data. One bucket and one Secret serve every piece (each under a folder of its own), unless a piece is given its own.', {
-    endpoint: str('The store\'s URL.'),
-    region: str('The region of its buckets.', { default: 'us-east-1' }),
-    bucket: str('The one bucket.'),
+    endpoint: str('The store\'s URL.', storeText),
+    region: str('The region of its buckets.', { default: 'us-east-1', ...storeText }),
+    bucket: str('The one bucket.', storeText),
     credentialsSecret: str('A Secret in the platform namespace holding AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.'),
     pageservers: store('the pageservers'),
     safekeepers: store('the safekeepers'),

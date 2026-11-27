@@ -24,8 +24,10 @@ export const COMPUTE_DATABASES = ['postgres', 'app'] as const
 /** Where the move's script is mounted in the target compute, and the ConfigMap (in the compute namespace) the operator renders it in. */
 export const MOVE_SCRIPT_PATH = '/move/copy.sh'
 export const MOVE_SCRIPT_CONFIG_MAP = 'peat-move-script'
-/** The ConfigMap (in the platform namespace) naming the pods a move may exec into: the exec guard's parameter. */
-export const MOVE_EXECS_CONFIG_MAP = 'peat-move-execs'
+/** The ConfigMap (in the platform namespace) naming the pods a move may exec into: the exec guard's parameter, made and kept by the operator
+ * (it was peat-move-execs, made by the control layer; a new name, so that one an earlier release or a person made is never an object the
+ * operator finds in its way). */
+export const MOVE_EXECS_CONFIG_MAP = 'peat-move-pods'
 /** The label on the move's target compute pod: the network rule that lets it reach the source on 5432 selects it. */
 export const MOVE_TARGET_LABEL = 'peat-move'
 /** The commands the exec guard allows, as an exec names them: psql, and bash with the move's script. */
