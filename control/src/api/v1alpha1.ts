@@ -192,6 +192,8 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
     lastCheck: obj('The last check between steps.', { at: str('When.', { format: 'date-time' }), passed: bool('Whether it passed.'), message: str('What it found.') }),
     halted: obj('Where and why it halted.', { at: str('When.', { format: 'date-time' }), step: str('The step.'), reason: str('Why.') }),
     retried: str('The last retry request answered.'),
+    refill: int('A pageserver whose drain the way back dropped: filled again before the next step.'),
+    reason: str('Why the way back was taken without the earlier release being set.'),
   }),
   answered: obj('The requests answered, by the value that was asked (the retry an upgrade answered is upgrade.retried).', { applyPending: str('The applyPending answered.') }),
   pendingChanges: list('Differences between an adopted object and what the operator would make, not applied (requests.applyPending applies them).', obj('A difference.', { kind: str('Kind.'), namespace: str('Namespace.'), name: str('Name.'), change: str('What would change.') })),
