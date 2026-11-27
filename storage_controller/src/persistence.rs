@@ -213,16 +213,6 @@ impl Persistence {
         Ok(Self::kubernetes_with_client(client, namespace))
     }
 
-    /// Return an error when the Kubernetes store finds its records went back, instead of exiting
-    /// the process (tests).
-    #[cfg(test)]
-    pub(crate) fn do_not_exit(mut self) -> Self {
-        if let Store::Kubernetes(store) = &mut self.store {
-            store.do_not_exit();
-        }
-        self
-    }
-
     /// Read lists `page` objects at a time in the Kubernetes store (tests).
     #[cfg(test)]
     pub(crate) fn list_page(mut self, page: u32) -> Self {

@@ -43,7 +43,7 @@ async fn kubernetes_store() -> Option<Persistence> {
 /// behind the store's back (as an etcd restore would).
 async fn kubernetes_store_and_client() -> Option<(Persistence, kube::Client, String)> {
     let (client, namespace) = kubernetes_client_and_namespace().await?;
-    let p = Persistence::kubernetes_with_client(client.clone(), namespace.clone()).do_not_exit();
+    let p = Persistence::kubernetes_with_client(client.clone(), namespace.clone());
     p.migration_run().await.expect("the kinds are installed");
     Some((p, client, namespace))
 }
@@ -1243,7 +1243,7 @@ async fn a_health_entry_without_its_shard_is_dropped_and_swept() {
         .delete(TENANT, &Default::default())
         .await
         .unwrap();
-    let fresh = Persistence::kubernetes_with_client(client.clone(), ns.clone()).do_not_exit();
+    let fresh = Persistence::kubernetes_with_client(client.clone(), ns.clone());
     let health = fresh.list_metadata_health_records().await.unwrap();
     assert_eq!(
         health
@@ -1272,11 +1272,7 @@ async fn reads_concurrent_with_writes_are_not_taken_for_the_store_going_back() {
     let Some((client, ns)) = kubernetes_client_and_namespace().await else {
         return;
     };
-    let p = Arc::new(
-        Persistence::kubernetes_with_client(client, ns)
-            .do_not_exit()
-            .list_page(3),
-    );
+    let p = Arc::new(Persistence::kubernetes_with_client(client, ns).list_page(3));
     p.migration_run().await.unwrap();
     p.insert_node(&node(1)).await.unwrap();
     let tenants: Vec<String> = (0..10)
@@ -1329,6 +1325,7 @@ async fn reads_concurrent_with_writes_are_not_taken_for_the_store_going_back() {
         r.await.unwrap();
     }
     let mut sorted = gens.clone();
+    sorted.sort();
     sorted.dedup();
     assert_eq!(
         sorted.len(),

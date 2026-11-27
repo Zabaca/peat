@@ -263,14 +263,14 @@ impl Default for StrictMode {
     }
 }
 
-/// Secrets may either be provided on the command line (for testing), or loaded from AWS SecretManager: this
-/// type encapsulates the logic to decide which and do the loading.
 /// Where the records are kept, with what each store needs.
 enum RecordsStore {
     Postgres { database_url: String },
     Kubernetes,
 }
 
+/// Secrets may either be provided on the command line (for testing), or loaded from AWS SecretManager: this
+/// type encapsulates the logic to decide which and do the loading.
 struct Secrets {
     records: RecordsStore,
     public_key: Option<JwtAuth>,
