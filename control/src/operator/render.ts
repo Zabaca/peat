@@ -522,6 +522,7 @@ export const STATEFULSET_POLICY = 'peat-control-statefulsets-keep-to-the-safekee
 export const SERVICE_POLICY = 'peat-control-services-stay-inside'
 export const COMPUTE_POLICY = 'peat-control-computes-of-the-compute-images'
 export const EXEC_POLICY = 'peat-control-exec-only-for-a-move'
+export const EXEC_SHAPE_POLICY = 'peat-control-exec-only-psql-in-a-compute'
 export const NODE_SPEC_FIELDS = ['configSource', 'externalID', 'podCIDR', 'podCIDRs', 'providerID', 'unschedulable'] as const
 
 export function guards(r: Resolved, storageImages: string[] = [r.images.storage], computeImages: string[] = [r.images.compute[18], r.images.compute[19]]): Manifest[] {
@@ -630,11 +631,29 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
       },
     },
     binding(COMPUTE_POLICY),
+    // An exec is a CONNECT: a policy sees its options (the container and the command) and the pod's name, not the pod. Two rules: the
+    // shape (only a compute's container, only psql or the move's script), with no parameter; and the pods a move lists, for the move's
+    // length, in the ConfigMap peat-move-pods, which the operator keeps (made empty, before the binding). The list's binding lets a
+    // missing list through (Allow): an API server reads the parameter before the rule's matchConditions (seen on v1.37), so a binding
+    // that denied on a missing list refused every account's exec in the cluster. With the list deleted by hand, until the operator makes
+    // it again, the control layer is held to the shape alone. What neither bounds: psql's arguments are free, so within a listed pod the
+    // account may run any SQL as the pod's local superuser while the move lasts.
     {
-      // an exec is a CONNECT: the policy sees its options (the container and the command) and the pod's name, not the pod; the pods a move
-      // may exec into are listed, for the move's length, by the control layer in the ConfigMap peat-move-execs (the parameter: none, and
-      // every exec is refused). What it does not bound: psql's arguments are free, so within a listed pod the account may run any SQL as the
-      // pod's local superuser while the move lasts.
+      apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', metadata: meta(r, EXEC_SHAPE_POLICY),
+      spec: {
+        failurePolicy: 'Fail',
+        matchConstraints: { resourceRules: [{ apiGroups: [''], apiVersions: ['v1'], operations: ['CONNECT'], resources: ['pods/exec', 'pods/attach'] }] },
+        matchConditions: byControl,
+        validations: [
+          { expression: `request.namespace == '${n.computeNamespace}' && request.resource.resource == 'pods' && request.subResource == 'exec'`, message: `the control layer's account may exec only into a compute, in ${n.computeNamespace} (never attach)` },
+          { expression: "object.container == 'compute'", message: "the control layer's account may exec only into a compute's container" },
+          { expression: `size(object.command) > 0 && (object.command[0] == 'psql' || (size(object.command) > 1 && object.command[0] == 'bash' && object.command[1] == '${MOVE_SCRIPT_PATH}'))`, messageExpression: `'the control layer may run psql or bash ${MOVE_SCRIPT_PATH} only, not ' + (size(object.command) > 0 ? object.command[0] : 'nothing')` },
+        ],
+      },
+    },
+    binding(EXEC_SHAPE_POLICY),
+    { apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(r, MOVE_EXECS_CONFIG_MAP, n.namespace) },
+    {
       apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', metadata: meta(r, EXEC_POLICY),
       spec: {
         failurePolicy: 'Fail',
@@ -642,14 +661,11 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
         matchConstraints: { resourceRules: [{ apiGroups: [''], apiVersions: ['v1'], operations: ['CONNECT'], resources: ['pods/exec', 'pods/attach'] }] },
         matchConditions: byControl,
         validations: [
-          { expression: `request.namespace == '${n.computeNamespace}' && request.resource.resource == 'pods' && request.subResource == 'exec'`, message: `the control layer's account may exec only into a compute, in ${n.computeNamespace} (never attach)` },
           { expression: "has(params.data) && params.data.exists(m, request.name in params.data[m].split(' '))", messageExpression: "'the control layer may exec only into a pod a move under way lists: ' + request.name + ' is not one'" },
-          { expression: "object.container == 'compute'", message: "the control layer's account may exec only into a compute's container" },
-          { expression: `size(object.command) > 0 && (object.command[0] == 'psql' || (size(object.command) > 1 && object.command[0] == 'bash' && object.command[1] == '${MOVE_SCRIPT_PATH}'))`, messageExpression: `'the control layer may run psql or bash ${MOVE_SCRIPT_PATH} only, not ' + (size(object.command) > 0 ? object.command[0] : 'nothing')` },
         ],
       },
     },
-    { apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicyBinding', metadata: meta(r, EXEC_POLICY), spec: { policyName: EXEC_POLICY, validationActions: ['Deny'], paramRef: { name: MOVE_EXECS_CONFIG_MAP, namespace: n.namespace, parameterNotFoundAction: 'Deny' } } },
+    { apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicyBinding', metadata: meta(r, EXEC_POLICY), spec: { policyName: EXEC_POLICY, validationActions: ['Deny'], paramRef: { name: MOVE_EXECS_CONFIG_MAP, namespace: n.namespace, parameterNotFoundAction: 'Allow' } } },
   ]
 }
 

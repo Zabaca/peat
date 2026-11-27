@@ -601,6 +601,28 @@ export interface ShardLocations {
   held: Record<string, { attached: boolean; generation: number | null } | undefined>
 }
 /**
+ * The locations `staleErrorProblem` compares, for the shards that carry an error: the controller's (`GET /debug/v1/tenant`) and what each
+ * pageserver lists (`GET /v1/tenant`, by tenant id). None when a pageserver did not answer (`undefined` in `held`): the shard then stays a
+ * problem.
+ */
+export function shardLocations(debug: any[], held: Record<string, Map<string, { attached: boolean; generation: number | null }> | undefined>, withError: Set<string>): Map<string, ShardLocations> {
+  const out = new Map<string, ShardLocations>()
+  if (Object.values(held).some((h) => h === undefined)) return out
+  for (const d of debug) {
+    const id = String(d.tenant_shard_id)
+    if (!withError.has(id)) continue
+    out.set(id, {
+      generation: typeof d.generation === 'number' ? d.generation : null,
+      intent: { attached: d.intent?.attached ?? null, secondary: (d.intent?.secondary ?? []) as number[] },
+      observed: Object.fromEntries(Object.entries(d.observed?.locations ?? {}).map(([n, v]: [string, any]) => [n, v?.conf ? { mode: String(v.conf.mode), generation: v.conf.generation ?? null } : undefined])),
+      held: Object.fromEntries(Object.entries(held).map(([n, h]) => [n, h!.get(id)])),
+    })
+  }
+  return out
+}
+/** The shards that carry an error (`last_error`), by id. */
+export const shardsWithError = (tenants: any[]): Set<string> => new Set<string>(tenants.flatMap((t) => (t.shards ?? []) as any[]).filter((s) => s.last_error).map((s) => String(s.tenant_shard_id)))
+/**
  * Whether a shard's `last_error` is a leftover: this version of the controller never clears one (a reconcile that succeeds leaves it; only a later error replaces it, and a restart empties it), so after a failed
  * compute notification that was retried and settled the string stays. It is a leftover, and so only a warning, when the shard is not reconciling, has no compute notification pending, **and the controller's intent, what it
  * has observed and what the pageservers themselves hold all agree**: the intended attached node holds it attached at the controller's generation (by the controller's observation and by that pageserver's own list), no other
@@ -712,4 +734,16 @@ export function computeImageFor(pg: number, images: Record<number, string | unde
   const image = images[pg]
   if (!image) throw new Error(`no compute image is set for Postgres ${pg}`)
   return image
+}
+
+/**
+ * What the control layer answers a caller held to `cls` (its pod address's class) calling `method path`: `pass`, `refuse` (403), or
+ * `again` (503, call again) for an address in no class calling what some class may. That is most likely a pod so new that the API server
+ * does not list its address yet: a storage controller sends its first notification within a second of starting, and a 403 is an answer it
+ * never retries and keeps as the shard's last error. `again` admits nothing.
+ */
+export function callerVerdict(routes: Record<string, [string, RegExp][]>, cls: string, method: string, path: string): 'pass' | 'again' | 'refuse' {
+  const may = (c: string) => routes[c]!.some(([m, re]) => m === method && re.test(path))
+  if (may(cls)) return 'pass'
+  return cls === 'unknown' && Object.keys(routes).some((c) => c !== 'unknown' && may(c)) ? 'again' : 'refuse'
 }

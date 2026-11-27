@@ -155,10 +155,13 @@ What a move leaves out of the copy and the comparison, matched by exact name, ne
 A person's role granted to `app`, and a person's role's membership in `neon_superuser`, are copied.
 
 What guards it:
-- The control layer may exec only into a compute's container in a pod listed in the ConfigMap `peat-move-execs`, only `psql` or
-  `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). An admission
-  rule enforces it; with no list, no exec passes.
-- The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-execs`
+- The control layer may exec only into a compute's container in a pod listed in the ConfigMap `peat-move-pods`, only `psql` or
+  `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). Two admission
+  rules enforce it: one the shape (namespace, container, command), one the list, which the operator makes empty and keeps. Neither
+  judges any account but the control layer's, whatever exists or is missing: an API server reads a rule's parameter before the rule's
+  own conditions, so the list's rule lets a missing list through. With the list deleted by hand, until the operator makes it again, the
+  control layer is held to the shape alone.
+- The list is not a limit on the control layer itself: its Role may write ConfigMaps in the platform namespace, `peat-move-pods`
   among them, so a control layer that misbehaves can list any compute. The list bounds what a move does, not what the account could do.
 - The rule does not bound `psql`'s arguments, so in a listed pod the control layer may run any SQL as the local superuser, and so any
   shell command in that container (`\!`, `-o '|command'`, `COPY ... TO PROGRAM`).

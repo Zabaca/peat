@@ -402,11 +402,13 @@ refused_exec() { # refused_exec <what> <expected message part> <exec args...>
   grep -qF "$want" <<< "$out" || fail "the exec guard refused $what, but not as expected: $out"
   echo "  refused: $what"
 }
-refused_exec 'an exec with no move under way (the list not there)' 'no params found' "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1'
-k -n peat create configmap peat-move-execs --from-literal="probe=some-other-pod" >/dev/null
+# the list is the operator's, there and empty from the install
+k -n peat get configmap peat-move-pods >/dev/null 2>&1 || fail "the operator did not make the exec guard's list, peat-move-pods"
+refused_exec 'an exec with no move under way (the list empty)' 'is not one' "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1'
+k -n peat patch configmap peat-move-pods --type merge -p '{"data":{"probe":"some-other-pod"}}' >/dev/null
 sleep 3
 refused_exec 'an exec into a compute no move lists' 'is not one' "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1'
-k -n peat patch configmap peat-move-execs --type merge -p "{\"data\":{\"probe\":\"$guard_pod\"}}" >/dev/null
+k -n peat patch configmap peat-move-pods --type merge -p "{\"data\":{\"probe\":\"$guard_pod\"}}" >/dev/null
 sleep 3
 refused_exec 'a command other than psql or the move script, in a listed pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- ls /
 refused_exec 'bash with a script of its own, in a listed pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- bash -c id
@@ -416,7 +418,15 @@ echo "  allowed: psql in a listed pod"
 if out=$(k --as=system:serviceaccount:peat-system:peat-operator -n peat-compute exec "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1' 2>&1); then fail "the operator's account was let exec"; fi
 grep -qF "runs no exec" <<< "$out" || fail "the operator's exec was refused, but not by its rule: $out"
 echo "  refused: an exec by the operator's account, into a listed pod"
-k -n peat delete configmap peat-move-execs >/dev/null
+# the list deleted by hand: the guard touches no account but the control layer's (an exec as the cluster's admin into a pod outside the
+# platform's namespaces), the control layer is still held to psql in a compute, and the operator makes the list again
+k -n peat delete configmap peat-move-pods >/dev/null
+[ "$(k -n store exec deploy/records-db -- echo reached)" = reached ] || fail "with the exec guard's list missing, the cluster's admin could not exec into a pod outside the platform"
+echo "  allowed: an exec by the cluster's admin outside the platform, the list missing"
+refused_exec 'a command other than psql or the move script, the list missing' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- ls /
+t0=$(date +%s); until k -n peat get configmap peat-move-pods >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'the operator did not make the list peat-move-pods again'; sleep 3; done
+k -n peat patch configmap peat-move-pods --type merge -p '{"data":{"probe":null}}' >/dev/null
+echo "  the list made again by the operator"
 
 step "a database moved from Postgres 18 to 19 under its own name (P2), with a second database and a second role of its own"
 dbobj mv18 'pgVersion: 18'
@@ -467,7 +477,7 @@ case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but 
 [ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'the second role, its password or its database did not come with the move'
 settings_kept 'in the move'
 [ "$(k -n shop get database mv18-pg18 -o jsonpath='{.status.pgVersion}')" = 18 ] || fail 'the old copy mv18-pg18 was not kept'
-if k -n peat get configmap peat-move-execs -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
+if k -n peat get configmap peat-move-pods -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
 echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, the settings, its old copy mv18-pg18 kept on 18"
 echo "  $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: the old version stopped [0-9]* ms after the last look at it' | tail -1)"
 

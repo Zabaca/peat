@@ -37,6 +37,7 @@ import {
   secondaryWarmProblem,
   seedCompletion,
   seedDecision,
+  callerVerdict,
   seedGroup,
   seedIds,
   staleErrorProblem,
@@ -231,7 +232,16 @@ describe('who may call which route', () => {
     expect(decide).toContain("?? 'unknown'")
     expect(decide).toContain("catch { return 'unknown' }")
     expect(decide).not.toContain("return 'gateway'")
-    expect(control).toContain('if (cls && !CALLER_ROUTES[cls]!.some(')
+    expect(control).toContain("const verdict = cls ? callerVerdict(CALLER_ROUTES, cls, req.method, path) : 'pass'")
+    // an address in no class calling what a piece may (a storage controller's first notification, before its pod's address is listed) is
+    // asked to call again (503, retried by the controller), never admitted; what no piece may call is refused
+    expect(callerVerdict(routes, 'unknown', 'PUT', '/hook/notify-attach')).toBe('again')
+    expect(callerVerdict(routes, 'unknown', 'GET', '/compute/current')).toBe('again')
+    expect(callerVerdict(routes, 'unknown', 'GET', '/healthz')).toBe('pass')
+    expect(callerVerdict(routes, 'unknown', 'POST', '/db')).toBe('refuse')
+    expect(callerVerdict(routes, 'compute', 'PUT', '/hook/notify-attach')).toBe('refuse')
+    expect(callerVerdict(routes, 'controller', 'PUT', '/hook/notify-attach')).toBe('pass')
+    expect(control).toContain("status: 503, headers: { 'content-type': 'application/json', 'retry-after': '1' }")
     expect(control).toContain("labelSelector=app%3Dpeat-compute`), 'list compute pods'")
     // names that reach an API path are held to a pattern, and a name with a slash or `..` matches neither
     const DB = /^[a-z][a-z0-9-]{0,30}$/
