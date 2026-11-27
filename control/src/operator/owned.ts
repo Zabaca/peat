@@ -25,13 +25,20 @@ export class Owned {
   private readonly entries = new Map<string, Entry>()
   private constructor(private readonly k: Kube, private readonly ns: string) {}
 
+  /** Whether the record was made new on this load (there was none): objects of the platform that exist then are named as such. */
+  fresh = false
+
   /** The record as kept: made empty (and kept) only when there is none at all. */
-  static async load(k: Kube, ns: string): Promise<Owned> {
+  static async load(k: Kube, ns: string, again = true): Promise<Owned> {
     const o = new Owned(k, ns)
     const path = `/api/v1/namespaces/${ns}/configmaps/${OWNED_CONFIG_MAP}`
     const r = await k.request('GET', path)
     if (r.status === 404) {
-      ok(await k.request('POST', `/api/v1/namespaces/${ns}/configmaps`, { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: OWNED_CONFIG_MAP, namespace: ns }, data: {} }), 'make the record of what the operator made', [409])
+      const made = ok(await k.request('POST', `/api/v1/namespaces/${ns}/configmaps`, { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: OWNED_CONFIG_MAP, namespace: ns }, data: {} }), 'make the record of what the operator made', [409])
+      // made by another pass between the read and the create: that one is read, never taken as empty
+      if (made.status === 409 && again) return Owned.load(k, ns, false)
+      ok(made, 'make the record of what the operator made')
+      o.fresh = true
       return o
     }
     ok(r, 'read the record of what the operator made')
