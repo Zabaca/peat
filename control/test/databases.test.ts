@@ -37,6 +37,16 @@ describe('made as its spec says', () => {
     expect(act(first, [first, second])).toMatchObject({ do: 'make' })
     expect(act(second, [first, second])).toEqual({ do: 'refuse', why: 'the name orders is taken by the database in a: a name is unique across the platform' })
   })
+  test('a status that lost its record is written again from the platform\'s record, never made again; a record in another namespace holds the name', () => {
+    const records = new Map([['orders', { namespace: 'shop' }]])
+    expect(databaseAction(db('orders'), [db('orders')], { replacementOpen: null, records })).toEqual({ do: 'rebuild' })
+    const other = db('orders', { ns: 'elsewhere' })
+    expect(databaseAction(other, [other], { replacementOpen: null, records })).toEqual({ do: 'refuse', why: 'the name orders is taken by the database in shop: a name is unique across the platform' })
+    // a deleted object whose status lost its record still waits for what was made from it
+    const root = { ...db('orders'), metadata: { ...db('orders').metadata, deletionTimestamp: '2026-12-01T00:00:00Z' } }
+    const branch = db('orders-dev', { made: true, spec: { parent: 'orders' } })
+    expect(databaseAction(root, [root, branch], { replacementOpen: null, records })).toMatchObject({ do: 'wait' })
+  })
   test('refused: a malformed name, a drill\'s name, a parent and a replica at once, a moment with no parent, a branch of another version', () => {
     expect(act(db('Orders'))).toMatchObject({ do: 'refuse' })
     expect(act(db('drill-x'))).toMatchObject({ do: 'refuse', why: expect.stringContaining('drills') })
@@ -77,6 +87,11 @@ describe('deleted', () => {
     const drill = db('drill-x', { made: true, metadata: { name: 'drill-x', namespace: 'shop', finalizers: [FINALIZER], annotations: { [DRILL]: 'true' } } })
     expect(act(gone(drill))).toEqual({ do: 'delete', holdData: false })
     expect(act(gone(db('orders')))).toEqual({ do: 'delete', holdData: false })
+    // the annotation alone is not a drill: a person who adds it to their own database still gets the hold
+    const marked = db('orders', { made: true, metadata: { name: 'orders', namespace: 'shop', finalizers: [FINALIZER], annotations: { [DRILL]: 'true' } } })
+    expect(act(gone(marked))).toEqual({ do: 'delete', holdData: true })
+    // a status that lost its record, with the platform's record there: held all the same
+    expect(databaseAction(gone(db('orders')), [], { replacementOpen: null, records: new Map([['orders', { namespace: 'shop' }]]) })).toEqual({ do: 'delete', holdData: true })
   })
   test('a root waits for what was made from it', () => {
     const root = gone(db('orders', { made: true })), branch = db('orders-dev', { made: true, spec: { parent: 'orders' } })
@@ -104,5 +119,14 @@ describe('the hold', () => {
     expect(purgeDue({ deleteAfter: '2026-11-30T00:00:00Z', tenant: 't', root: true }, now, true)).toBe(false)
     expect(purgeDue({ deleteAfter: '2026-11-30T00:00:00Z', tenant: 't', root: true }, now, false)).toBe(true)
     expect(purgeDue({ deleteAfter: 'never', tenant: 't', root: false }, now, false)).toBe(false)
+  })
+})
+
+describe('closed', () => {
+  test('closed once, and closed again when a compute started as it closed (a start that read the database just before)', () => {
+    expect(act(db('orders', { made: true, spec: { closed: true } }))).toEqual({ do: 'close' })
+    expect(act(db('orders', { made: true, spec: { closed: true }, status: { phase: 'Closed' } }))).toEqual({ do: 'none' })
+    expect(act(db('orders', { made: true, spec: { closed: true }, status: { phase: 'Closed', awake: true } }))).toEqual({ do: 'close' })
+    expect(act(db('orders', { made: true, spec: { closed: false }, status: { phase: 'Closed' } }))).toEqual({ do: 'open' })
   })
 })

@@ -15,12 +15,13 @@ export const DB_NAME = /^[a-z][a-z0-9-]{0,30}$/
 export interface DbObject {
   metadata: { name: string; namespace: string; creationTimestamp?: string; deletionTimestamp?: string; finalizers?: string[]; annotations?: Record<string, string> }
   spec?: { pgVersion?: number; parent?: string; at?: string; replicaOf?: string; closed?: boolean; requests?: { stop?: string; rehearseMove?: string } }
-  status?: { tenant?: string; timeline?: string; pgVersion?: number; phase?: string; message?: string; answered?: { stop?: string; rehearseMove?: string } }
+  status?: { tenant?: string; timeline?: string; pgVersion?: number; phase?: string; message?: string; awake?: boolean; answered?: { stop?: string; rehearseMove?: string } }
 }
 
 export type Action =
   | { do: 'finalize' }
   | { do: 'make'; kind: 'root' | 'branch' | 'replica'; from?: string; at?: string; pg?: number }
+  | { do: 'rebuild' }
   | { do: 'delete'; holdData: boolean }
   | { do: 'close' }
   | { do: 'open' }
@@ -32,27 +33,36 @@ export type Action =
 const made = (o: DbObject) => Boolean(o.status?.tenant)
 const older = (a: DbObject, b: DbObject) => String(a.metadata.creationTimestamp ?? '') < String(b.metadata.creationTimestamp ?? '') || (a.metadata.creationTimestamp === b.metadata.creationTimestamp && a.metadata.namespace < b.metadata.namespace)
 
+/** A drill's database: the platform's drills alone make one (the annotation and a name beginning `drill`, which a person's call is refused). */
+export const isDrill = (o: DbObject) => o.metadata.annotations?.[DRILL] === 'true' && o.metadata.name.startsWith('drill')
+
 /**
- * The next thing to do about `o`, given every Database (`all`) and whether a safekeeper replacement is open (no database is made while one
- * is: the controller could put a new timeline on the member being replaced). In order: a deleted object is taken apart (a root waits for its
- * branches and replicas to go first); an object without the finalizer gets it; an object not made yet is made, unless its name is taken
- * (names are unique across namespaces: the oldest object keeps it), malformed, a drill's, or its parent is not made yet; a made one is
- * closed, opened or stopped as its spec asks. A version raised or lowered is refused here (the move to a newer version is its own step).
+ * The next thing to do about `o`, given every Database (`all`), the records the platform namespace keeps (`records`: by name, the namespace
+ * of each) and whether a safekeeper replacement is open (no database is made while one is: the controller could put a new timeline on the
+ * member being replaced). In order: a deleted object is taken apart (a root waits for its branches and replicas to go first); an object
+ * without the finalizer gets it; an object whose status lost its record while the platform's record of it is there has its status written
+ * again from it; an object not made yet is made, unless its name is taken (names are unique across namespaces: the oldest object, or a
+ * record, keeps it), malformed, a drill's, or its parent is not made yet; a made one is closed (again, if a compute started as it closed),
+ * opened or stopped as its spec asks. A version raised or lowered is refused here (the move to a newer version is its own step).
  */
-export function databaseAction(o: DbObject, all: DbObject[], ctx: { replacementOpen: string | null }): Action {
+export function databaseAction(o: DbObject, all: DbObject[], ctx: { replacementOpen: string | null; records?: Map<string, { namespace: string }> }): Action {
   const name = o.metadata.name
   const others = all.filter((x) => x !== o && !(x.metadata.name === name && x.metadata.namespace === o.metadata.namespace))
   if (o.metadata.deletionTimestamp) {
     if (!(o.metadata.finalizers ?? []).includes(FINALIZER)) return { do: 'none' }
-    if (made(o)) {
+    const recorded = made(o) || ctx.records?.get(name)?.namespace === o.metadata.namespace
+    if (recorded) {
       const children = others.filter((x) => (x.spec?.parent === name || x.spec?.replicaOf === name) && x.metadata.namespace === o.metadata.namespace && !x.metadata.deletionTimestamp)
       if (children.length) return { do: 'wait', why: `deleted, waiting for ${children.map((x) => x.metadata.name).join(', ')} (made from it) to be deleted first` }
     }
-    return { do: 'delete', holdData: made(o) && o.metadata.annotations?.[DRILL] !== 'true' }
+    return { do: 'delete', holdData: recorded && !isDrill(o) }
   }
   if (o.metadata.annotations?.[COPYING]) return { do: 'none' }
   if (!(o.metadata.finalizers ?? []).includes(FINALIZER)) return { do: 'finalize' }
   if (!made(o)) {
+    const rec = ctx.records?.get(name)
+    if (rec && rec.namespace === o.metadata.namespace) return { do: 'rebuild' }
+    if (rec) return { do: 'refuse', why: `the name ${name} is taken by the database in ${rec.namespace}: a name is unique across the platform` }
     if (!DB_NAME.test(name)) return { do: 'refuse', why: `a database's name is 1 to 31 lowercase letters, digits or hyphens, starting with a letter, not ${JSON.stringify(name)}` }
     if (name.startsWith('drill') && o.metadata.annotations?.[DRILL] !== 'true') return { do: 'refuse', why: 'names that begin with drill belong to the platform\'s drills' }
     const holder = others.find((x) => x.metadata.name === name && (made(x) || older(x, o)))
@@ -71,7 +81,7 @@ export function databaseAction(o: DbObject, all: DbObject[], ctx: { replacementO
     if (o.spec?.parent) return { do: 'make', kind: 'branch', from: o.spec.parent, ...(o.spec.at ? { at: o.spec.at } : {}) }
     return { do: 'make', kind: 'root', ...(o.spec?.pgVersion ? { pg: o.spec.pgVersion } : {}) }
   }
-  if (o.spec?.closed && o.status?.phase !== 'Closed') return { do: 'close' }
+  if (o.spec?.closed && (o.status?.phase !== 'Closed' || o.status?.awake)) return { do: 'close' }
   if (!o.spec?.closed && o.status?.phase === 'Closed') return { do: 'open' }
   const stop = o.spec?.requests?.stop
   if (stop && stop !== o.status?.answered?.stop) return { do: 'stop', request: stop }
