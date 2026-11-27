@@ -175,15 +175,43 @@ pub async fn compare(
     ))
 }
 
+/// Whether a copy may replace what the destination holds, and what it may lose doing so.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Replace {
+    /// Remove what the destination holds first (`--replace`).
+    pub replace: bool,
+    /// With `replace`: the source holds no pageserver, and the destination is meant to be
+    /// emptied (`--empty-destination`).
+    pub empty_destination: bool,
+    /// With `replace`: the destination holds a shard at a higher generation than the source, a
+    /// timeline at a higher membership generation, or one the source lacks, and these are meant
+    /// to go (`--accept-older`).
+    pub accept_older: bool,
+}
+
+impl From<bool> for Replace {
+    fn from(replace: bool) -> Self {
+        Replace {
+            replace,
+            ..Default::default()
+        }
+    }
+}
+
 /// Copy every record of one store into the other, then compare them.
 pub async fn copy(
     stores: &Stores,
     from: Store,
     to: Store,
-    replace: bool,
+    replace: impl Into<Replace>,
     running: &Running,
     accept_remade: &BTreeSet<String>,
 ) -> anyhow::Result<Outcome> {
+    let Replace {
+        replace,
+        empty_destination,
+        accept_older,
+    } = replace.into();
     if from == Store::Bucket || to == Store::Bucket {
         return Ok(Outcome::Refused(
             "copy moves records between postgres and kubernetes; the bucket is read by restore"
@@ -202,7 +230,40 @@ pub async fn copy(
     if let Some(reason) = something_may_run(&records, running, to == Store::Postgres).await {
         return Ok(Outcome::Refused(reason));
     }
+    if replace {
+        // A working platform has its pageservers registered: a source with none would empty the
+        // destination
+        if records.pageservers.is_empty() && !empty_destination {
+            return Ok(Outcome::Refused(format!(
+                "the source holds no pageserver ({:?}): with --replace it would empty the \
+                 destination; give --empty-destination too if that is meant",
+                records.counts()
+            )));
+        }
+        // Nothing the destination holds is lowered or dropped unless that is meant
+        let held = stores.open(to, false).await?.read_all_records().await?;
+        let older = older_than(&records, &held, accept_remade);
+        if !older.is_empty() && !accept_older {
+            return Ok(Outcome::Refused(format!(
+                "the destination holds what the source would lower or drop: {older:?}; give \
+                 --accept-older too if that is meant"
+            )));
+        }
+    }
     if to == Store::Postgres {
+        // Back into Postgres: checked against the copy's highest-ever values too when the
+        // bucket is given
+        if stores.records_copy_storage.is_some() {
+            if let Some(old) = stores.bucket().await?.read().await? {
+                let stale = below_highest(&records, &old, accept_remade);
+                if !stale.is_empty() {
+                    return Ok(Outcome::Refused(format!(
+                        "the source holds generations below what the copy in the bucket has \
+                         seen: {stale:?}; give --accept-remade with those that were remade"
+                    )));
+                }
+            }
+        }
         let dest = stores.open(to, true).await?;
         return write_checked(&dest, &records, replace, &BTreeMap::new()).await;
     }
@@ -240,6 +301,55 @@ pub async fn copy(
         write_new_copy(&bucket, &records, revisions, old.as_ref()).await?;
     }
     Ok(outcome)
+}
+
+/// What `held` (the destination) has that `source` would lower or drop: a shard at a higher
+/// generation or missing from the source, a timeline at a higher membership generation or missing.
+/// Records named in `accept_remade` (remade under their id, so lower) are not counted.
+fn older_than(source: &Records, held: &Records, accept_remade: &BTreeSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, t) in &held.tenants {
+        let key = record_key(TenantSpec::KIND, name);
+        if accept_remade.contains(&key) {
+            continue;
+        }
+        for shard in &t.shards {
+            let theirs = source.tenants.get(name).and_then(|s| {
+                s.shards.iter().find(|x| {
+                    (x.shard_number, x.shard_count) == (shard.shard_number, shard.shard_count)
+                })
+            });
+            let at = format!("{key} shard {}/{}", shard.shard_number, shard.shard_count);
+            match theirs {
+                None => out.push(format!("{at}: not in the source")),
+                Some(s) if s.generation < shard.generation => out.push(format!(
+                    "{at}: generation {:?}, the source has {:?}",
+                    shard.generation, s.generation
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    for (name, t) in &held.timelines {
+        let key = record_key(TimelineSpec::KIND, name);
+        if accept_remade.contains(&key) {
+            continue;
+        }
+        let Some(m) = &t.membership else { continue };
+        match source
+            .timelines
+            .get(name)
+            .and_then(|s| s.membership.as_ref())
+        {
+            None => out.push(format!("{key}: not in the source")),
+            Some(s) if s.generation < m.generation => out.push(format!(
+                "{key}: membership generation {}, the source has {}",
+                m.generation, s.generation
+            )),
+            Some(_) => {}
+        }
+    }
+    out
 }
 
 /// The tenants and timelines whose generations are below the copy's highest-ever values.

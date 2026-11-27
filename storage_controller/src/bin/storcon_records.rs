@@ -76,6 +76,14 @@ enum Command {
         /// Remove what the destination holds first
         #[arg(long)]
         replace: bool,
+        /// With --replace: the source holds no pageserver, and the destination is meant to be
+        /// emptied
+        #[arg(long, requires = "replace")]
+        empty_destination: bool,
+        /// With --replace: the destination's shards or timelines at higher generations than the
+        /// source's, or that the source lacks, are meant to be lowered or dropped
+        #[arg(long, requires = "replace")]
+        accept_older: bool,
         /// Tenants and timelines (`<Kind>/<name>`) remade under their id, whose generations are
         /// below what the copy has seen
         #[arg(long, value_delimiter = ',')]
@@ -197,10 +205,17 @@ async fn run(stores: &Stores, command: Command) -> anyhow::Result<Outcome> {
             from,
             to,
             replace,
+            empty_destination,
+            accept_older,
             accept_remade,
             running,
         } => {
             let accept: BTreeSet<String> = accept_remade.into_iter().collect();
+            let replace = records_tool::Replace {
+                replace,
+                empty_destination,
+                accept_older,
+            };
             let outcome =
                 records_tool::copy(stores, from, to, replace, &running.running(), &accept).await?;
             if outcome == Outcome::Done {
