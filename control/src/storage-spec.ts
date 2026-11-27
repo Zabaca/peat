@@ -267,6 +267,14 @@ export type TimelineRead = { answered: false } | { answered: true; onLost: boole
  * Whether a lost safekeeper may be decommissioned (and its StatefulSet and marks removed): only when EVERY primary timeline was answered about and none still lists it. A timeline nobody answered about is unknown, never
  * "not on the lost one": when the other members blip at the closing count, or every member lost its disk, nothing is known, and a decommission then leaves sets without their replacement (found in review, 2026-11-20).
  */
+/**
+ * Whether a timeline nobody answered about is lost everywhere: every member its set lists (and any it is moving to) is lost, by a
+ * lost-disk mark or by being decommissioned already. Then it is answered for (nothing of it is left on any member to move: the way on is
+ * the database's recovery from the store). A member that is alive, or only silent with no mark (a reboot, a blip), keeps it unknown.
+ */
+export function lostEverywhere(members: number[], lost: ReadonlySet<number>): boolean {
+  return members.length > 0 && members.every((id) => lost.has(id))
+}
 export function closeDecision(reads: TimelineRead[]): { todo: number; unknown: number; close: boolean } {
   const todo = reads.filter((r) => r.answered && r.onLost).length
   const unknown = reads.filter((r) => !r.answered).length

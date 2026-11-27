@@ -65,6 +65,14 @@ branches to be deleted first, and the name can be used again at once. The contro
 (an install whose records are the control layer's older ConfigMaps, or a cluster whose objects were lost) and compares the two
 (`?dry=1` compares only); `?held=<name>` first brings a deleted database back from its held data while the hold lasts.
 
+When every safekeeper is lost (every member's disk, so no member holds a timeline's write-ahead log), no database can start: what
+each one wrote and the pageservers uploaded to the store is kept; what was written and not yet uploaded is gone. The way on: (1) the
+lost members are retired: the control layer does it by itself once every timeline is answered for (a timeline no member answers about
+counts as answered when every member its set lists carries a lost-disk mark or is already retired; one member alive, or only silent
+with no mark, keeps it unknown and the member kept), or a person asks `POST /sk/<id>/decommission`; (2) the control layer seeds three
+new members when every listed one is retired; (3) each database is recovered under its own name, `POST /db/<name>/recover` (`?dry=1`
+first says what it would do): a new timeline from the store's last upload, the same name, address and login.
+
 ## Installing
 
 The control image is `ghcr.io/zabaca/peat/control`, published with the storage and compute images on every merge to main, tagged with

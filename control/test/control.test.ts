@@ -39,6 +39,7 @@ import {
   seedDecision,
   callerVerdict,
   seedGroup,
+  lostEverywhere,
   shardLocations,
   seedIds,
   staleErrorProblem,
@@ -338,6 +339,23 @@ describe('the program\'s settings for the pieces it makes', () => {
 })
 
 describe('the safekeepers: closing, seeding, moving, deciding', () => {
+  test('a timeline nobody answers about is answered for only when every member listed for it is lost for good', () => {
+    // every member of its set lost (a lost-disk mark, or decommissioned already): answered for, the decommission goes through
+    expect(lostEverywhere([7, 8, 9], new Set([7, 8, 9]))).toBe(true)
+    // one lost, one merely unreachable (no mark: a reboot, a blip): unknown
+    expect(lostEverywhere([7, 8], new Set([7]))).toBe(false)
+    // one alive (no mark; were it holding the timeline it would have answered): unknown
+    expect(lostEverywhere([7, 8, 9], new Set([7, 8]))).toBe(false)
+    // a member it is moving to counts as listed; no member listed (the controller did not say) is unknown
+    expect(lostEverywhere([7, 8, 9, 10], new Set([7, 8, 9]))).toBe(false)
+    expect(lostEverywhere([], new Set([7]))).toBe(false)
+    // in the closing count: only after nobody answered, from the controller's own set (and its move), with the lost marks and the decommissioned
+    const reads = control.slice(control.indexOf('async function readTimelines'), control.indexOf('async function replacementOpen'))
+    expect(reads).toContain('if (!read.answered) {')
+    expect(reads).toContain('/debug/v1/tenant/${t}/timeline/${tl}/locate')
+    expect(reads).toContain('if (lostEverywhere(members, lostIds)) read = { answered: true, onLost: false }')
+    expect(reads).toContain("labelSelector=peat-sk-lost")
+  })
   test('a lost safekeeper is closed only when every timeline was answered about and none lists it', () => {
     const on = { answered: true, onLost: true } as const, off = { answered: true, onLost: false } as const, unknown = { answered: false } as const
     expect(closeDecision([])).toEqual({ todo: 0, unknown: 0, close: true })
@@ -537,7 +555,7 @@ describe('the safekeepers: closing, seeding, moving, deciding', () => {
   })
 
   test('a safekeeper the control layer replaces is made from the shared definition, with the install\'s Secret names and volume', () => {
-    expect(control).toContain("import { SAFEKEEPER_RESOURCES, SEED_GROUP_ANNOTATION, closeDecision, decommissionDecision, reopenDecision, totalLossEvidence, formatSeedGroup, parseSeedGroup, membersOffBox, moveDecision, otherReplacementOpen, placementFor, replaceDecision, replacementMachines, replacementPool, safekeeperStatefulSet, seedCompletion, seedDecision, seedGroup, seedIds, neverWritten, isPullTimelineFailure, keeperNodeProblem, keeperReplacementVerdict, certInfo, certNeedsReload, tcpUp, memoryGauges, placementVerdict, startVerdict, within, type MemberAt, type ReplacementMark, type SkRecord, type TimelineRead } from './storage-spec'")
+    expect(control).toContain("import { SAFEKEEPER_RESOURCES, SEED_GROUP_ANNOTATION, closeDecision, decommissionDecision, lostEverywhere, reopenDecision, totalLossEvidence, formatSeedGroup, parseSeedGroup, membersOffBox, moveDecision, otherReplacementOpen, placementFor, replaceDecision, replacementMachines, replacementPool, safekeeperStatefulSet, seedCompletion, seedDecision, seedGroup, seedIds, neverWritten, isPullTimelineFailure, keeperNodeProblem, keeperReplacementVerdict, certInfo, certNeedsReload, tcpUp, memoryGauges, placementVerdict, startVerdict, within, type MemberAt, type ReplacementMark, type SkRecord, type TimelineRead } from './storage-spec'")
     expect(control).toContain('secrets: SK_SECRETS,')
     expect(control).toContain('volumeRoot: SK_VOLUME')
   })

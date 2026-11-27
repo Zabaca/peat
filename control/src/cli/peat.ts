@@ -37,9 +37,11 @@ export function parseAt(v: string | undefined, now = Date.now()): string {
   if (t > now) throw new Refused(`--at ${v} is in the future`)
   return new Date(t).toISOString()
 }
-export function checkName(name: string | undefined, what = 'the database'): string {
+/** A database's name as the command takes it: a drill's name is refused for making and changing one (a person's database is never taken for a
+ * drill's), but taken by a delete (`drill`), so a drill's database a failed drill left is removed without the drills' own clean-up. */
+export function checkName(name: string | undefined, what = 'the database', drill = false): string {
   if (!name || !DB_NAME.test(name)) throw new Refused(`${what}'s name is 1 to 31 lowercase letters, digits or hyphens, starting with a letter: ${JSON.stringify(name ?? '')}`)
-  if (name.startsWith('drill')) throw new Refused(`${name}: names beginning "drill" belong to the platform's drills`)
+  if (name.startsWith('drill') && !drill) throw new Refused(`${name}: names beginning "drill" belong to the platform's drills`)
   return name
 }
 export function parsePg(v: string | undefined): 18 | 19 {
@@ -224,7 +226,7 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
         return await follow((y) => y.status?.move?.to === pg && !y.status?.move?.rehearsal, `the move to Postgres ${pg}`)
       }
       case 'delete': {
-        const o = await find(checkName(a))
+        const o = await find(checkName(a, 'the database', true))
         if (!opts['yes']) { out.line(`deleting ${o.metadata.namespace}/${a}${where} removes its compute now and its data after the platform's hold: add --yes`); return 1 }
         ok(await k.request('DELETE', dbPath(o.metadata.namespace, a!)), `delete ${a}`, [404])
         out.line(`${o.metadata.namespace}/${a}${where}: deleted (its compute goes now, its data after the platform's hold)`)
