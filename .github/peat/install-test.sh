@@ -513,6 +513,7 @@ case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but 
 [ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all on 19'
 [ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'the second role, its password or its database did not come with the move'
 settings_kept 'in the move'
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.move.verify}')" = counts ] || fail "a real move did not check by row counts, the default: $(k -n shop get database mv18 -o jsonpath='{.status.move.verify}')"
 [ "$(k -n shop get database mv18-pg18 -o jsonpath='{.status.pgVersion}')" = 18 ] || fail 'the old copy mv18-pg18 was not kept'
 if k -n peat get configmap peat-move-pods -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
 echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, the settings, its old copy mv18-pg18 kept on 18"
@@ -610,7 +611,8 @@ swsql 'create database zbig'
 swsql "create table big as select g as id, md5(g::text) as note from generate_series(1, 2000000) g" zbig
 curl -fsS -X POST localhost:18080/db/sw18/stop >/dev/null || fail 'sw18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=sw18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'sw18 did not stop'; sleep 2; done
-k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
+# moveVerify full: a comparison of every row, long enough on zbig's 2M rows to write during it (row counts take a moment)
+k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19,"moveVerify":"full"}}' >/dev/null
 t0=$(date +%s); until sw_pod=$(ready_pod peat-compute compute=sw18) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 k -n peat-compute port-forward "pod/$sw_pod" 25433:5432 >>"$work/tunnel-sw.log" 2>&1 &
 pids+=($!); sw_tunnel=$!
