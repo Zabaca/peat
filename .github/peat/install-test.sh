@@ -444,7 +444,7 @@ refused_exec 'an exec with no move under way (no grant)' 'is forbidden' "$guard_
 # the shape rule, with exec granted on the pod by hand (as the operator grants a move's pods)
 k -n peat-compute create role probe-exec --verb=create,get --resource=pods/exec --resource-name="$guard_pod" >/dev/null
 k -n peat-compute create rolebinding probe-exec --role=probe-exec --serviceaccount=peat:peat-control >/dev/null
-t0=$(date +%s); until [ "$(k "${as_control[@]}" auth can-i create pods/exec/"$guard_pod" -n peat-compute 2>/dev/null)" = yes ]; do [ "$(since "$t0")" -lt 30 ] || fail 'the hand-made grant did not take'; sleep 1; done
+t0=$(date +%s); until [ "$(k "${as_control[@]}" auth can-i create pods/"$guard_pod" --subresource=exec -n peat-compute 2>/dev/null)" = yes ]; do [ "$(since "$t0")" -lt 30 ] || fail 'the hand-made grant did not take'; sleep 1; done
 refused_exec 'a command other than psql or the move script, in a granted pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- ls /
 refused_exec 'bash with a script of its own, in a granted pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- bash -c id
 [ "$(k "${as_control[@]}" -n peat-compute exec "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1')" = 1 ] || fail 'the exec guard refused psql in a granted pod'
@@ -620,7 +620,7 @@ if [ -n "$other_pod" ]; then
   k "${as[@]}" -n shop patch database sw18 --subresource=status --type merge -p "{\"status\":{\"move\":{\"pods\":[\"$sw_pod\",\"$tgt_pod\",\"$other_pod\"]}}}" >/dev/null
   sleep 3
   case "$(k -n peat-compute get role peat-move-sw18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null)" in *"$other_pod"*) fail "a pod of another database named in a move's ask was granted: $other_pod";; esac
-  [ "$(k "${as[@]}" auth can-i create pods/exec/"$other_pod" -n peat-compute 2>/dev/null)" = no ] || fail "the control layer may exec into another database's pod $other_pod"
+  [ "$(k "${as[@]}" auth can-i create pods/"$other_pod" --subresource=exec -n peat-compute 2>/dev/null)" = no ] || fail "the control layer may exec into another database's pod $other_pod"
   echo "  the move's grant is its two pods; $other_pod, another database's, named in its ask, is not granted"
 else
   echo "  the move's grant is its two pods (no other database's compute was up to name)"
@@ -646,7 +646,7 @@ sw_message=$(k -n shop get database sw18 -o jsonpath='{.status.move.message}')
 grep -q 'written during the comparison' <<< "$sw_message" || fail "the move failed, but not on the write counts: $sw_message"
 phase_is sw18 Ready 120
 t0=$(date +%s); while k -n peat-compute get role peat-move-sw18 >/dev/null 2>&1; do [ "$(since "$t0")" -lt 30 ] || fail "the failed move's exec grant was left"; sleep 1; done
-[ "$(k "${as[@]}" auth can-i create pods/exec/"$sw_pod" -n peat-compute 2>/dev/null)" = no ] || fail 'the control layer may still exec into the source after the move'
+[ "$(k "${as[@]}" auth can-i create pods/"$sw_pod" --subresource=exec -n peat-compute 2>/dev/null)" = no ] || fail 'the control layer may still exec into the source after the move'
 echo "  after the move: its grant taken back"
 t0=$(date +%s); until got=$(swsql 'select count(*) from w') 2>/dev/null; do [ "$(since "$t0")" -lt 240 ] || fail 'sw18 did not answer after its move'; sleep 3; done
 case "$(swsql 'show server_version_num')" in 18*) ;; *) fail 'sw18 is not on Postgres 18 after its failed move';; esac
