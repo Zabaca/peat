@@ -78,6 +78,11 @@ if [ -z "$ready" ]; then
   tail -50 "$work/apiserver.log" >&2
   exit 1
 fi
+# From here on, trust the API server's own certificate (made when it starts, so not before it is
+# ready): its file holds the server's certificate, then the CA that signed it. Skipping the check
+# instead makes every client log "Server cert bypassed", which Neon's suites take for an error.
+awk '/BEGIN CERTIFICATE/ { n++ } n == 2' "$work/certs/apiserver.crt" > "$work/certs/ca.crt"
+sed -i.bak "s|insecure-skip-tls-verify: true|certificate-authority: \"$work/certs/ca.crt\"|" "$work/kubeconfig"
 "${kubectl[@]}" apply -f "$here/crds.yaml" >/dev/null
 "${kubectl[@]}" wait --for condition=established --timeout=60s -f "$here/crds.yaml" >/dev/null
 

@@ -132,6 +132,16 @@ enum Command {
         #[command(flatten)]
         running: RunningArgs,
     },
+    /// The scale measure (storage_controller/kubernetes/measure.md): a storage server's restart
+    /// with this many databases on it, on records of its own in a namespace it makes and deletes
+    /// (and on --database-url, an empty Postgres database, when given)
+    MeasureRestart {
+        #[arg(long, default_value_t = 1000)]
+        tenants: usize,
+        /// Leave the measure's namespace and its records in place
+        #[arg(long)]
+        keep: bool,
+    },
 }
 
 #[tokio::main]
@@ -173,6 +183,19 @@ async fn main() {
 
 async fn run(stores: &Stores, command: Command) -> anyhow::Result<Outcome> {
     match command {
+        Command::MeasureRestart { tenants, keep } => {
+            let lines = records_tool::measure::measure_restart(&records_tool::measure::Measure {
+                tenants,
+                kubeconfig: stores.kubeconfig.clone(),
+                database_url: stores.database_url.clone(),
+                keep,
+            })
+            .await?;
+            for line in lines {
+                println!("{line}");
+            }
+            Ok(Outcome::Done)
+        }
         Command::Dump { from, output } => {
             let doc = records_tool::dump(stores, from).await?;
             match output {
