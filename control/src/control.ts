@@ -54,7 +54,7 @@ const SK_SECRETS = { store: process.env['SAFEKEEPER_STORE_SECRET'] || 'peat-stor
 // The directory on each machine that holds its safekeepers' data (one subdirectory per member), and whether it must exist already
 // (`Directory`: a volume that did not provision fails the pod instead of filling the system disk) or is made (`DirectoryOrCreate`)
 const SK_VOLUME = process.env['SAFEKEEPER_VOLUME'] || '/var/lib/peat/safekeeper'
-const SK_VOLUME_TYPE = process.env['SAFEKEEPER_VOLUME_TYPE'] === 'DirectoryOrCreate' ? 'DirectoryOrCreate' : 'Directory'
+const SK_VOLUME_CREATE = process.env['SAFEKEEPER_VOLUME_TYPE'] === 'DirectoryOrCreate'
 // one StatefulSet of one pod per machine, node id = the machine's number: pageserver-w<id>-0, safekeeper-w<id>-0
 const COMPUTE_IMAGE = process.env['COMPUTE_IMAGE'] ?? ''
 if (!COMPUTE_IMAGE) throw new Error('COMPUTE_IMAGE is not set')
@@ -855,7 +855,7 @@ const skStatefulSet = (id: number, node: string) => {
     id, node, namespace: NS, image: STORAGE_IMAGE, controlUrl: CONTROL_URL,
     remote: { endpoint: process.env['S3_ENDPOINT'] ?? '', bucket: process.env['S3_BUCKET'] ?? '', region: process.env['S3_REGION'] ?? 'auto', prefix: S3_PREFIX },
     secrets: SK_SECRETS,
-    placement: placementFor(node, { keeperMachines: KEEPER_MACHINES, platform: PLACEMENT, keeper: KEEPER_PLACEMENT }), volumeRoot: SK_VOLUME, volumeType: SK_VOLUME_TYPE, walBackupParallelJobs: Number(process.env['SK_WAL_BACKUP_JOBS'] ?? '2'),
+    placement: placementFor(node, { keeperMachines: KEEPER_MACHINES, platform: PLACEMENT, keeper: KEEPER_PLACEMENT }), volumeRoot: SK_VOLUME, volumeCreate: SK_VOLUME_CREATE, walBackupParallelJobs: Number(process.env['SK_WAL_BACKUP_JOBS'] ?? '2'),
     resources: SK_RESOURCES,
     labels: { 'peat-sk': 'true' },
   })

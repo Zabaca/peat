@@ -37,18 +37,29 @@ export interface SafekeeperOptions {
   /** The hostPath that is the machine's safekeeper volume (its root). */
   volumeRoot: string
   /** Whether that root must exist (`Directory`, the default) or is made (`DirectoryOrCreate`). */
-  volumeType?: 'Directory' | 'DirectoryOrCreate'
+  /** Make the volume's root when it is missing (`hostDir`). */
+  volumeCreate?: boolean
   walBackupParallelJobs: number
   resources: Record<string, unknown>
   /** Labels the object carries beyond its own (the control layer marks the ones it makes). */
   labels?: Record<string, string>
 }
 
+/**
+ * A piece's host directory as a volume. It is mounted as itself, never through `subPath`, and each piece addresses its own folder inside
+ * it: where the kubelet runs in a container of its own (Talos), it resolves a subPath in its own view of the machine, which is not the
+ * one the container runtime mounts. A directory made when missing is mounted unchecked (type ''), so the runtime makes it on the machine
+ * itself: DirectoryOrCreate makes it in the kubelet's view, which on Talos is read-only under /var/mnt and another folder under /var/lib.
+ * One that must exist is checked (Directory), as before.
+ */
+export const hostDir = (path: string, create = false) => ({ path, type: create ? '' : 'Directory' })
+
 /** The command the container runs: the guard, then the safekeeper. */
 export function safekeeperScript(o: Pick<SafekeeperOptions, 'id' | 'namespace' | 'controlUrl' | 'remote' | 'walBackupParallelJobs'>): string {
   return `set -eu
 id=${o.id}
-if [ ! -s /data/identity ]; then
+d=/vol/sk-$id
+if [ ! -s $d/identity ]; then
   i=0
   while :; do
     a=$(curl -sS --max-time 3 "${o.controlUrl}/sk/$id/may-start-empty" 2>/dev/null || true)
@@ -60,12 +71,12 @@ if [ ! -s /data/identity ]; then
     sleep 5
   done
 fi
-if [ -f /data/identity ] && [ "$(cat /data/identity)" != "$id" ]; then
-  echo "refusing to start: this directory belongs to safekeeper $(cat /data/identity), not $id" >&2
+if [ -f $d/identity ] && [ "$(cat $d/identity)" != "$id" ]; then
+  echo "refusing to start: this directory belongs to safekeeper $(cat $d/identity), not $id" >&2
   exit 1
 fi
-echo "$id" > /data/identity
-exec /usr/local/bin/safekeeper -D /data --id "$id" \\
+echo "$id" > $d/identity
+exec /usr/local/bin/safekeeper -D $d --id "$id" \\
   --listen-pg 0.0.0.0:5454 --listen-http 0.0.0.0:7676 \\
   --advertise-pg "safekeeper-w\${id}-0.safekeeper.${o.namespace}.svc.cluster.local:5454" \\
   --availability-zone "sk-\${id}" \\
@@ -80,7 +91,7 @@ exec /usr/local/bin/safekeeper -D /data --id "$id" \\
 export function safekeeperStatefulSet(o: SafekeeperOptions): Record<string, any> {
   const labels = { app: 'safekeeper', 'node-id': String(o.id) }
   const dir = `sk-${o.id}`
-  const volume = { name: 'volume', hostPath: { path: o.volumeRoot, type: o.volumeType ?? 'Directory' } }
+  const volume = { name: 'volume', hostPath: hostDir(o.volumeRoot, o.volumeCreate) }
   return {
     apiVersion: 'apps/v1',
     kind: 'StatefulSet',
@@ -121,7 +132,7 @@ export function safekeeperStatefulSet(o: SafekeeperOptions): Record<string, any>
               resources: o.resources,
               readinessProbe: { httpGet: { path: '/v1/status', port: 7676 }, periodSeconds: 5 },
               volumeMounts: [
-                { name: 'volume', mountPath: '/data', subPath: dir },
+                { name: 'volume', mountPath: '/vol' },
                 { name: 'auth', mountPath: '/auth' },
                 { name: 'tok', mountPath: '/tok' },
               ],
