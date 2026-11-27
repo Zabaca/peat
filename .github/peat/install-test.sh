@@ -7,8 +7,9 @@
 #
 # The control image must be in the local Docker (it is loaded into the cluster); the others are pulled by the cluster, or loaded from the
 # local Docker when LOAD_IMAGES names them. The store is a MinIO
-# in the cluster, the storage controller's records a Postgres in the cluster (records postgres: the Kubernetes records come with the
-# controller that keeps them). The platform is a one-machine trial (spread none) on the cluster's one node. Needs kind, kubectl, docker,
+# in the cluster. The storage controller's records are the default, Kubernetes objects with their copy in the store (records
+# kubernetes); RECORDS=postgres keeps them in a Postgres in the cluster instead, for an UPGRADE_FROM release whose controller predates
+# the Kubernetes records. The platform is a one-machine trial (spread none) on the cluster's one node. Needs kind, kubectl, docker,
 # bun and psql on the PATH (KIND names another kind). KEEP=1 keeps the cluster afterwards; it is deleted otherwise, pass or fail.
 # UPGRADE_FROM=<a release in the registry> installs that release first (its storage and compute images, this control image) and, after
 # the databases' checks, upgrades the platform to the images given, with a writer and a reader running throughout.
@@ -56,7 +57,7 @@ for image in ${LOAD_IMAGES:-}; do "$kind" load docker-image "$image" --name "$cl
 node="$cluster-control-plane"
 k label node "$node" peat.zabaca.com/machine=true --overwrite
 
-echo "== the store and the records' database (throwaways of their own)"
+echo "== the store (and, with RECORDS=postgres, the records' database), throwaways of their own"
 k create namespace store
 k -n store apply -f - <<EOF
 apiVersion: apps/v1
@@ -81,7 +82,9 @@ apiVersion: v1
 kind: Service
 metadata: { name: minio }
 spec: { selector: { app: minio }, ports: [ { port: 9000 } ] }
----
+EOF
+records=${RECORDS:-kubernetes}
+[ "$records" = postgres ] && k -n store apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: records-db }
@@ -113,9 +116,11 @@ k -n peat-system rollout status deployment/peat-operator --timeout=180s
 echo "== the platform: its namespace and the store's Secret first, then one Platform"
 k create namespace peat
 k -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=peat-test --from-literal=AWS_SECRET_ACCESS_KEY=peat-test-secret
-k -n peat create secret generic records-db --from-literal=uri='postgresql://postgres:peat-test@records-db.store.svc:5432/storage_controller'
 k -n store rollout status deployment/minio --timeout=180s
-k -n store rollout status deployment/records-db --timeout=180s
+if [ "$records" = postgres ]; then
+  k -n peat create secret generic records-db --from-literal=uri='postgresql://postgres:peat-test@records-db.store.svc:5432/storage_controller'
+  k -n store rollout status deployment/records-db --timeout=180s
+fi
 k apply -f - <<EOF
 apiVersion: peat.zabaca.com/v1alpha1
 kind: Platform
@@ -127,7 +132,7 @@ spec:
   objectStore: { endpoint: "http://minio.store.svc:9000", region: us-east-1, bucket: peat, credentialsSecret: peat-store }
   pageservers: { count: 1, storage: { hostPath: { path: /var/lib/peat/pageserver, create: true } } }
   safekeepers: { storage: { hostPath: { path: /var/lib/peat/safekeeper, create: true } } }
-  controller: { records: postgres, postgres: { urlSecret: records-db } }
+  controller: $(if [ "$records" = postgres ]; then echo '{ records: postgres, postgres: { urlSecret: records-db } }'; else echo '{ records: kubernetes }'; fi)
   gateways: { count: 1 }
   control: { replicas: 1 }
   computes: { idleAfter: 1m }
@@ -271,6 +276,33 @@ sql 'create table t (id int primary key, payload text)'
 sql "insert into t select g, md5(g::text) from generate_series(1, 100000) g"
 [ "$(sql 'select count(*) from t')" = 100000 ] || fail 'the rows written were not read back'
 echo "  first answer $first_s s after the make; 100000 rows written and read back with verify-full"
+
+if [ "$records" = kubernetes ]; then
+  step "the storage controller's pod deleted and made again: the new one leads at its own address, the copy current, a new database attached"
+  old_ctl=$(k -n peat get pods -l app=storage-controller -o jsonpath='{.items[0].metadata.name}')
+  k -n peat delete pod "$old_ctl" --wait=false >/dev/null
+  t0=$(date +%s); until new_ctl=$(k -n peat get pods -l app=storage-controller -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null) && [ -n "$new_ctl" ] && [ "$new_ctl" != "$old_ctl" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'no new storage controller was ready in 180 s'; sleep 2; done
+  new_ip=$(k -n peat get pod "$new_ctl" -o jsonpath='{.status.podIP}')
+  # the Leader record names the new pod by its own address, not the Service's
+  t0=$(date +%s); until case "$(k -n peat get leaders.storagecontroller.peat.zabaca.com leader -o jsonpath='{.spec.address}' 2>/dev/null)" in "http://$new_ip:1234"*) true;; *) false;; esac; do
+    [ "$(since "$t0")" -lt 60 ] || fail "the Leader record does not name the new controller ($new_ip): $(k -n peat get leaders.storagecontroller.peat.zabaca.com leader -o jsonpath='{.spec.address}' 2>&1)"
+    sleep 2
+  done
+  # the copy in the store is written by the new leader: nothing behind (the pod's own port, so no network rule stands between)
+  k -n peat port-forward "pod/$new_ctl" 21234:1234 >>"$work/tunnel-controller.log" 2>&1 &
+  pids+=($!); ctl_tunnel=$!
+  tunnel_up 21234
+  t0=$(date +%s); until [ "$(curl -fsS localhost:21234/metrics 2>/dev/null | awk '/^storage_controller_records_copy_behind_seconds /{print $2}')" = 0 ]; do
+    [ "$(since "$t0")" -lt 60 ] || fail "the new leader's copy of the records is behind: $(curl -fsS localhost:21234/metrics 2>&1 | grep records_copy_behind | head -3)"
+    sleep 2
+  done
+  kill "$ctl_tunnel" 2>/dev/null || true
+  sleep 30
+  curl -fsS -X POST localhost:18080/db -H 'content-type: application/json' -d '{"name":"handover"}' >/dev/null || fail 'no database was made after the controller was replaced'
+  ho_password=$(k -n peat get secret db-handover-login -o jsonpath='{.data.password}' | base64 -d)
+  t0=$(date +%s); until [ "$(PGPASSWORD="$ho_password" psql "host=handover.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/ca.crt connect_timeout=30" -XAtqc 'select 1' 2>/dev/null)" = 1 ]; do [ "$(since "$t0")" -lt 300 ] || fail 'the database made after the controller was replaced did not answer'; sleep 3; done
+  echo "  $new_ctl leads at $new_ip, its copy current; a database made 30 s after it answers"
+fi
 
 step "asleep, then woken by a connection"
 curl -fsS -X POST localhost:18080/db/first/stop >/dev/null || fail 'the stop was refused'
@@ -421,7 +453,7 @@ echo "  refused: an exec by the operator's account, into a listed pod"
 # the list deleted by hand: the guard touches no account but the control layer's (an exec as the cluster's admin into a pod outside the
 # platform's namespaces), the control layer is still held to psql in a compute, and the operator makes the list again
 k -n peat delete configmap peat-move-pods >/dev/null
-[ "$(k -n store exec deploy/records-db -- echo reached)" = reached ] || fail "with the exec guard's list missing, the cluster's admin could not exec into a pod outside the platform"
+[ "$(k -n store exec deploy/minio -- echo reached)" = reached ] || fail "with the exec guard's list missing, the cluster's admin could not exec into a pod outside the platform"
 echo "  allowed: an exec by the cluster's admin outside the platform, the list missing"
 refused_exec 'a command other than psql or the move script, the list missing' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- ls /
 t0=$(date +%s); until k -n peat get configmap peat-move-pods >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'the operator did not make the list peat-move-pods again'; sleep 3; done
