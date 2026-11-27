@@ -503,11 +503,14 @@ impl From<DatabaseError> for ApiError {
                 ApiError::InternalServerError(anyhow::anyhow!(reason))
             }
             DatabaseError::Cas(reason) => ApiError::Conflict(reason),
-            // The API server could not be reached, or answered that it cannot serve now: as a
-            // lost connection to Postgres is.
-            DatabaseError::Kubernetes(kube::Error::Api(status)) if status.code < 500 => {
+            // The API server refused the request itself (other than for too many requests).
+            DatabaseError::Kubernetes(kube::Error::Api(status))
+                if status.code < 500 && status.code != 429 =>
+            {
                 ApiError::InternalServerError(anyhow::anyhow!(status))
             }
+            // The API server could not be reached, or answered that it cannot serve now (429 or
+            // 5xx): as a lost connection to Postgres is.
             DatabaseError::Kubernetes(_) => ApiError::ShuttingDown,
             DatabaseError::Exists(reason) => ApiError::InternalServerError(anyhow::anyhow!(reason)),
         }

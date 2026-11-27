@@ -42,6 +42,14 @@ async fn kubernetes_store() -> Option<Persistence> {
 /// The Kubernetes store, with a client and namespace of its own for a test to change the objects
 /// behind the store's back (as an etcd restore would).
 async fn kubernetes_store_and_client() -> Option<(Persistence, kube::Client, String)> {
+    let (client, namespace) = kubernetes_client_and_namespace().await?;
+    let p = Persistence::kubernetes_with_client(client.clone(), namespace.clone()).do_not_exit();
+    p.migration_run().await.expect("the kinds are installed");
+    Some((p, client, namespace))
+}
+
+/// A client of the test API server, and a namespace of its own.
+async fn kubernetes_client_and_namespace() -> Option<(kube::Client, String)> {
     let path = std::env::var(KUBECONFIG_ENV).ok()?;
     let kubeconfig = kube::config::Kubeconfig::read_from(&path).expect("read the test kubeconfig");
     let mut config = kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
@@ -62,9 +70,7 @@ async fn kubernetes_store_and_client() -> Option<(Persistence, kube::Client, Str
         .create(&PostParams::default(), &ns)
         .await
         .expect("make the test's namespace");
-    let p = Persistence::kubernetes_with_client(client.clone(), namespace.clone()).do_not_exit();
-    p.migration_run().await.expect("the kinds are installed");
-    Some((p, client, namespace))
+    Some((client, namespace))
 }
 
 async fn postgres_store() -> Option<Persistence> {
@@ -348,6 +354,15 @@ async fn generations() {
         trace.push(show_err(&p.re_attach(NodeId(2)).await));
         // A pageserver the controller does not know re-attaches to nothing
         trace.push(format!("{:?}", p.re_attach(NodeId(9)).await.unwrap()));
+
+        // A validation whose pageserver is guessed wrong (a live migration's warm-up names the new
+        // one while the old still validates) is answered as any read is
+        let mut warm = p
+            .shard_generations_on(NodeId(2), [a, c].iter())
+            .await
+            .unwrap();
+        warm.sort_by_key(|(id, _)| *id);
+        trace.push(format!("validated by the wrong guess {warm:?}"));
 
         // Detaching keeps the generation and forgets the pageserver
         p.update_tenant_shard(
@@ -1247,4 +1262,77 @@ async fn a_health_entry_without_its_shard_is_dropped_and_swept() {
         .map(|o| o.spec.tenant_id)
         .collect();
     assert_eq!(left, vec![TENANT_B.to_string()]);
+}
+
+/// Reads concurrent with writes of the same tenant (a validation's list, a tenant's
+/// generations, a load, across pages of three) are never taken for the store going back, and
+/// every attach still takes a generation no other took.
+#[tokio::test]
+async fn reads_concurrent_with_writes_are_not_taken_for_the_store_going_back() {
+    let Some((client, ns)) = kubernetes_client_and_namespace().await else {
+        return;
+    };
+    let p = Arc::new(
+        Persistence::kubernetes_with_client(client, ns)
+            .do_not_exit()
+            .list_page(3),
+    );
+    p.migration_run().await.unwrap();
+    p.insert_node(&node(1)).await.unwrap();
+    let tenants: Vec<String> = (0..10)
+        .map(|i| format!("{i:08x}{}", &TENANT[8..]))
+        .collect();
+    for t in &tenants {
+        p.insert_tenant_shards(vec![shard_row(t, 0, 0)])
+            .await
+            .unwrap();
+    }
+    let id = shard_id(&tenants[0], 0, 0);
+    let writer = {
+        let p = p.clone();
+        tokio::spawn(async move {
+            let mut gens = Vec::new();
+            for _ in 0..60 {
+                gens.push(p.increment_generation(id, NodeId(1)).await.unwrap());
+            }
+            gens
+        })
+    };
+    let readers: Vec<_> = (0..4)
+        .map(|r| {
+            let p = p.clone();
+            tokio::spawn(async move {
+                for _ in 0..30 {
+                    match r {
+                        0 => {
+                            p.shard_generations_on(NodeId(1), [id].iter())
+                                .await
+                                .unwrap();
+                        }
+                        1 => {
+                            p.tenant_generations(id.tenant_id).await.unwrap();
+                        }
+                        2 => {
+                            // Across four pages of three
+                            assert_eq!(p.load_active_tenant_shards().await.unwrap().len(), 10);
+                        }
+                        _ => {
+                            p.list_metadata_health_records().await.unwrap();
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    let gens = writer.await.unwrap();
+    for r in readers {
+        r.await.unwrap();
+    }
+    let mut sorted = gens.clone();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        60,
+        "every attach took a generation of its own"
+    );
 }

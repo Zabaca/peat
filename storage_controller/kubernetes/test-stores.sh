@@ -29,10 +29,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Ports from the environment, so two runs on one machine can be kept apart.
-etcd_port=${STORCON_TEST_ETCD_PORT:-23790}
-api_port=${STORCON_TEST_API_PORT:-26443}
-pg_port=${STORCON_TEST_PG_PORT:-25432}
+# Ports from the environment, or picked at random so two runs on one machine do not meet.
+base=$((20000 + RANDOM % 20000))
+etcd_port=${STORCON_TEST_ETCD_PORT:-$base}
+api_port=${STORCON_TEST_API_PORT:-$((base + 20))}
+pg_port=${STORCON_TEST_PG_PORT:-$((base + 21))}
 
 openssl genrsa -out "$work/sa.key" 2048 2>/dev/null
 openssl rsa -in "$work/sa.key" -pubout -out "$work/sa.pub" 2>/dev/null

@@ -223,6 +223,15 @@ impl Persistence {
         self
     }
 
+    /// Read lists `page` objects at a time in the Kubernetes store (tests).
+    #[cfg(test)]
+    pub(crate) fn list_page(mut self, page: u32) -> Self {
+        if let Store::Kubernetes(store) = &mut self.store {
+            store.list_page(page);
+        }
+        self
+    }
+
     /// Keep the records in Kubernetes objects in `namespace`, through `client`.
     pub(crate) fn kubernetes_with_client(client: kube::Client, namespace: String) -> Self {
         Self {
@@ -445,10 +454,10 @@ impl Persistence {
         }
     }
 
-    /// A pageserver's generation validation: the generations of shards whose latest generation
-    /// was issued to `node_id`. On Postgres, the same query as [`Self::shard_generations`]; the
-    /// Kubernetes store answers from one list of that pageserver's tenants, and leaves out a
-    /// shard whose latest generation went to another pageserver (answered invalid).
+    /// A pageserver's generation validation, `node_id` being the pageserver the controller
+    /// expects the shards' generations were issued to: the same answer as
+    /// [`Self::shard_generations`]. On Postgres, the same query; the Kubernetes store reads one
+    /// list of that pageserver's tenants, and reads any shard the list does not cover on its own.
     pub(crate) async fn shard_generations_on(
         &self,
         node_id: NodeId,

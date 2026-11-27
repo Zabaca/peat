@@ -56,6 +56,8 @@ pub(crate) struct KubernetesStore {
     client: kube::Client,
     namespace: String,
     guard: Guard,
+    /// The page size of a list (smaller in tests, to read across pages).
+    list_page: u32,
     /// One write at a time per object within this controller (`storage_controller/kubernetes/
     /// README.md`): a tenant with many shards reconciling at once queues here instead of
     /// spending its retries on conflicts with itself. The compare-and-swap still guards against
@@ -67,20 +69,68 @@ type Locks = std::sync::Mutex<HashMap<(&'static str, String), Arc<tokio::sync::M
 
 /// What this controller has seen of each object, so a read that finds one older than that (the
 /// cluster's store taken back under it) is caught before anything is written or answered from it.
+///
+/// A read is compared only with what was seen before it was sent: a write this controller makes
+/// while a read is in flight is not a reason to refuse the read's older answer. Every note of an
+/// object takes a sequence number, and a read takes the number current when it is sent.
 struct Guard {
     seen: std::sync::Mutex<HashMap<(&'static str, String), Seen>>,
+    /// The sequence of notes.
+    sequence: std::sync::atomic::AtomicU64,
     /// Exit the process when the records went back (the controller); tests only record it.
     exit: bool,
 }
 
+/// How many notes of one object are kept: enough for the writes one read can overlap. A read
+/// that overlapped more is not compared for that object (the next read is).
+const SEEN_HISTORY: usize = 16;
+
 #[derive(Clone, Copy)]
-struct Seen {
+struct Note {
+    sequence: u64,
     revision: u64,
     /// Deleted by this controller, at `revision`.
     deleted: bool,
 }
 
+#[derive(Default)]
+struct Seen {
+    /// The latest notes, oldest first; their revisions never go down.
+    notes: std::collections::VecDeque<Note>,
+    /// A delete of it was sent and its answer lost (or it was found already gone): its absence
+    /// is not the store going back.
+    in_doubt: bool,
+}
+
+impl Seen {
+    fn latest(&self) -> Option<Note> {
+        self.notes.back().copied()
+    }
+
+    /// What was seen when a read sent at `sent` went out: the latest note no later than it.
+    fn as_of(&self, sent: u64) -> Option<Note> {
+        self.notes
+            .iter()
+            .rev()
+            .find(|n| n.sequence <= sent)
+            .copied()
+    }
+}
+
 impl Guard {
+    fn new(exit: bool) -> Self {
+        Guard {
+            seen: Default::default(),
+            sequence: Default::default(),
+            exit,
+        }
+    }
+
+    /// The sequence number a read is sent at.
+    fn before_read(&self) -> u64 {
+        self.sequence.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn went_back(&self, what: String) -> DatabaseError {
         tracing::error!(
             "The records went back under this controller ({what}): the cluster's store was \
@@ -93,56 +143,89 @@ impl Guard {
         DatabaseError::Logical(format!("the records went back: {what}"))
     }
 
-    /// Check an object read from the API server against what this controller has seen of it.
-    fn observe<S: Spec>(&self, obj: &Object<S>) -> DatabaseResult<()> {
-        let revision = obj.revision()?;
+    /// Note a revision of an object. One below the latest note is not noted: a read never
+    /// lowers what was seen.
+    fn note(&self, kind: &'static str, name: &str, revision: u64, deleted: bool) {
         let mut seen = self.seen.lock().unwrap();
-        let key = (S::KIND, obj.name().to_string());
-        if let Some(s) = seen.get(&key).copied() {
-            if revision < s.revision || (s.deleted && revision == s.revision) {
-                drop(seen);
-                return Err(self.went_back(format!(
-                    "{} {} at revision {revision}, this controller saw {}{}",
-                    S::KIND,
-                    key.1,
-                    s.revision,
-                    if s.deleted { " and deleted it" } else { "" }
-                )));
+        let sequence = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let s = seen.entry((kind, name.to_string())).or_default();
+        if let Some(l) = s.latest() {
+            if revision < l.revision || (revision == l.revision && l.deleted && !deleted) {
+                return;
             }
         }
-        seen.insert(
-            key,
-            Seen {
-                revision,
-                deleted: false,
-            },
-        );
-        Ok(())
+        if !deleted {
+            s.in_doubt = false;
+        }
+        s.notes.push_back(Note {
+            sequence,
+            revision,
+            deleted,
+        });
+        while s.notes.len() > SEEN_HISTORY {
+            s.notes.pop_front();
+        }
     }
 
-    /// Check that an object found absent was not one this controller saw and did not delete.
-    fn observe_absent<S: Spec>(&self, name: &str) -> DatabaseResult<()> {
-        let seen = self
+    /// Check an object returned by a read sent at `sent` against what was seen before it.
+    fn observe<S: Spec>(&self, obj: &Object<S>, sent: u64) -> DatabaseResult<()> {
+        let revision = obj.revision()?;
+        let before = self
             .seen
             .lock()
             .unwrap()
-            .get(&(S::KIND, name.to_string()))
-            .copied();
-        match seen {
-            Some(s) if !s.deleted => Err(self.went_back(format!(
-                "{} {name} is gone, this controller saw it at revision {} and did not delete it",
-                S::KIND,
-                s.revision
-            ))),
+            .get(&(S::KIND, obj.name().to_string()))
+            .and_then(|s| s.as_of(sent));
+        if let Some(b) = before {
+            if revision < b.revision || (b.deleted && revision == b.revision) {
+                return Err(self.went_back(format!(
+                    "{} {} at revision {revision}, this controller saw {}{}",
+                    S::KIND,
+                    obj.name(),
+                    b.revision,
+                    if b.deleted { " and deleted it" } else { "" }
+                )));
+            }
+        }
+        self.note(S::KIND, obj.name(), revision, false);
+        Ok(())
+    }
+
+    /// Check that an object a read sent at `sent` found absent was not one this controller saw
+    /// before it and has not deleted (or tried to) since.
+    fn observe_absent<S: Spec>(&self, name: &str, sent: u64) -> DatabaseResult<()> {
+        let found = {
+            let seen = self.seen.lock().unwrap();
+            seen.get(&(S::KIND, name.to_string()))
+                .map(|s| (s.as_of(sent), s.latest(), s.in_doubt))
+        };
+        match found {
+            Some((Some(b), Some(l), false)) if !b.deleted && !l.deleted => {
+                Err(self.went_back(format!(
+                    "{} {name} is gone, this controller saw it at revision {} and did not delete it",
+                    S::KIND,
+                    b.revision
+                )))
+            }
             _ => Ok(()),
         }
     }
 
     fn wrote<S: Spec>(&self, name: &str, revision: u64, deleted: bool) {
+        self.note(S::KIND, name, revision, deleted);
+    }
+
+    /// A delete whose outcome is not known (its answer lost, or the object found already gone).
+    fn delete_in_doubt<S: Spec>(&self, name: &str) {
         self.seen
             .lock()
             .unwrap()
-            .insert((S::KIND, name.to_string()), Seen { revision, deleted });
+            .entry((S::KIND, name.to_string()))
+            .or_default()
+            .in_doubt = true;
     }
 
     /// The revision a new object of this name starts at: above any this controller has seen.
@@ -151,16 +234,17 @@ impl Guard {
             .lock()
             .unwrap()
             .get(&(S::KIND, name.to_string()))
-            .map_or(1, |s| s.revision + 1)
+            .and_then(|s| s.latest())
+            .map_or(1, |n| n.revision + 1)
     }
 
-    /// Names of one kind this controller saw and did not delete.
+    /// Names of one kind this controller saw and has not deleted.
     fn live<S: Spec>(&self) -> Vec<String> {
         self.seen
             .lock()
             .unwrap()
             .iter()
-            .filter(|((kind, _), s)| *kind == S::KIND && !s.deleted)
+            .filter(|((kind, _), s)| *kind == S::KIND && s.latest().is_some_and(|n| !n.deleted))
             .map(|((_, name), _)| name.clone())
             .collect()
     }
@@ -181,10 +265,8 @@ impl KubernetesStore {
         KubernetesStore {
             client,
             namespace,
-            guard: Guard {
-                seen: Default::default(),
-                exit: true,
-            },
+            guard: Guard::new(!cfg!(test)),
+            list_page: LIST_PAGE,
             locks: Default::default(),
         }
     }
@@ -195,16 +277,20 @@ impl KubernetesStore {
         self.guard.exit = false;
     }
 
+    /// Read lists `page` objects at a time (tests).
+    #[cfg(test)]
+    pub(crate) fn list_page(&mut self, page: u32) {
+        self.list_page = page;
+    }
+
     /// Another store on the same records, as a second controller would have.
     #[cfg(test)]
     pub(crate) fn second_client(&self) -> Self {
         KubernetesStore {
             client: self.client.clone(),
             namespace: self.namespace.clone(),
-            guard: Guard {
-                seen: Default::default(),
-                exit: false,
-            },
+            guard: Guard::new(false),
+            list_page: LIST_PAGE,
             locks: Default::default(),
         }
     }
@@ -236,10 +322,11 @@ impl KubernetesStore {
     }
 
     async fn get<S: Spec>(&self, name: &str) -> DatabaseResult<Option<Object<S>>> {
+        let sent = self.guard.before_read();
         let obj = self.api::<S>().get_opt(name).await?;
         match &obj {
-            Some(o) => self.guard.observe(o)?,
-            None => self.guard.observe_absent::<S>(name)?,
+            Some(o) => self.guard.observe(o, sent)?,
+            None => self.guard.observe_absent::<S>(name, sent)?,
         }
         Ok(obj)
     }
@@ -248,7 +335,8 @@ impl KubernetesStore {
     async fn list<S: Spec>(&self, labels: Option<&str>) -> DatabaseResult<Vec<Object<S>>> {
         let api = self.api::<S>();
         let mut out = Vec::new();
-        let mut params = ListParams::default().limit(LIST_PAGE);
+        let sent = self.guard.before_read();
+        let mut params = ListParams::default().limit(self.list_page);
         if let Some(labels) = labels {
             params = params.labels(labels);
         }
@@ -261,14 +349,15 @@ impl KubernetesStore {
             }
         }
         for o in &out {
-            self.guard.observe(o)?;
+            self.guard.observe(o, sent)?;
         }
         if labels.is_none() {
-            // A list of every object also shows the ones that are gone.
+            // A list of every object also shows the ones that are gone (of those seen before it
+            // was sent, and not deleted since).
             let listed: std::collections::HashSet<&str> = out.iter().map(|o| o.name()).collect();
             for name in self.guard.live::<S>() {
                 if !listed.contains(name.as_str()) {
-                    self.guard.observe_absent::<S>(&name)?;
+                    self.guard.observe_absent::<S>(&name, sent)?;
                 }
             }
         }
@@ -320,7 +409,23 @@ impl KubernetesStore {
     ) -> DatabaseResult<R> {
         let api = self.api::<S>();
         let lock = self.lock::<S>(name);
-        let _held = lock.lock().await;
+        let held = lock.clone().lock_owned().await;
+        let result = self.modify_locked(&api, name, &mut decide).await;
+        drop(held);
+        // Forget the lock once no one waits on it, so the map does not keep every name.
+        let mut locks = self.locks.lock().unwrap();
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(&(S::KIND, name.to_string()));
+        }
+        result
+    }
+
+    async fn modify_locked<S: Spec, R>(
+        &self,
+        api: &Api<Object<S>>,
+        name: &str,
+        decide: &mut impl FnMut(Option<&S>) -> DatabaseResult<(Write<S>, R)>,
+    ) -> DatabaseResult<R> {
         for _ in 0..MAX_RETRIES {
             let current = self.get::<S>(name).await?;
             let (write, result) = decide(current.as_ref().map(|o| &o.spec))?;
@@ -355,8 +460,16 @@ impl KubernetesStore {
                             self.guard.wrote::<S>(name, current.revision()?, true);
                             Ok(())
                         }
-                        Err(e) if is_conflict(&e) || is_not_found(&e) => continue,
-                        Err(e) => Err(e.into()),
+                        Err(e) if is_conflict(&e) => continue,
+                        Err(e) => {
+                            // Found gone (404), or the answer lost: it may be deleted, so its
+                            // absence from now on is not the store going back.
+                            self.guard.delete_in_doubt::<S>(name);
+                            if is_not_found(&e) {
+                                continue;
+                            }
+                            Err(e.into())
+                        }
                     }
                 }
             };
@@ -734,7 +847,13 @@ impl KubernetesStore {
                     let Some(cur) = cur else {
                         return Ok((Write::Keep, ()));
                     };
-                    let old = NodeSchedulingPolicy::from_str(&cur.scheduling_policy).unwrap();
+                    let old =
+                        NodeSchedulingPolicy::from_str(&cur.scheduling_policy).map_err(|e| {
+                            DatabaseError::Logical(format!(
+                                "Pageserver {node}: scheduling policy {:?}: {e}",
+                                cur.scheduling_policy
+                            ))
+                        })?;
                     let new = match old {
                         NodeSchedulingPolicy::Active => NodeSchedulingPolicy::Active,
                         NodeSchedulingPolicy::PauseForRestart => NodeSchedulingPolicy::Active,
@@ -821,16 +940,23 @@ impl KubernetesStore {
             })
             .await?;
         rows.sort_by_key(|r| r.shard_number);
-        Ok(rows
-            .into_iter()
-            .map(|p| ShardGenerationState {
-                tenant_shard_id: p
-                    .get_tenant_shard_id()
-                    .expect("Corrupt tenant shard id in database"),
-                generation: p.generation.map(|g| Generation::new(g as u32)),
-                generation_pageserver: p.generation_pageserver.map(|n| NodeId(n as u64)),
+        rows.into_iter()
+            .map(|p| {
+                // The kinds declare free strings: an object edited by hand is an error, not a
+                // panic.
+                let tenant_shard_id = p.get_tenant_shard_id().map_err(|e| {
+                    DatabaseError::Logical(format!(
+                        "Tenant {}: a shard that is not a tenant shard id: {e}",
+                        p.tenant_id
+                    ))
+                })?;
+                Ok(ShardGenerationState {
+                    tenant_shard_id,
+                    generation: p.generation.map(|g| Generation::new(g as u32)),
+                    generation_pageserver: p.generation_pageserver.map(|n| NodeId(n as u64)),
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub(crate) async fn shard_generations(
@@ -859,8 +985,10 @@ impl KubernetesStore {
     }
 
     /// A pageserver's generation validation: its shards' generations, read from one list of
-    /// the tenants labelled with that pageserver. A shard of a tenant without the label is left
-    /// out, so it is answered invalid: its latest generation was issued to another pageserver.
+    /// the tenants labelled with `node_id` (the pageserver the controller expects). A shard the
+    /// list does not cover is read on its own, so a guess that is wrong (a live migration's
+    /// warm-up, when the controller's intent already names the new pageserver and the old one
+    /// still validates) costs a read, never an answer.
     pub(crate) async fn shard_generations_on(
         &self,
         node_id: NodeId,
@@ -874,14 +1002,21 @@ impl KubernetesStore {
                 .into_iter()
                 .map(|o| (o.spec.tenant_id.clone(), o.spec))
                 .collect();
-            Ok(wanted
-                .into_iter()
-                .filter_map(|id| {
-                    let t = tenants.get(&id.tenant_id.to_string())?;
-                    let s = t.shards.iter().find(|s| s.key() == shard_key(&id))?;
-                    Some((id, s.generation.map(|g| Generation::new(g as u32))))
-                })
-                .collect())
+            let mut out = Vec::new();
+            let mut uncovered = Vec::new();
+            for id in wanted {
+                let found = tenants
+                    .get(&id.tenant_id.to_string())
+                    .and_then(|t| t.shards.iter().find(|s| s.key() == shard_key(&id)));
+                match found {
+                    Some(s) => out.push((id, s.generation.map(|g| Generation::new(g as u32)))),
+                    None => uncovered.push(id),
+                }
+            }
+            if !uncovered.is_empty() {
+                out.extend(self.shard_generations(uncovered.iter()).await?);
+            }
+            Ok(out)
         })
         .await
     }
@@ -1146,36 +1281,61 @@ impl KubernetesStore {
         new_shard_count: ShardCount,
     ) -> DatabaseResult<AbortShardSplitStatus> {
         let new = new_shard_count.literal() as i32;
-        self.measured(
-            DatabaseOperation::AbortShardSplit,
-            self.modify::<TenantSpec, AbortShardSplitStatus>(&split_tenant_id.to_string(), |cur| {
-                let Some(cur) = cur else {
-                    // Parent shards are already gone: we cannot abort.
-                    return Ok((Write::Keep, AbortShardSplitStatus::Complete));
-                };
-                let mut spec = cur.clone();
-                // Clear the splitting state on parent shards
-                let mut parents = 0usize;
-                for s in spec.shards.iter_mut().filter(|s| s.shard_count != new) {
-                    s.splitting = SplitState::Idle;
-                    parents += 1;
-                }
-                if parents == 0 {
-                    return Ok((Write::Keep, AbortShardSplitStatus::Complete));
-                }
-                // Sanity check: if parent shards were present, their cardinality should
-                // be less than the number of child shards.
-                if parents >= new_shard_count.count() as usize {
-                    return Err(DatabaseError::Logical(format!(
-                        "Unexpected parent shard count {parents} while aborting split to \
+        let name = split_tenant_id.to_string();
+        self.measured(DatabaseOperation::AbortShardSplit, async {
+            let status = self
+                .modify::<TenantSpec, AbortShardSplitStatus>(&name, |cur| {
+                    let Some(cur) = cur else {
+                        // Parent shards are already gone: we cannot abort.
+                        return Ok((Write::Keep, AbortShardSplitStatus::Complete));
+                    };
+                    let mut spec = cur.clone();
+                    // Clear the splitting state on parent shards
+                    let mut parents = 0usize;
+                    for s in spec.shards.iter_mut().filter(|s| s.shard_count != new) {
+                        s.splitting = SplitState::Idle;
+                        parents += 1;
+                    }
+                    if parents == 0 {
+                        return Ok((Write::Keep, AbortShardSplitStatus::Complete));
+                    }
+                    // Sanity check: if parent shards were present, their cardinality should
+                    // be less than the number of child shards.
+                    if parents >= new_shard_count.count() as usize {
+                        return Err(DatabaseError::Logical(format!(
+                            "Unexpected parent shard count {parents} while aborting split to \
                                 count {new_shard_count:?} on tenant {split_tenant_id}"
-                    )));
-                }
-                // Erase child shards
-                spec.shards.retain(|s| s.shard_count != new);
-                Ok((Write::Put(spec), AbortShardSplitStatus::Aborted))
-            }),
-        )
+                        )));
+                    }
+                    // Erase child shards
+                    spec.shards.retain(|s| s.shard_count != new);
+                    Ok((Write::Put(spec), AbortShardSplitStatus::Aborted))
+                })
+                .await?;
+            // The children's health entries go with them, in a second write, as Postgres
+            // cascades the delete.
+            if matches!(status, AbortShardSplitStatus::Aborted) {
+                self.modify::<MetadataHealthSpec, ()>(&name, |cur| {
+                    let Some(cur) = cur else {
+                        return Ok((Write::Keep, ()));
+                    };
+                    let mut spec = cur.clone();
+                    spec.shards.retain(|s| s.shard_count != new);
+                    Ok((
+                        if spec == *cur {
+                            Write::Keep
+                        } else if spec.shards.is_empty() {
+                            Write::Delete
+                        } else {
+                            Write::Put(spec)
+                        },
+                        (),
+                    ))
+                })
+                .await?;
+            }
+            Ok(status)
+        })
         .await
     }
 
@@ -1199,6 +1359,18 @@ impl KubernetesStore {
             }
         }
         self.measured(DatabaseOperation::UpdateMetadataHealth, async {
+            // A health record for a shard that does not exist is refused, as Postgres's foreign
+            // key refuses it; checked for every tenant before anything is written.
+            let shards = self.existing_shards().await?;
+            for (tenant_id, updates) in &by_tenant {
+                let have = shards.get(tenant_id).cloned().unwrap_or_default();
+                if let Some((n, c, _)) = updates.iter().find(|(n, c, _)| !have.contains(&(*n, *c)))
+                {
+                    return Err(DatabaseError::Logical(format!(
+                        "a health record for tenant shard {tenant_id} {n}/{c}, which does not exist"
+                    )));
+                }
+            }
             for (tenant_id, updates) in by_tenant {
                 self.modify::<MetadataHealthSpec, ()>(&tenant_id, |cur| {
                     let mut spec = cur.cloned().unwrap_or_else(|| MetadataHealthSpec {
@@ -1212,7 +1384,7 @@ impl KubernetesStore {
                             shard_number: *shard_number,
                             shard_count: *shard_count,
                             healthy: *healthy,
-                            last_scrubbed_at: objects::round_to_micros(now),
+                            last_scrubbed_at: objects::truncate_to_micros(now),
                         });
                     }
                     Ok((Write::Put(spec), ()))
@@ -1314,7 +1486,7 @@ impl KubernetesStore {
     ) -> DatabaseResult<Vec<MetadataHealthPersistence>> {
         self.measured(
             DatabaseOperation::ListMetadataHealthOutdated,
-            self.health_where(|s| s.last_scrubbed_at < earlier),
+            self.health_where(|s| s.last_scrubbed_at < objects::truncate_to_micros(earlier)),
         )
         .await
     }
@@ -1655,7 +1827,7 @@ impl KubernetesStore {
         tenant_id: TenantId,
         timeline_id: TimelineId,
     ) -> DatabaseResult<()> {
-        let deletion_time = objects::round_to_micros(chrono::Local::now().to_utc());
+        let deletion_time = objects::truncate_to_micros(chrono::Local::now().to_utc());
         self.measured(
             DatabaseOperation::InsertTimeline,
             self.modify_timeline(&tenant_id.to_string(), &timeline_id.to_string(), |spec| {
@@ -1963,4 +2135,67 @@ fn is_conflict(e: &kube::Error) -> bool {
 
 fn is_not_found(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(s) if s.code == 404)
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    fn leader(rev: u64) -> Object<LeaderSpec> {
+        Object::new(
+            LEADER_OBJECT_NAME,
+            LeaderSpec {
+                address: "http://controller.example.com:1234".to_string(),
+                started_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            },
+            rev,
+        )
+    }
+
+    #[test]
+    fn a_read_is_compared_only_with_what_was_seen_before_it_was_sent() {
+        let g = Guard::new(false);
+        g.observe(&leader(5), g.before_read()).unwrap();
+        // A read sent now, and a write of revision 6 finished while it was in flight: its
+        // answer at 5 is older than the write, not the store going back
+        let sent = g.before_read();
+        g.wrote::<LeaderSpec>(LEADER_OBJECT_NAME, 6, false);
+        g.observe(&leader(5), sent).unwrap();
+        // and it did not lower what was seen
+        assert_eq!(g.next_revision::<LeaderSpec>(LEADER_OBJECT_NAME), 7);
+        // A read sent after the write, answered at 5: the store went back
+        let sent = g.before_read();
+        assert!(g.observe(&leader(5), sent).is_err());
+    }
+
+    #[test]
+    fn an_absence_is_compared_with_what_was_seen_before_and_done_since() {
+        let g = Guard::new(false);
+        // A name first seen after the read was sent (made by a write while the list was in
+        // flight) is not taken for gone
+        let sent = g.before_read();
+        g.wrote::<LeaderSpec>(LEADER_OBJECT_NAME, 1, false);
+        g.observe_absent::<LeaderSpec>(LEADER_OBJECT_NAME, sent)
+            .unwrap();
+        // Seen before, and deleted by this controller while the read was in flight
+        let sent = g.before_read();
+        g.wrote::<LeaderSpec>(LEADER_OBJECT_NAME, 1, true);
+        g.observe_absent::<LeaderSpec>(LEADER_OBJECT_NAME, sent)
+            .unwrap();
+        // Made again, seen, then gone with no delete: the store went back
+        g.wrote::<LeaderSpec>(LEADER_OBJECT_NAME, 2, false);
+        assert!(
+            g.observe_absent::<LeaderSpec>(LEADER_OBJECT_NAME, g.before_read())
+                .is_err()
+        );
+        // A delete whose answer was lost: its absence is accepted
+        g.delete_in_doubt::<LeaderSpec>(LEADER_OBJECT_NAME);
+        g.observe_absent::<LeaderSpec>(LEADER_OBJECT_NAME, g.before_read())
+            .unwrap();
+        // A deleted object back at the revision it was deleted at went back
+        let g = Guard::new(false);
+        g.wrote::<LeaderSpec>(LEADER_OBJECT_NAME, 4, true);
+        assert!(g.observe(&leader(4), g.before_read()).is_err());
+        g.observe(&leader(5), g.before_read()).unwrap();
+    }
 }
