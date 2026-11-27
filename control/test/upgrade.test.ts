@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { reconcile, differences } from '../src/operator/reconcile'
 import type { Storage } from '../src/operator/storage'
 import { decide, imagesFor, nextPhase, stepsOf, type UpgradeState } from '../src/operator/upgrade'
@@ -349,5 +349,112 @@ describe('the review\'s smaller points', () => {
     respec('release-a', { adopt: [{ kind: 'Deployment', namespace: 'peat', name: 'nothing-like-it' }] })
     await pass()
     expect(statusOf().message).toContain('adopt names Deployment/peat/nothing-like-it, which the platform does not make')
+  })
+})
+
+describe('the second review\'s faults, with their siblings', () => {
+  // a piece broken on release-b: its workload never ready there, and the storage readings a broken piece of that kind gives
+  const breakOn = (piece: string) => {
+    const isB = (o: any) => String(o?.spec?.template?.spec?.containers?.[0]?.image ?? '').endsWith(':release-b')
+    const broken = () => {
+      for (const o of [...k.all('deployments'), ...k.all('statefulsets')]) if (o.metadata.name === piece && isB(o)) o.status = { readyReplicas: 0, replicas: 1, observedGeneration: o.metadata.generation ?? 1 }
+      const pod = k.get('v1', 'pods', 'peat', `${piece}-0`)
+      if (pod?.spec.containers[0].image.endsWith(':release-b')) pod.status = { conditions: [] }
+    }
+    const brokenNow = () => [...k.all('deployments'), ...k.all('statefulsets')].some((o) => o.metadata.name === piece && isB(o))
+    storage.problems = async () => {
+      if (piece === 'storage-controller' && brokenNow()) throw new Error('fetch failed')
+      const m = /^safekeeper-w(\d)$/.exec(piece)
+      if (m && brokenNow()) return [`safekeeper ${m[1]} does not answer`]
+      return [...unsettled]
+    }
+    return broken
+  }
+  afterEach(() => { storage.problems = async () => [...unsettled] })
+  for (const piece of ['storage-controller', 'storage-broker', 'pageserver-w1', 'pageserver-w2', 'safekeeper-w1', 'safekeeper-w2', 'safekeeper-w3', 'peat-gateway', 'peat-control']) {
+    test(`going back past a broken ${piece}: the way back mends it, it does not wait for it`, async () => {
+      const broken = breakOn(piece)
+      respec('release-b')
+      for (let i = 0; i < 80 && statusOf().phase !== 'Halted'; i++) { await pass(); broken() }
+      expect(statusOf().phase).toBe('Halted')
+      respec('release-a')
+      for (let i = 0; i < 80 && !(statusOf().phase === 'Ready' && statusOf().release === 'release-a'); i++) { await pass(); broken() }
+      expect(statusOf()).toMatchObject({ phase: 'Ready', release: 'release-a' })
+    })
+  }
+  test('while one keeper is mended on the way back the others must still answer', async () => {
+    const broken = breakOn('safekeeper-w1')
+    respec('release-b')
+    for (let i = 0; i < 80 && statusOf().phase !== 'Halted'; i++) { await pass(); broken() }
+    const own = storage.problems
+    storage.problems = async (x) => [...(await own(x)), 'safekeeper 2 does not answer']
+    respec('release-a')
+    for (let i = 0; i < 5; i++) { await pass(); broken() }
+    expect(statusOf().upgrade.lastCheck.message).toContain('safekeeper 2 does not answer')
+    expect(statusOf().upgrade.lastCheck.message).not.toContain('safekeeper 1 does not answer')
+  })
+})
+
+describe('adoption written in the right order', () => {
+  const broker = () => k.put({ apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name: 'storage-broker', namespace: 'peat' }, spec: { replicas: 1, strategy: { type: 'Recreate' }, selector: { matchLabels: { app: 'storage-broker' } }, template: { metadata: { labels: { app: 'storage-broker' } }, spec: { containers: [{ name: 'storage-broker', image: 'ghcr.io/zabaca/peat/storage:older' }] } } } })
+  const fresh = () => {
+    k = new FakeKube()
+    for (const n of ['machine-1', 'machine-2', 'machine-3']) k.put({ apiVersion: 'v1', kind: 'Node', metadata: { name: n, labels: LABEL } })
+  }
+  const adopt = [{ kind: 'Deployment', namespace: 'peat', name: 'storage-broker' }]
+  for (const failing of ['the mark', 'the record'] as const) {
+    test(`a pass that fails writing ${failing}: the next holds the difference, never applies it`, async () => {
+      fresh(); broker()
+      k.put(platform('release-a', { adopt }))
+      if (failing === 'the mark') k.forcedOnce.set('PATCH /apis/apps/v1/namespaces/peat/deployments/storage-broker', { status: 500, json: { message: 'down' } })
+      else k.forcedOnce.set('PATCH /api/v1/namespaces/peat-system/configmaps/peat-owned', { status: 500, json: { message: 'down' } })
+      await reconcile(k, { storage: () => storage, now: () => clock }).catch(() => undefined)
+      for (let i = 0; i < 3; i++) await pass()
+      expect(image('deployments', 'peat', 'storage-broker')).toBe('ghcr.io/zabaca/peat/storage:older')
+      expect((statusOf().pendingChanges as any[]).some((x) => x.name === 'storage-broker')).toBe(true)
+      // and taken off the list it is still held
+      respec('release-a')
+      await pass()
+      expect(image('deployments', 'peat', 'storage-broker')).toBe('ghcr.io/zabaca/peat/storage:older')
+    })
+  }
+  test('a release changed while an adoption is pending goes through the ordered steps, from what the live pieces run', async () => {
+    fresh(); broker()
+    k.put(platform('release-a', { adopt }))
+    for (let i = 0; i < 4; i++) await pass()
+    // never recorded Ready on release-a? the release is recorded once every piece is ready, pending or not
+    respec('release-b', { adopt })
+    await pass()
+    expect(statusOf().phase).toBe('Upgrading')
+    expect(image('deployments', 'peat', 'peat-control')).toBe('ghcr.io/zabaca/peat/control:release-a')
+    expect(image('deployments', 'peat-gateway', 'peat-gateway')).toBe('ghcr.io/zabaca/peat/control:release-a')
+    expect(image('statefulsets', 'peat', 'pageserver-w2')).toBe('ghcr.io/zabaca/peat/storage:release-a')
+  })
+})
+
+describe('the keeper-prep Job, steady', () => {
+  test('with safekeepers outside and no tolerations, keeper-prep is made once and left alone pass after pass', async () => {
+    respec('release-a', { safekeepers: { outside: { machines: ['machine-3'] } } })
+    await pass()
+    const uid = k.get('batch/v1', 'jobs', 'peat', 'keeper-prep').metadata.uid
+    k.calls.length = 0
+    for (let i = 0; i < 5; i++) await pass()
+    expect(k.get('batch/v1', 'jobs', 'peat', 'keeper-prep').metadata.uid).toBe(uid)
+    expect(k.calls.filter((c) => c.startsWith('DELETE /apis/batch/v1/namespaces/peat/jobs/keeper-prep'))).toEqual([])
+  })
+})
+
+describe('a drain the controller refuses', () => {
+  test('is a wait bounded by checkTimeout: the upgrade halts there, every pass completes', async () => {
+    const drain = storage.drain, node = storage.node
+    storage.drain = async () => { throw new Error('drain of pageserver 1: 412 no other node to drain to') }
+    respec('release-b')
+    for (let i = 0; i < 40 && statusOf().phase !== 'Halted'; i++) await pass()
+    expect(statusOf().phase).toBe('Halted')
+    expect(statusOf().upgrade.halted.reason).toContain('412 no other node to drain to')
+    storage.node = async () => { throw new Error('the storage controller: fetch failed') }
+    const r = await reconcile(k, { storage: () => storage, now: () => clock })
+    expect(r.phase).toBe('Halted')
+    storage.drain = drain; storage.node = node
   })
 })

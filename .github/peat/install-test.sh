@@ -146,6 +146,19 @@ ready_s=$(since "$t0")
 echo "  Ready $ready_s s after the Platform was applied; survives: $(k get platform peat -o jsonpath='{.status.survives}')"
 k get platform peat -o jsonpath='{range .status.pieces[*]}{.kind} {.name} {.release} {.ready}{"\n"}{end}'
 
+echo "== steady: the operator writes nothing to a settled platform"
+# the spec of every object it made (a generation where the kind has one, else the resourceVersion), read twice, three passes apart
+sel='app.kubernetes.io/managed-by=peat-operator'
+made_now() {
+  k get deploy,sts,job,networkpolicy -A -l "$sel" -o jsonpath='{range .items[*]}{.kind}/{.metadata.namespace}/{.metadata.name} {.metadata.generation}{"\n"}{end}'
+  k get validatingadmissionpolicy,validatingadmissionpolicybinding -l "$sel" -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.generation}{"\n"}{end}'
+  k get svc,configmap,secret,serviceaccount,role,rolebinding -A -l "$sel" -o jsonpath='{range .items[*]}{.kind}/{.metadata.namespace}/{.metadata.name} {.metadata.resourceVersion}{"\n"}{end}'
+}
+sleep 15; made_now | sort > "$work/steady-1"
+sleep 35; made_now | sort > "$work/steady-2"
+if ! diff -q "$work/steady-1" "$work/steady-2" >/dev/null; then diff "$work/steady-1" "$work/steady-2" | head -20; fail 'the operator changed objects of a settled platform'; fi
+echo "  $(wc -l < "$work/steady-1" | tr -d ' ') objects of the operator's unchanged over three of its passes"
+
 echo "== the guards, judged by the cluster's own API server, as the control layer's account"
 as=(--as=system:serviceaccount:peat:peat-control)
 refused() { # refused <words the refusal must hold> <kubectl arguments...>

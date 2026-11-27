@@ -34,17 +34,16 @@ export interface UpgradeState {
   complete?: boolean
 }
 
-/** A pageserver's step is its piece (render.ts names it); the pageserver a step is of (0: not a pageserver's). */
-export const pageserverStep = pageserverPiece
-export const pageserverOf = (step: string): number => (/^pageserver-w\d+$/.test(step) ? Number(step.slice('pageserver-w'.length)) : 0)
+/** The pageserver a step is of (0: not a pageserver's): the step is its piece, as render.ts names it. */
+export const pageserverOf = (step: string): number => { const id = Number(step.replace(/^\D+/, '')); return Number.isInteger(id) && id > 0 && pageserverPiece(id) === step ? id : 0 }
 
 /** The steps of an upgrade, in order. Safekeepers are the control layer's StatefulSets, named here as the cluster has them. */
 export function stepsOf(pageservers: number[], safekeepers: string[]): string[] {
   const sk = [...safekeepers].sort((a, b) => Number(a.replace(/\D/g, '')) - Number(b.replace(/\D/g, '')))
-  return ['controller', ...[...pageservers].sort((a, b) => a - b).map(pageserverStep), ...sk, 'gateways', 'control']
+  return ['controller', ...[...pageservers].sort((a, b) => a - b).map(pageserverPiece), ...sk, 'gateways', 'control']
 }
 /** The same images, field by field (a status read back from the API server need not keep the order its fields were written in). */
-const sameImages = (a: Images, b: Images) => a.storage === b.storage && a.control === b.control && String(a.compute?.[18]) === String(b.compute?.[18]) && String(a.compute?.[19]) === String(b.compute?.[19])
+export const sameImages = (a: Images, b: Images) => a.storage === b.storage && a.control === b.control && String(a.compute?.[18]) === String(b.compute?.[18]) && String(a.compute?.[19]) === String(b.compute?.[19])
 
 /** Whether the current step's own images have been applied (so it renders at its target). */
 const applied = (p: Phase | undefined) => p !== undefined && p !== 'precheck' && p !== 'draining'
@@ -128,6 +127,6 @@ export function nextPhase(step: string, phase: Phase, pageserverCount: number): 
 }
 
 /** The step's phase is over its bound: the upgrade halts there, with why. */
-export function overdue(u: UpgradeState, now: Date, checkSeconds: number): boolean {
-  return Boolean(u.since) && now.getTime() - Date.parse(u.since!) > checkSeconds * 1000
+export function overdue(u: UpgradeState, now: Date, timeoutSeconds: number): boolean {
+  return Boolean(u.since) && now.getTime() - Date.parse(u.since!) > timeoutSeconds * 1000
 }
