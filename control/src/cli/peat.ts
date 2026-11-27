@@ -11,14 +11,15 @@
 //   peat replica <of> <db>                                 a read replica of <of>
 //   peat stop <db>                                         put it to sleep now (the next connection wakes it)
 //   peat close <db> | peat open <db>                       refuse every connection until it is opened
-//   peat move <db> --pg <version> [--rehearse]             move it to a newer Postgres version under its own name (a rehearsal copies and compares only)
+//   peat move <db> --pg <version> [--rehearse]             not in this release: refused (the release that moves a database to a newer version turns it on)
 //   peat delete <db> --yes                                 delete it: its compute at once, its data after the platform's hold
 //   peat url <db>                                          its connection URL (from its login Secret)
-//   peat ca [-n <namespace>]                               the authority's certificate, for sslmode=verify-full
+//   peat ca [<db>]                                         the authority's certificate, for sslmode=verify-full (the one <db>'s status names)
 //   peat status                                            the platform: its phase, its release, every piece
-//   peat retry                                             go on with a halted upgrade from the step that halted
+//   peat retry [<platform>]                                go on with a halted upgrade from the step that halted
 //
-// Options: -n/--namespace (default: the kubeconfig context's), --kubeconfig, --context, --no-wait, --timeout <seconds> (default 180).
+// Options: -n/--namespace (default: the kubeconfig context's), -A (a database looked up by name in every namespace: refused when more than
+// one holds that name), --kubeconfig (a list joined by ':' is read as kubectl reads it), --context, --no-wait, --timeout <seconds> (180).
 import { API_VERSION } from '../api/v1alpha1'
 import { DB_NAME } from '../databases'
 import { fromKubeconfig, ok, type Kube } from '../kube'
@@ -64,17 +65,19 @@ export function parseArgs(argv: string[]): { words: string[]; opts: Record<strin
 
 const dbPath = (ns: string, name?: string) => `/apis/${API_VERSION}/namespaces/${ns}/databases${name ? `/${name}` : ''}`
 
-/** The Database of this name: in the namespace given, else the only one of that name in any namespace the login may list. */
-async function findDb(k: Kube, name: string, ns: string | undefined): Promise<any> {
-  if (ns) {
+/**
+ * The Database of this name: in the namespace given (-n, else the kubeconfig context's), as make and list use; with `anyNamespace` (-A)
+ * the one of that name in any namespace the login may list, refused when more than one namespace holds it.
+ */
+async function findDb(k: Kube, name: string, ns: string, anyNamespace = false): Promise<any> {
+  if (!anyNamespace) {
     const r = await k.request('GET', dbPath(ns, name))
-    if (r.status === 404) throw new Refused(`no database ${name} in ${ns}`)
+    if (r.status === 404) throw new Refused(`no database ${name} in ${ns} (-n names another namespace; -A looks in every one)`)
     return ok(r, `read ${name}`).json
   }
-  const all = await k.request('GET', `/apis/${API_VERSION}/databases`)
-  if (all.status === 403) return findDb(k, name, k.namespace)
-  const found = (ok(all, 'list the databases').json.items as any[]).filter((d) => d.metadata.name === name)
-  if (found.length === 0) throw new Refused(`no database ${name}`)
+  const found = (ok(await k.request('GET', `/apis/${API_VERSION}/databases`), 'list the databases').json.items as any[]).filter((d) => d.metadata.name === name)
+  if (found.length === 0) throw new Refused(`no database ${name} in any namespace`)
+  if (found.length > 1) throw new Refused(`${name} is in more than one namespace (${found.map((d) => d.metadata.namespace).sort().join(', ')}): name one with -n`)
   return found[0]
 }
 
@@ -114,12 +117,19 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
   const { words, opts } = parsed
   const [verb, a, b] = words
   const usage = () => { out.line('usage: peat <list|show|make|branch|restore|replica|stop|close|open|move|delete|url|ca|status|retry> ... (peat help)'); return 2 }
-  if (!verb || verb === 'help' || opts['help']) return usage()
+  if (verb === 'help' || opts['help']) { for (const l of HELP) out.line(l); return 0 }
+  if (!verb) return usage()
+  const timeoutS = Number(opts['timeout'] ?? 180)
+  if (!Number.isFinite(timeoutS) || timeoutS <= 0) { out.line(`peat: --timeout needs a number of seconds, not ${JSON.stringify(opts['timeout'])}`); return 2 }
   const k = deps.kube ?? fromKubeconfig({ path: typeof opts['kubeconfig'] === 'string' ? opts['kubeconfig'] : undefined, context: typeof opts['context'] === 'string' ? opts['context'] : undefined, namespace: typeof opts['namespace'] === 'string' ? opts['namespace'] : undefined })
   const ns = (typeof opts['namespace'] === 'string' ? opts['namespace'] : undefined)
   const here = ns ?? k.namespace
+  const any = Boolean(opts['A'] || opts['all-namespaces']) && !ns
+  const find = (name: string) => findDb(k, name, here, any)
+  // where the command acts, named on every line that removes or shuts something, and on an error reaching the cluster
+  const where = k.where ? ` (${k.where})` : ''
   const wait = !opts['no-wait']
-  const w = { timeoutS: Number(opts['timeout'] ?? 180), everyMs: deps.everyMs ?? 1000, out }
+  const w = { timeoutS, everyMs: deps.everyMs ?? 1000, out }
   const patch = async (o: any, body: unknown) => ok(await k.request('PATCH', dbPath(o.metadata.namespace, o.metadata.name), body, 'application/merge-patch+json'), `change ${o.metadata.name}`).json
   const make = async (name: string, spec: Record<string, unknown>, inNs: string, what: string) => {
     const r = await k.request('POST', dbPath(inNs), { apiVersion: API_VERSION, kind: 'Database', metadata: { name, namespace: inNs }, spec })
@@ -139,54 +149,44 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
         for (const o of items) out.line(`${o.metadata.namespace}/${o.metadata.name}  ${o.status?.phase ?? 'Creating'}  ${o.status?.pgVersion ? `pg${o.status.pgVersion}` : ''}  ${o.status?.awake ? 'awake' : 'asleep'}  ${o.status?.host ?? o.status?.serviceHost ?? ''}`.replace(/\s+$/, ''))
         return 0
       }
-      case 'show': out.line(describe(await findDb(k, checkName(a), ns))); return 0
+      case 'show': out.line(describe(await find(checkName(a)))); return 0
       case 'make': return await make(checkName(a), opts['pg'] !== undefined ? { pgVersion: parsePg(String(opts['pg'])) } : {}, here, 'making a new database')
       case 'branch': case 'replica': {
-        const parent = await findDb(k, checkName(a, 'the parent'), ns)
+        const parent = await find(checkName(a, 'the parent'))
         return await make(checkName(b), verb === 'branch' ? { parent: a } : { replicaOf: a }, parent.metadata.namespace, verb === 'branch' ? `making a branch of ${a}` : `making a replica of ${a}`)
       }
       case 'restore': {
-        const parent = await findDb(k, checkName(a, 'the parent'), ns)
+        const parent = await find(checkName(a, 'the parent'))
         const at = parseAt(typeof opts['at'] === 'string' ? opts['at'] : undefined, (deps.now ?? Date.now)())
         return await make(checkName(b), { parent: a, at }, parent.metadata.namespace, `making ${a} as it was at ${at}, as a new database`)
       }
       case 'stop': {
-        const o = await findDb(k, checkName(a), ns)
+        const o = await find(checkName(a))
         const request = new Date((deps.now ?? Date.now)()).toISOString()
         await patch(o, { spec: { requests: { stop: request } } })
-        if (wait) await waitFor(k, o.metadata.namespace, o.metadata.name, (x) => x.status?.answered?.stop === request, { ...w, what: 'asleep' })
+        // answered and asleep: a status written again from the record marks the requests it finds answered, whatever the compute is doing
+        if (wait) await waitFor(k, o.metadata.namespace, o.metadata.name, (x) => x.status?.answered?.stop === request && x.status?.awake === false, { ...w, what: 'asleep' })
         out.line(`${o.metadata.namespace}/${o.metadata.name}: asleep; the next connection wakes it`)
         return 0
       }
       case 'close': case 'open': {
-        const o = await findDb(k, checkName(a), ns)
+        const o = await find(checkName(a))
         await patch(o, { spec: { closed: verb === 'close' } })
         if (wait) await waitFor(k, o.metadata.namespace, o.metadata.name, (x) => (verb === 'close' ? x.status?.phase === 'Closed' : x.status?.phase === 'Ready'), { ...w, what: verb === 'close' ? 'closed' : 'open' })
-        out.line(`${o.metadata.namespace}/${o.metadata.name}: ${verb === 'close' ? 'closed: every connection is refused until it is opened' : 'open'}`)
+        out.line(`${o.metadata.namespace}/${o.metadata.name}${where}: ${verb === 'close' ? 'closed: every connection is refused until it is opened' : 'open'}`)
         return 0
       }
-      case 'move': {
-        const o = await findDb(k, checkName(a), ns)
-        const pg = parsePg(typeof opts['pg'] === 'string' ? opts['pg'] : undefined)
-        if (opts['rehearse']) {
-          const request = `${pg}@${new Date((deps.now ?? Date.now)()).toISOString()}`
-          await patch(o, { spec: { requests: { rehearseMove: request } } })
-          out.line(`${o.metadata.namespace}/${o.metadata.name}: a rehearsal of the move to Postgres ${pg} asked (${request}); peat show ${a} reads its answer`)
-          return 0
-        }
-        await patch(o, { spec: { pgVersion: pg } })
-        out.line(`${o.metadata.namespace}/${o.metadata.name}: the move to Postgres ${pg} asked; peat show ${a} follows it`)
-        return 0
-      }
+      // not in this release: a version raised now would be moved, unasked, by the release that carries moves out
+      case 'move': throw new Refused('the move to a newer Postgres version is not in this release: nothing was changed')
       case 'delete': {
-        const o = await findDb(k, checkName(a), ns)
-        if (!opts['yes']) { out.line(`deleting ${o.metadata.namespace}/${a} removes its compute now and its data after the platform's hold: add --yes`); return 1 }
+        const o = await find(checkName(a))
+        if (!opts['yes']) { out.line(`deleting ${o.metadata.namespace}/${a}${where} removes its compute now and its data after the platform's hold: add --yes`); return 1 }
         ok(await k.request('DELETE', dbPath(o.metadata.namespace, a!)), `delete ${a}`, [404])
-        out.line(`${o.metadata.namespace}/${a}: deleted (its compute goes now, its data after the platform's hold)`)
+        out.line(`${o.metadata.namespace}/${a}${where}: deleted (its compute goes now, its data after the platform's hold)`)
         return 0
       }
       case 'url': {
-        const o = await findDb(k, checkName(a), ns)
+        const o = await find(checkName(a))
         const secret = o.status?.loginSecret
         if (!secret) throw new Refused(`${a} has no login yet: ${o.status?.message ?? 'it is being made'}`)
         const s = ok(await k.request('GET', `/api/v1/namespaces/${o.metadata.namespace}/secrets/${secret}`), `read ${secret}`).json
@@ -194,9 +194,13 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
         return 0
       }
       case 'ca': {
-        const r = await k.request('GET', `/api/v1/namespaces/${here}/configmaps/peat-ca`)
-        if (r.status === 404) throw new Refused(`no authority's certificate in ${here}: it is published in each namespace that holds a database`)
-        out.line(String(ok(r, 'read peat-ca').json.data?.['ca.crt'] ?? '').trimEnd())
+        // the ConfigMap a database's status names, in its namespace; with no database, the platform's name for it in this namespace
+        const o = a ? await find(checkName(a)) : null
+        const inNs = o?.metadata.namespace ?? here, name = o?.status?.caConfigMap ?? 'peat-ca'
+        if (o && !o.status?.caConfigMap) throw new Refused(`${a}'s status names no authority's certificate: ${o.status?.message ?? 'it is being made, or the platform publishes none (an issuer named without keys.caSecret)'}`)
+        const r = await k.request('GET', `/api/v1/namespaces/${inNs}/configmaps/${name}`)
+        if (r.status === 404) throw new Refused(`no authority's certificate ${name} in ${inNs}: it is published in each namespace that holds a database`)
+        out.line(String(ok(r, `read ${name}`).json.data?.['ca.crt'] ?? '').trimEnd())
         return 0
       }
       case 'status': {
@@ -214,17 +218,28 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
       case 'retry': {
         const items = ok(await k.request('GET', `/apis/${API_VERSION}/platforms`), 'read the platform').json.items as any[]
         if (!items.length) { out.line('no Platform in this cluster'); return 1 }
+        // the one Platform, or the one named: never the first of several
+        const p = a ? items.find((x) => x.metadata.name === a) : items.length === 1 ? items[0] : null
+        if (!p) throw new Refused(a ? `no Platform ${a}` : `more than one Platform (${items.map((x) => x.metadata.name).sort().join(', ')}): name one`)
         const request = new Date((deps.now ?? Date.now)()).toISOString()
-        ok(await k.request('PATCH', `/apis/${API_VERSION}/platforms/${items[0].metadata.name}`, { spec: { requests: { retry: request } } }, 'application/merge-patch+json'), 'ask for a retry')
-        out.line(`${items[0].metadata.name}: a retry asked (${request})`)
+        ok(await k.request('PATCH', `/apis/${API_VERSION}/platforms/${p.metadata.name}`, { spec: { requests: { retry: request } } }, 'application/merge-patch+json'), 'ask for a retry')
+        out.line(`${p.metadata.name}${where}: a retry asked (${request})`)
         return 0
       }
       default: return usage()
     }
   } catch (e) {
-    out.line(e instanceof Refused ? `peat: ${e.message}` : `peat: ${e}`)
+    out.line(e instanceof Refused ? `peat: ${e.message}` : `peat${where}: ${e}`)
     return 1
   }
 }
+
+/** `peat help`: the commands and options, as the header of this file gives them. */
+const HELP = [
+  'peat: a platform\'s databases, through your own Kubernetes login',
+  '  peat list [-n <namespace> | -A]', '  peat show <db>', '  peat make <db> [--pg 18|19]', '  peat branch <from> <db>', '  peat restore <from> <db> --at <time | log position>',
+  '  peat replica <of> <db>', '  peat stop <db>', '  peat close <db> | peat open <db>', '  peat delete <db> --yes', '  peat url <db>', '  peat ca [<db>]', '  peat status', '  peat retry [<platform>]',
+  'options: -n/--namespace (default: the kubeconfig context\'s), -A (look a database up in every namespace), --kubeconfig, --context, --no-wait, --timeout <seconds>',
+]
 
 if (import.meta.main) process.exit(await run(process.argv.slice(2)))

@@ -316,19 +316,32 @@ held=$(k -n peat get configmap -l peat-held=true -o jsonpath='{range .items[?(@.
 echo "  orders-then deleted: its compute gone, its data held until $held"
 
 step "the peat command, through the test's own login"
-peatc() { (cd "$root/control" && bun src/cli/peat.ts "$@"); }
+# the one-file program, as users get it: compiled here for this machine, and every step below drives that file
+(cd "$root/control" && bun build src/cli/peat.ts --compile --outfile "$work/peat" >/dev/null) || fail 'the peat command did not compile'
+peatc() { "$work/peat" "$@"; }
 peatc make cli-made -n shop --timeout 120 || fail 'peat make failed'
 peatc list -n shop | grep -q '^shop/cli-made  Ready' || fail 'peat list does not show the database it made'
 cli_url=$(peatc url cli-made -n shop) || fail 'peat url failed'
-peatc ca -n shop > "$work/cli-ca.crt"
+peatc ca cli-made -n shop > "$work/cli-ca.crt"
 cli_password=$(sed -E 's|^postgresql://app:([^@]*)@.*$|\1|' <<< "$cli_url")
-t0=$(date +%s); until PGPASSWORD="$cli_password" psql "host=cli-made.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/cli-ca.crt connect_timeout=30" -XAtqc 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'the database peat made did not answer'; sleep 3; done
+cli() { PGPASSWORD="$cli_password" psql "host=$2 hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/cli-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+t0=$(date +%s); until cli 'select 1' cli-made.peat-db.svc >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'the database peat made did not answer'; sleep 3; done
+cli 'create table n (i int)' cli-made.peat-db.svc
+cli 'insert into n select generate_series(1, 10)' cli-made.peat-db.svc
+sleep 2; cli_moment=$(date -u +%Y-%m-%dT%H:%M:%SZ); sleep 2
+cli 'insert into n select generate_series(11, 30)' cli-made.peat-db.svc
+peatc branch cli-made cli-dev -n shop --timeout 120 || fail 'peat branch failed'
+peatc restore cli-made cli-then --at "$cli_moment" -n shop --timeout 120 || fail 'peat restore failed'
+t0=$(date +%s); until [ "$(cli 'select count(*) from n' cli-dev.peat-db.svc 2>/dev/null)" = 30 ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the branch peat made does not read its parent'\''s 30 rows'; sleep 3; done
+t0=$(date +%s); until [ "$(cli 'select count(*) from n' cli-then.peat-db.svc 2>/dev/null)" = 10 ]; do [ "$(since "$t0")" -lt 180 ] || fail "the restore peat made does not read the 10 rows of $cli_moment"; sleep 3; done
 peatc stop cli-made -n shop || fail 'peat stop failed'
 peatc close cli-made -n shop || fail 'peat close failed'
 peatc open cli-made -n shop || fail 'peat open failed'
+peatc delete cli-dev -n shop --yes || fail 'peat delete failed'
+peatc delete cli-then -n shop --yes || fail 'peat delete failed'
 peatc delete cli-made -n shop --yes || fail 'peat delete failed'
 peatc status | grep -q '^peat: Ready' || fail 'peat status does not say Ready'
-echo "  make, list, url, ca, stop, close, open, delete and status, each through the kubeconfig; the database answered with its published URL's login"
+echo "  the compiled command: make, list, url, ca, branch (30 rows), restore to a moment (10 rows), stop, close, open, delete and status, each through the kubeconfig"
 
 upgrade_s=''; max_gap=''
 if [ -n "${UPGRADE_FROM:-}" ]; then
