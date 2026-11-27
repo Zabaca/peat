@@ -512,6 +512,7 @@ t0=$(date +%s); while k -n peat-compute get role peat-move-mv18 >/dev/null 2>&1;
 [ -z "$(k -n shop get database mv18 -o jsonpath='{.status.move.pods}')" ] || fail 'the move left pods asked for exec'
 echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, the settings, its old copy mv18-pg18 kept on 18"
 echo "  $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: the old version stopped [0-9]* ms after the last look at it' | tail -1)"
+echo "  the grants of its exec: $(k -n peat logs -l app=peat-control --tail=-1 2>/dev/null | grep -o 'mv18: exec on [^ ]* *[^ ]* granted in [0-9]* ms' | sed 's/.*granted in //' | tr '\n' ' ')"
 
 step "the way back from the move, while nothing was written since"
 k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
@@ -605,6 +606,10 @@ swsql 'create database zbig'
 swsql "create table big as select g as id, md5(g::text) as note from generate_series(1, 2000000) g" zbig
 curl -fsS -X POST localhost:18080/db/sw18/stop >/dev/null || fail 'sw18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=sw18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'sw18 did not stop'; sleep 2; done
+# another database's compute, held awake by a session of its own, to be named in the move's ask below
+sql 'select pg_sleep(900)' >/dev/null 2>&1 &
+pids+=($!); first_held=$!
+t0=$(date +%s); until [ -n "$(ready_pod peat-compute compute=first)" ]; do [ "$(since "$t0")" -lt 120 ] || fail 'first did not wake'; sleep 1; done
 k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
 t0=$(date +%s); until sw_pod=$(ready_pod peat-compute compute=sw18) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 k -n peat-compute port-forward "pod/$sw_pod" 25433:5432 >>"$work/tunnel-sw.log" 2>&1 &
@@ -615,16 +620,14 @@ tunnel_up 25433
 t0=$(date +%s); until grant=$(k -n peat-compute get role peat-move-sw18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null) && case "$grant" in *'","'*) true;; *) false;; esac; do [ "$(since "$t0")" -lt 300 ] || fail 'the move ran with no exec grant of its two pods'; sleep 0.5; done
 tgt_pod=$(k -n peat-compute get pods -l peat-move=target -o jsonpath='{.items[0].metadata.name}')
 [ "$grant" = "[\"$sw_pod\",\"$tgt_pod\"]" ] || [ "$grant" = "[\"$tgt_pod\",\"$sw_pod\"]" ] || fail "the move's grant is not exactly its source $sw_pod and target $tgt_pod: $grant"
-other_pod=$(k -n peat-compute get pods -l app=peat-compute -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels.compute}{"\n"}{end}' | awk '$2 != "sw18" && $2 !~ /^mv-/ { print $1; exit }')
-if [ -n "$other_pod" ]; then
-  k "${as[@]}" -n shop patch database sw18 --subresource=status --type merge -p "{\"status\":{\"move\":{\"pods\":[\"$sw_pod\",\"$tgt_pod\",\"$other_pod\"]}}}" >/dev/null
-  sleep 3
-  case "$(k -n peat-compute get role peat-move-sw18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null)" in *"$other_pod"*) fail "a pod of another database named in a move's ask was granted: $other_pod";; esac
-  [ "$(k "${as[@]}" auth can-i create pods/"$other_pod" --subresource=exec -n peat-compute 2>/dev/null)" = no ] || fail "the control layer may exec into another database's pod $other_pod"
-  echo "  the move's grant is its two pods; $other_pod, another database's, named in its ask, is not granted"
-else
-  echo "  the move's grant is its two pods (no other database's compute was up to name)"
-fi
+other_pod=$(ready_pod peat-compute compute=first)
+[ -n "$other_pod" ] || fail "first, held awake to be named in sw18's ask, has no compute"
+k "${as[@]}" -n shop patch database sw18 --subresource=status --type merge -p "{\"status\":{\"move\":{\"pods\":[\"$sw_pod\",\"$tgt_pod\",\"$other_pod\"]}}}" >/dev/null
+sleep 3
+case "$(k -n peat-compute get role peat-move-sw18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null)" in *"$other_pod"*) fail "a pod of another database named in a move's ask was granted: $other_pod";; esac
+[ "$(k "${as[@]}" auth can-i create pods/"$other_pod" --subresource=exec -n peat-compute 2>/dev/null)" = no ] || fail "the control layer may exec into another database's pod $other_pod"
+echo "  the move's grant is its two pods; $other_pod, another database's, named in its ask, is not granted"
+pkill -P "$first_held" 2>/dev/null || true; kill "$first_held" 2>/dev/null || true
 # the moment: the comparison is reading zbig (app's own comparison is over), seen as the session the compute's own superuser holds on the
 # source's zbig while it reads it (the target's side is read after it): looked for every 50 ms over the pod's 127.0.0.1, since a CI
 # runner read 1M rows before a look every few tenths of a second (one with the state read each time) caught it
