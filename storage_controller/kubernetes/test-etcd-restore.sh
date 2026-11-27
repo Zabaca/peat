@@ -90,26 +90,42 @@ EOF
 
   start_controller() {
     KUBECONFIG="$work/kubeconfig" "$controller" -l "127.0.0.1:$listen_port" --dev \
+      --address-for-peers "${1:-http://127.0.0.1:$listen_port}" \
       --records kubernetes --records-namespace records \
       --records-copy-storage "local_path = '$work/bucket'" >> "$work/controller.log" 2>&1 &
     ctl_pid=$!
   }
+  # Wait for the copy in the bucket to hold $1
+  copy_has() {
+    for _ in $(seq 1 20); do
+      grep -q "$1" "$work/bucket/records.json" 2>/dev/null && return 0
+      sleep 0.5
+    done
+    echo "FAIL ($bump bump): the copy never held $1" >&2
+    tail -20 "$work/controller.log" >&2
+    return 1
+  }
+  wait_status() {
+    for _ in $(seq 1 30); do
+      curl -fsS "http://127.0.0.1:$listen_port/status" >/dev/null 2>&1 && break
+      sleep 1
+    done
+  }
+  # A first controller, then gone (a pod lost with its address): the Leader record still names it
+  # when the next one starts, which writes the copy once it becomes leader
+  start_controller "http://controller-0.invalid:1234"
+  wait_status
+  copy_has 'controller-0.invalid' || return 1
+  kill "$ctl_pid"; wait "$ctl_pid" 2>/dev/null || true
   start_controller
-  for _ in $(seq 1 30); do
-    curl -fsS "http://127.0.0.1:$listen_port/status" >/dev/null 2>&1 && break
-    sleep 1
-  done
+  wait_status
   curl -fsS -X POST "http://127.0.0.1:$listen_port/control/v1/node" -H 'content-type: application/json' \
     -d '{"node_id":1,"listen_pg_addr":"localhost","listen_pg_port":6400,"listen_http_addr":"localhost","listen_http_port":9898,"availability_zone_id":"zone-a"}' >/dev/null
   sleep 2
   "$ETCD_TOOLS/etcdctl" --endpoints "http://127.0.0.1:$etcd_port" snapshot save "$work/snapshot.db" >/dev/null 2>&1
   curl -fsS -X PUT "http://127.0.0.1:$listen_port/control/v1/node/1/config" -H 'content-type: application/json' \
     -d '{"node_id":1,"scheduling":"Pause"}' >/dev/null
-  for _ in $(seq 1 20); do
-    grep -q '"schedulingPolicy":"pause"' "$work/bucket/records.json" 2>/dev/null && break
-    sleep 0.5
-  done
-  grep -q '"schedulingPolicy":"pause"' "$work/bucket/records.json"
+  copy_has '"schedulingPolicy":"pause"' || return 1
 
   # The restore, the controller still running
   kill "$api_pid" "$etcd_pid"; wait "$api_pid" "$etcd_pid" 2>/dev/null || true

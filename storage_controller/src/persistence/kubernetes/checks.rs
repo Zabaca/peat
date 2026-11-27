@@ -17,7 +17,8 @@ pub(crate) struct Verdict {
     pub(crate) unfinished: Vec<String>,
     /// Missing, and named by `--records-accept-deleted`: an accepted mark is written.
     pub(crate) accepted: Vec<String>,
-    /// Named by `--records-accept-deleted` but not missing: refused, so the list is exact.
+    /// Named by `--records-accept-deleted` but not missing, nor accepted by an earlier start:
+    /// refused, so the list is exact.
     pub(crate) wrongly_accepted: Vec<String>,
 }
 
@@ -62,9 +63,11 @@ pub(crate) fn classify(
             v.missing.push(key.clone());
         }
     }
+    // A name an earlier start accepted (its mark says so) is satisfied, so a restart with the
+    // setting still in place starts.
     v.wrongly_accepted = accept_deleted
         .iter()
-        .filter(|k| !v.accepted.contains(k))
+        .filter(|k| !v.accepted.contains(k) && !marks.get(*k).is_some_and(|m| m.accepted))
         .cloned()
         .collect();
     v
@@ -183,6 +186,34 @@ mod tests {
         assert_eq!(v.went_back, vec!["Tenant/a"]);
         assert_eq!(v.wrongly_accepted, vec!["Tenant/a"]);
         assert!(v.refuses());
+    }
+
+    #[test]
+    fn a_name_accepted_before_is_satisfied_on_a_restart_with_the_setting_still_there() {
+        let accepted = |r| {
+            BTreeMap::from([(
+                "Safekeeper/s".to_string(),
+                Mark {
+                    revision: r,
+                    accepted: true,
+                },
+            )])
+        };
+        let accept = BTreeSet::from(["Safekeeper/s".to_string()]);
+        // The copy still holds the record, covered by the accepted mark
+        let v = classify(
+            &map(&[]),
+            &map(&[("Safekeeper/s", 5)]),
+            &accepted(5),
+            &accept,
+        );
+        assert!(!v.refuses(), "{v:?}");
+        // The copy written since, without it
+        let v = classify(&map(&[]), &map(&[]), &accepted(5), &accept);
+        assert!(!v.refuses(), "{v:?}");
+        // A plain mark (a delete of this controller's) is no acceptance
+        let v = classify_(&[], &[], &[("Safekeeper/s", 5)], &["Safekeeper/s"]);
+        assert_eq!(v.wrongly_accepted, vec!["Safekeeper/s"]);
     }
 
     #[test]

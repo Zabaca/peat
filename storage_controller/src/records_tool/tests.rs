@@ -450,11 +450,19 @@ async fn a_start_refuses_records_that_went_back_or_went_missing() {
     let marks = copy.read_marks().await.unwrap();
     assert!(marks["Safekeeper/safekeeper-2"].accepted);
     accepted.stop_copy();
-    // And once accepted, the next start passes without it
+    // And once accepted, the next start passes without it, and with it still set (a pod
+    // restarted before the setting is taken out)
     c.again(KubernetesRecords::default())
         .await
         .unwrap()
         .stop_copy();
+    c.again(KubernetesRecords {
+        accept_deleted: vec!["Safekeeper/safekeeper-2".to_string()],
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+    .stop_copy();
 }
 
 /// A crash between a mark and its delete: the object is at its mark's revision; the start
@@ -624,6 +632,88 @@ async fn the_copy_is_not_written_while_another_controller_leads() {
         Some(1),
         "not written"
     );
+}
+
+/// A start whose Leader record names another controller (the one it takes over from, dead or
+/// alive, or one the tool copied in) writes the copy once it becomes leader, and stops, showing
+/// behind, when another is named after it.
+#[tokio::test]
+async fn the_copy_is_written_from_when_this_controller_becomes_leader() {
+    let Some(c) = controller(KubernetesRecords::default()).await else {
+        return;
+    };
+    let copy = c.reader().await;
+    // The Leader record names controller-0
+    fill(&c.p).await;
+    let expected = c.p.read_all_records().await.unwrap();
+    wait_for_copy(&copy, |d| d.records.diff(&expected).unwrap().is_empty()).await;
+    c.p.stop_copy();
+
+    let own = "http://controller-1.example.com:1234".to_string();
+    let p = c
+        .again(KubernetesRecords {
+            own_address: Some(own.clone()),
+            copy_max_lag: Some(Duration::from_secs(1)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Before it leads: not written
+    p.update_node_scheduling_policy(
+        NodeId(1),
+        pageserver_api::controller_api::NodeSchedulingPolicy::Pause,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let doc = copy.read().await.unwrap().unwrap();
+    assert_eq!(
+        doc.records.pageservers["pageserver-1"].scheduling_policy,
+        "active"
+    );
+    // It becomes leader: written
+    let leader = p.get_leader().await.unwrap();
+    p.update_leader(
+        leader,
+        ControllerPersistence {
+            address: own,
+            started_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    wait_for_copy(&copy, |d| {
+        d.records.pageservers["pageserver-1"].scheduling_policy == "pause"
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    p.increment_generation(shard_id(TENANT, 0, 0), NodeId(1))
+        .await
+        .unwrap();
+    // Another is named after it: no more writes, and the copy shows behind
+    let leader = p.get_leader().await.unwrap();
+    p.update_leader(
+        leader,
+        ControllerPersistence {
+            address: "http://controller-2.example.com:1234".to_string(),
+            started_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let err = p
+        .increment_generation(shard_id(TENANT, 0, 0), NodeId(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("behind"), "{err}");
+    let doc = copy.read().await.unwrap().unwrap();
+    assert_eq!(
+        doc.records.leader.as_ref().map(|l| l.address.as_str()),
+        Some("http://controller-1.example.com:1234")
+    );
+    p.stop_copy();
 }
 
 /// Under --records-start-without-copy nothing is made until the copy and its marks are read.

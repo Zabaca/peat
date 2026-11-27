@@ -586,6 +586,13 @@ async fn write_copies(
         .storage_controller_records_copy_behind_seconds;
     let mut last_write = Instant::now();
     let mut written_changes = 0u64;
+    // The Leader record has named this controller: from then on, one naming another means
+    // another leads. Before, it names the controller this one is taking over from (alive, dead,
+    // or copied in by the tool), until this one becomes leader.
+    let mut named_this = false;
+    let mut waiting_said = false;
+    // Another leads: nothing more is written, and the copy shows behind from here on.
+    let mut stopped = false;
     loop {
         tokio::select! {
             _ = changed.notified() => {}
@@ -613,6 +620,9 @@ async fn write_copies(
             (m.document(), m.changes)
         };
         behind.set(writer.state.behind().as_secs_f64().ceil() as i64);
+        if stopped {
+            continue;
+        }
         if changes == written_changes && last_write.elapsed() < MAX_INTERVAL {
             continue;
         }
@@ -621,15 +631,34 @@ async fn write_copies(
             let leaders: Api<Object<LeaderSpec>> =
                 Api::namespaced(writer.client.clone(), &writer.namespace);
             match leaders.get_opt(LEADER_OBJECT_NAME).await {
-                Ok(Some(l)) if l.spec.address != *own => {
+                Ok(Some(l)) if l.spec.address == *own => named_this = true,
+                Ok(Some(l)) if named_this => {
                     tracing::warn!(
-                        "records copy: the Leader record names {}, not this controller; not \
-                         writing the copy",
+                        "records copy: the Leader record names {}, not this controller, which it \
+                         named before; writing the copy no more",
                         l.spec.address
                     );
-                    return;
+                    stopped = true;
+                    writer
+                        .state
+                        .behind_since
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Instant::now);
+                    continue;
                 }
-                Ok(_) => {}
+                Ok(Some(l)) => {
+                    if !waiting_said {
+                        tracing::info!(
+                            "records copy: the Leader record names {}; writing the copy once it \
+                             names this controller",
+                            l.spec.address
+                        );
+                        waiting_said = true;
+                    }
+                    continue;
+                }
+                Ok(None) => {}
                 Err(e) => {
                     tracing::warn!("records copy: reading the Leader record failed: {e}");
                     continue;
