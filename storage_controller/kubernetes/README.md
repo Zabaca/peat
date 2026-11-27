@@ -12,6 +12,7 @@ Files beside this one:
 - [`rbac.yaml`](rbac.yaml): the Role the controller's account needs, and its RoleBinding, with the namespace and account name as placeholders.
 - [`test-stores.sh`](test-stores.sh): starts a Kubernetes API server with these kinds and a Postgres server, for the tests of both stores.
 - [`test-etcd-restore.sh`](test-etcd-restore.sh): restores etcd from a snapshot under a running controller, and checks what it does.
+- [`measure.md`](measure.md): the scale measure, how long a storage server's restart takes with 1,000 and 10,000 databases on it, and how to run it.
 
 ## Why the records can move
 
