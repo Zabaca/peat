@@ -4,32 +4,89 @@ When a pageserver starts, it asks the storage controller to re-attach it, and th
 
 ## What it does
 
-The test `measure_a_storage_servers_restart`, in `storage_controller/src/records_tool/tests.rs`, is skipped unless asked for. When run, it:
+`storcon_records measure-restart` measures; the test `measure_a_storage_servers_restart` (`storage_controller/src/records_tool/tests.rs`, skipped unless asked for) runs the same code. Either one:
 
-1. Makes a namespace of its own (`records-test-<random>`) on the API server, and a copy of the records in a temporary folder, then starts the Kubernetes store there as the controller does: start checks, then the kinds' check.
-2. Registers pageserver 1. Through the controller's own operations, 32 at a time, it makes `STORCON_MEASURE_TENANTS` tenants (1,000 by default) of one shard each, attached to pageserver 1 (a create and an increment per tenant). This is the **fill**.
+1. Makes a namespace of its own (`storcon-measure-<random>`) on the API server, and a copy of the records in a temporary folder, then starts the Kubernetes store there as the controller does: start checks, then the kinds' check.
+2. Registers pageserver 1. Through the controller's own operations, 32 at a time, it makes the given number of tenants (1,000 by default) of one shard each, attached to pageserver 1 (a create and an increment per tenant). This is the **fill**.
 3. Times pageserver 1's **re-attach**, the store's part of the restart, and checks that every tenant was re-attached.
 4. Measures the copy: how long after the re-attach it held every new generation, its size, and how long one write of it takes.
-5. Deletes its namespace, unless `STORCON_MEASURE_KEEP` is set.
-6. When `STORCON_TEST_DATABASE_URL` is set too, runs steps 2 and 3 on a new database there, for comparison.
+5. Deletes its namespace, unless asked to keep it.
+6. Given an empty Postgres database, runs steps 2 and 3 there too, for comparison.
 
-It touches nothing outside its own namespace and its own database. It needs:
-- a kubeconfig that may make and delete a namespace and the record objects in it;
-- the record kinds applied ([`crds.yaml`](crds.yaml)).
+It touches nothing outside its own namespace and the database it is given. It needs the record kinds applied ([`crds.yaml`](crds.yaml)), and an account that may make and delete a namespace and the record objects in any namespace (below).
 
-## How to run it
+## How to run it in a cluster
 
-From a checkout of this repository, with Rust:
+From the storage image, `ghcr.io/zabaca/peat/storage:<tag>`: the image of a merge to `main` that carries this command, or a later one. The account below holds what the measure needs, cluster-wide, so give it only on a cluster made for the proof. Apply the manifest, then read the Job's log; run it once with `--tenants=1000` and once with `--tenants=10000`, deleting the Job between the two:
 
-```sh
-STORCON_TEST_KUBECONFIG=<the kubeconfig of the API server to measure> \
-STORCON_MEASURE_TENANTS=10000 \
-  cargo test --release -p storage_controller measure_a_storage_servers_restart -- --ignored --nocapture
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata: {name: storcon-measure}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: measure, namespace: storcon-measure}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: storcon-measure}
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [create, delete]
+  - apiGroups: [storagecontroller.peat.zabaca.com]
+    resources: [tenants, metadatahealths, timelines, pageservers, safekeepers, leaders]
+    verbs: [get, list, watch, create, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: storcon-measure}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: storcon-measure}
+subjects:
+  - {kind: ServiceAccount, name: measure, namespace: storcon-measure}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: measure-restart, namespace: storcon-measure}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: measure
+      restartPolicy: Never
+      containers:
+        - name: measure
+          image: ghcr.io/zabaca/peat/storage:<tag>
+          command: [storcon_records, measure-restart, --tenants=10000]
 ```
 
-Run it once with `STORCON_MEASURE_TENANTS=1000`, and once with `10000`. Add `STORCON_TEST_DATABASE_URL=postgresql://<user>@<host>:<port>/<database>` for the Postgres line: the test makes a new database there, so the user needs `CREATEDB`. Without it, the test prints only the Kubernetes line.
+```sh
+kubectl -n storcon-measure wait --for=condition=complete --timeout=30m job/measure-restart
+kubectl -n storcon-measure logs job/measure-restart | grep tenants:
+kubectl -n storcon-measure delete job measure-restart
+```
 
-On a machine with no cluster, `test-stores.sh` starts a throwaway API server and Postgres and sets both variables:
+For the Postgres line, add `--database-url=postgresql://<user>:<password>@<host>:<port>/<database>`, naming an empty database the Job can reach (or set `DATABASE_URL` from a Secret). When the measure is done, delete the namespace `storcon-measure` and the ClusterRole and ClusterRoleBinding `storcon-measure`.
+
+**Before this command is in a published image**, the binary comes from a full CI run of the pull request that adds it (artifact `peat-release-arm64` or `peat-release-amd64`, which holds `target/release/storcon_records`). Run a pod of an earlier storage image with the same account, `command: [sleep, infinity]` in place of the Job's, then:
+
+```sh
+gh run download <run id> -R Zabaca/peat -n peat-release-arm64 -D release
+zstd -dc release/peat-release-arm64.tar.zst | tar -xf - ./target/release/storcon_records
+kubectl -n storcon-measure cp target/release/storcon_records <pod>:/tmp/storcon_records
+kubectl -n storcon-measure exec <pod> -- /tmp/storcon_records measure-restart --tenants=10000
+```
+
+## How to run it from a checkout
+
+With Rust, against the API server a kubeconfig names:
+
+```sh
+KUBECONFIG=<kubeconfig> cargo run --release -p storage_controller --bin storcon_records -- measure-restart --tenants=10000
+```
+
+The test runs the same code. `test-stores.sh` starts a throwaway API server and Postgres for it, on a machine with no cluster:
 
 ```sh
 KUBE_ASSETS=<envtest binaries> STORCON_MEASURE_TENANTS=10000 \

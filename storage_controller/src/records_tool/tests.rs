@@ -1395,49 +1395,10 @@ async fn killed_at_every_write_of_a_keeper_change() {
 // ---------------------------------------------------------------------------------------------
 // The scale measure (storage_controller/kubernetes/measure.md): not run by default.
 
-/// What one store took for a storage server's restart with `tenants` databases on it.
-struct Measured {
-    fill: Duration,
-    re_attach: Duration,
-    /// When the re-attach ended.
-    ended: std::time::Instant,
-}
-
-/// `tenants` tenants of one shard each, attached to pageserver 1 through the controller's own
-/// operations, then pageserver 1's re-attach, timed.
-async fn measure_restart(p: &Persistence, tenants: usize) -> Measured {
-    use futures::StreamExt;
-    p.insert_node(&node(1)).await.unwrap();
-    let started = std::time::Instant::now();
-    let ids: Vec<String> = (0..tenants)
-        .map(|i| format!("{i:08x}{}", &TENANT[8..]))
-        .collect();
-    futures::stream::iter(ids.iter().map(|t| async move {
-        p.insert_tenant_shards(vec![shard_row(t, 0, 0)])
-            .await
-            .unwrap();
-        p.increment_generation(shard_id(t, 0, 0), NodeId(1))
-            .await
-            .unwrap();
-    }))
-    .buffer_unordered(32)
-    .collect::<Vec<()>>()
-    .await;
-    let fill = started.elapsed();
-    let started = std::time::Instant::now();
-    let given = p.re_attach(NodeId(1)).await.unwrap();
-    let re_attach = started.elapsed();
-    assert_eq!(given.len(), tenants, "every tenant re-attached");
-    Measured {
-        fill,
-        re_attach,
-        ended: std::time::Instant::now(),
-    }
-}
-
 /// P7: a storage server's restart with `STORCON_MEASURE_TENANTS` databases on it (1000 by
 /// default), on the Kubernetes records at `STORCON_TEST_KUBECONFIG` with their copy, and on
-/// Postgres when `STORCON_TEST_DATABASE_URL` is set too. Prints one line per store.
+/// Postgres when `STORCON_TEST_DATABASE_URL` is set too. Prints one line per store. The same
+/// measure as `storcon_records measure-restart`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "the scale measure: run by hand, storage_controller/kubernetes/measure.md"]
 async fn measure_a_storage_servers_restart() {
@@ -1445,56 +1406,17 @@ async fn measure_a_storage_servers_restart() {
         .ok()
         .map(|n| n.parse().expect("STORCON_MEASURE_TENANTS is a number"))
         .unwrap_or(1000);
-    let c = controller(KubernetesRecords::default())
-        .await
+    let kubeconfig = std::env::var("STORCON_TEST_KUBECONFIG")
         .expect("STORCON_TEST_KUBECONFIG names the API server to measure");
-    let copy = c.reader().await;
-    let m = measure_restart(&c.p, tenants).await;
-    // The copy: how long after the re-attach it held every new generation, its size, and how
-    // long one write of it takes
-    let after = c.p.read_all_records().await.unwrap();
-    let behind = loop {
-        let doc = copy.read().await.unwrap().unwrap();
-        if doc.records.diff(&after).unwrap().is_empty() {
-            break m.ended.elapsed();
-        }
-        assert!(
-            m.ended.elapsed() < Duration::from_secs(600),
-            "the copy did not catch up in ten minutes"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    let doc = copy.read().await.unwrap().unwrap();
-    let size = serde_json::to_vec(&doc).unwrap().len();
-    let started = std::time::Instant::now();
-    copy.write(&doc).await.unwrap();
-    let write = started.elapsed();
-    c.p.stop_copy();
-    println!(
-        "kubernetes, {tenants} tenants: fill {:.1} s; re-attach {:.2} s ({:.0} tenants/s); \
-         copy {size} bytes, one write {} ms, caught up {:.1} s after the re-attach",
-        m.fill.as_secs_f64(),
-        m.re_attach.as_secs_f64(),
-        tenants as f64 / m.re_attach.as_secs_f64(),
-        write.as_millis(),
-        behind.as_secs_f64(),
-    );
-    if std::env::var("STORCON_MEASURE_KEEP").is_err() {
-        Api::<k8s_openapi::api::core::v1::Namespace>::all(c.client.clone())
-            .delete(&c.namespace, &Default::default())
-            .await
-            .unwrap();
-    }
-
-    if let Some(url) = test_database().await {
-        let p = Persistence::new(url).await;
-        p.migration_run().await.unwrap();
-        let m = measure_restart(&p, tenants).await;
-        println!(
-            "postgres, {tenants} tenants: fill {:.1} s; re-attach {:.2} s ({:.0} tenants/s)",
-            m.fill.as_secs_f64(),
-            m.re_attach.as_secs_f64(),
-            tenants as f64 / m.re_attach.as_secs_f64(),
-        );
+    let lines = super::measure::measure_restart(&super::measure::Measure {
+        tenants,
+        kubeconfig: Some(kubeconfig.into()),
+        database_url: test_database().await,
+        keep: std::env::var("STORCON_MEASURE_KEEP").is_ok(),
+    })
+    .await
+    .unwrap();
+    for line in lines {
+        println!("{line}");
     }
 }
