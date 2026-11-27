@@ -184,6 +184,22 @@ spec:
     metadata: { labels: { app: x } }
     spec: { containers: [ { name: x, image: docker.io/library/busybox:1.37 } ] }
 EOF
+# a compute of an image the guard does not list, as one made on the release before an upgrade is: it may be stopped, never moved to another such image
+k -n peat-compute apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: guard-probe }
+spec:
+  replicas: 0
+  selector: { matchLabels: { app: guard-probe } }
+  template:
+    metadata: { labels: { app: guard-probe } }
+    spec: { automountServiceAccountToken: false, containers: [ { name: compute, image: docker.io/library/busybox:1.37 } ] }
+EOF
+k "${as[@]}" -n peat-compute patch deployment guard-probe --type merge -p '{"spec":{"replicas":1}}' --dry-run=server >/dev/null || fail "a change that keeps a compute's image was refused"
+echo "  allowed: a change that keeps a compute's image, one the guard does not list"
+refused "only of the platform's compute images" -n peat-compute patch deployment guard-probe --type json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"docker.io/library/busybox:1.36"}]'
+k -n peat-compute delete deployment guard-probe --wait=false >/dev/null
 
 echo "== the kinds' rules, judged by the cluster's own API server"
 kind_refused() { # kind_refused <words the refusal must hold>, the object on standard input

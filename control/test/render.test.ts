@@ -300,6 +300,9 @@ describe('the guards', () => {
     const compute = JSON.stringify(policies.find((p) => p.metadata.name === COMPUTE_POLICY))
     expect(compute).toContain('compute-pg18:release-2026-12-01')
     expect(compute).toContain('compute-pg19:release-2026-12-01')
+    // a compute made on the release before an upgrade is stopped on its own image: a change that keeps every image is not judged on them
+    expect(compute).toContain("request.operation == 'UPDATE' && (has(object.spec.template.spec.containers) ? dyn(object.spec.template.spec.containers.map(c, c.image)) : dyn([])) == (has(oldObject.spec.template.spec.containers) ? dyn(oldObject.spec.template.spec.containers.map(c, c.image)) : dyn([]))")
+    expect(compute).toContain('variables.keepsImages || (')
   })
   test('each judges the control layer\'s account and no one else\'s, and fails closed', () => {
     for (const p of policies) {
