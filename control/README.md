@@ -39,7 +39,8 @@ adopt.
 
 A database is a Database object, in any namespace; its name is unique across the platform. The control layer makes the storage behind
 it (a new database, a branch of `parent`, a restore of `parent` to the moment `at`, a replica of `replicaOf`) and keeps its record in
-the object's status, with a copy in the platform namespace (a ConfigMap `db-<name>`) from which a lost status is written again; the
+the object's status, with a copy in the platform namespace (a ConfigMap `db-<name>`) from which a lost status is written again (so a
+Database object deleted without its finalizer and made again, while that ConfigMap is there, attaches to the same data); the
 operator publishes, in the object's namespace, the Secret `<name>-login` (username, password, host, URL) and the ConfigMap `peat-ca`
 (the authority's certificate, for `sslmode=verify-full`; not published when `certificates.issuer` is set and `keys.caSecret` is not,
 since the platform's own authority then signs nothing), and the status names both. `spec.closed: true` refuses every connection until it

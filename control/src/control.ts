@@ -20,7 +20,7 @@ import { ancestorFor, olderTimelineFor, ownMemberProbe, recoverDecision, recover
 import { GROUP, controlUrl, fromEnv, frontDoor, parseLabel, placement } from './names'
 import { newLeaf } from './operator/keys'
 import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
-import { DB_API, beginMaking, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
+import { DB_API, HELD_SELECTOR, beginMaking, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, orphanedTenant, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 import { parseWindows, windowAt } from './quiet-hours'
 
 const NAMES = fromEnv()
@@ -430,14 +430,18 @@ const nameService = (name: string) => ({
   spec: { type: 'ExternalName', externalName: FRONT_DOOR },
 })
 
-/** Make the database's compute exist: the spec Secret current, the Service, and the Deployment at one replica (made if it is not there). Returns the pod's name when a pod already exists, else the Deployment's. */
 /** A start refused because the database is closed (its object, read past every cache, says so). */
 class ClosedDb extends Error {}
-async function startCompute(d: Db): Promise<string> {
+/**
+ * Make the database's compute exist: the spec Secret current, the Service, and the Deployment at one replica (made if it is not there).
+ * Returns the pod's name when a pod already exists, else the Deployment's. A closed database is refused, except for the platform's own
+ * one-off start (`evenClosed`: a safekeeper replacement's first start of a timeline never written, which no client reaches).
+ */
+async function startCompute(d: Db, opts: { evenClosed?: boolean } = {}): Promise<string> {
   const existing = await livePod(d.name)
   const dep = await kube('GET', depPath(d.name))
   if (existing && dep.status === 200 && dep.json.spec.replicas === 1) return existing.metadata.name
-  if ((await freshDb(d))?.closed) throw new ClosedDb(`${d.name} is closed: it is opened before anything connects`)
+  if (!opts.evenClosed && (await freshDb(d))?.closed) throw new ClosedDb(`${d.name} is closed: it is opened before anything connects`)
   // created once and left to cert-manager to renew: `apply` replaces on a conflict, and a replace of a custom resource needs its resourceVersion (found 2026-11-19, the first wake: 422), so an existing one is not touched
   await ensureCertificate(d.name)
   await writeSpec(d)
@@ -1116,7 +1120,7 @@ async function startOnceIfNeverWritten(tenant: string, timeline: string, set: nu
     let started = false, ready = false
     try {
       started = true // from here a throw may have left it scaled up
-      await startCompute(d)
+      await startCompute(d, { evenClosed: true })
       for (let i = 0; i < 90 && !ready; i++) { ready = podReady(await livePod(d.name)); if (!ready) await new Promise((res) => setTimeout(res, 1000)) }
     } finally {
       if (started) await stopCompute(d.name).catch((e) => console.log(`sk-replace: could not stop ${d.name} after its first start: ${e}`))
@@ -1327,6 +1331,8 @@ async function createDb(name: string, asked: unknown, namespace: string): Promis
   const ids = await beginMaking(RECORDS, name, namespace, { tenant: hex32(), timeline: hex32() }, { root: true, mode: 'primary', parent: '', from: '' })
   if ('taken' in ids) throw new Error(`the name ${name} is being made in ${ids.taken}`)
   const { tenant, timeline } = ids
+  const earlier = await orphanedTenant(RECORDS, name, tenant)
+  if (earlier) throw new Refused(`an earlier database named ${name} lost its record and its data is still in the store (tenant ${earlier}): its login db-${name}-login names it. Write its record again (a copy of db-${name}) and run /records/copy, or delete that login to make a new, empty database under the name`)
   ok(await storcon('POST', '/v1/tenant', { new_tenant_id: tenant, placement_policy: { Attached: SECONDARIES } }), 'create tenant', [409])
   ok(await storcon('POST', `/v1/tenant/${tenant}/timeline`, { new_timeline_id: timeline, pg_version: pg }), 'create timeline', [409])
   await ensureLogin(RECORDS, name, tenant, () => randomBytes(12).toString('hex'))
@@ -1334,6 +1340,8 @@ async function createDb(name: string, asked: unknown, namespace: string): Promis
   await apply(`/api/v1/namespaces/${DB_NS}/services`, name, nameService(name))
   return { name, namespace, tenant, timeline, parent: '', from: '', root: true, mode: 'primary', port, created: new Date().toISOString(), pg, closed: false }
 }
+/** A make that cannot go on until a person acts: the loop writes it as Failed, not tried again in silence. */
+class Refused extends Error {}
 /** The ports the records and the statuses hold (a claim is the other half: claimPort). */
 const usedPorts = async () => new Set([...(await readRecords(RECORDS)).values()].map((r) => r.db.port).concat((await listDbs()).map((d) => d.port)))
 
@@ -1452,14 +1460,14 @@ async function reconcileDatabases() {
       else if (act.do === 'refuse') { if (o.status?.message !== act.why) await patchDbStatus(ns, name, s ? { message: act.why } : { phase: 'Failed', message: act.why }) }
       else if (act.do === 'wait') { if (o.status?.message !== act.why) await patchDbStatus(ns, name, { ...(s ? {} : { phase: 'Creating' }), message: act.why }) }
       else if (act.do === 'rebuild') {
-        await saveDb(recs.get(name)!.db, { phase: 'Ready', message: "ready: its status was written again from the platform's record of it" })
-        await endMaking(RECORDS, name)
+        await saveDb(recs.get(name)!.db, o.spec?.closed ? { phase: 'Closed', message: "closed: its status was written again from the platform's record of it" } : { phase: 'Ready', message: "ready: its status was written again from the platform's record of it" })
+        await endMaking(RECORDS, name).catch((e) => console.log(`database ${key}: release its claim: ${e}`))
         console.log(`database: ${key}: its status written again from its record`)
       } else if (act.do === 'make') {
-        await patchDbStatus(ns, name, { phase: 'Creating', message: `making a ${act.kind === 'root' ? 'new database' : act.kind === 'branch' ? (act.at ? `restore of ${act.from} at ${act.at}` : `branch of ${act.from}`) : `replica of ${act.from}`}` })
+        if (o.status?.phase !== 'Failed') await patchDbStatus(ns, name, { phase: 'Creating', message: `making a ${act.kind === 'root' ? 'new database' : act.kind === 'branch' ? (act.at ? `restore of ${act.from} at ${act.at}` : `branch of ${act.from}`) : `replica of ${act.from}`}` })
         const d = act.kind === 'root' ? await createDb(name, act.pg, ns) : act.kind === 'branch' ? (await makeBranch(act.from!, name, act.at, ns)).db : await makeReplica(act.from!, name, ns)
         await saveDb(d, { phase: 'Ready', message: 'ready: it sleeps until a client connects', awake: false })
-        await endMaking(RECORDS, name)
+        await endMaking(RECORDS, name).catch((e) => console.log(`database ${key}: release its claim: ${e}`)) // the database works: a claim left behind goes with its delete
         console.log(`database: ${key} made (${act.kind}${act.from ? ` of ${act.from}` : ''})`)
       } else if (act.do === 'delete') {
         const rec = recs.get(name)?.db
@@ -1487,7 +1495,8 @@ async function reconcileDatabases() {
       }
     } catch (e) {
       console.log(`database ${key}: ${act.do}: ${e}`)
-      if (act.do === 'make') await patchDbStatus(ns, name, { phase: 'Creating', message: `making it failed, tried again: ${String(e).slice(0, 300)}` }).catch(() => {})
+      if (act.do === 'make' && e instanceof Refused) { if (o.status?.message !== e.message) await patchDbStatus(ns, name, { phase: 'Failed', message: e.message }).catch(() => {}) }
+      else if (act.do === 'make') await patchDbStatus(ns, name, { phase: 'Creating', message: `making it failed, tried again: ${String(e).slice(0, 300)}` }).catch(() => {})
     } finally { working.delete(key) }
   }
 }
@@ -1901,7 +1910,7 @@ Bun.serve({
       // them until each is written (the COPYING mark), and to compare the two (records.ts, copyRecords). `?dry=1` compares and writes
       // nothing; `?held=<name>` (repeated) brings a deleted database back from its held data first. The ConfigMaps stay, marked
       // `peat-superseded`. Loopback only, like the routes below.
-      if (req.method === 'POST' && path === '/records/copy') return json(await copyRecords(RECORDS, { dry: url.searchParams.get('dry') === '1', held: url.searchParams.getAll('held').filter((n) => DB_NAME.test(n)) }))
+      if (req.method === 'POST' && path === '/records/copy') return json(await copyRecords(RECORDS, { dry: url.searchParams.get('dry') === '1', held: url.searchParams.getAll('held').filter((n) => HELD_SELECTOR.test(n)) }))
       if (req.method === 'GET' && path === '/hook-log') return json(hookLog)
       if (req.method === 'GET' && path === '/compute/current') {
         // is this pod still the current compute of its database? (asked by the compute pod's own shell when compute_ctl exits)
