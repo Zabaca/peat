@@ -2,9 +2,10 @@
 // know who is real); it finds the shapes a real name takes and allows only what is plainly not one:
 //
 //  - dash: an em dash or an en dash (the folder's prose uses commas, colons, semicolons and parentheses);
-//  - address: an IPv4 address outside the documentation ranges (RFC 5737), loopback and the unspecified address; an IPv6 address outside
-//    the documentation prefix 2001:db8::/32 (RFC 3849), loopback and the unspecified address;
-//  - host: a host name under a real top-level domain that is not a reserved example (RFC 2606) or a third party listed below with its
+//  - address: an IPv4 address outside the documentation ranges (RFC 5737), loopback, the unspecified address and the first address of a
+//    private, link-local or shared range (as a CIDR names it); an IPv6 address outside the documentation prefix 2001:db8::/32 (RFC
+//    3849), loopback and the unspecified address;
+//  - host: a host name under a real top-level domain that is not a reserved example (RFC 2606, and home.arpa, RFC 8375) or a third party listed below with its
 //    reason, and a bucket named in an Amazon S3 host or path or an s3:// address;
 //  - email: an address at any domain but a reserved example;
 //  - maintainer: the maintainer's name anywhere but its public addresses (this repository, its images, the API group of Peat's object kinds)
@@ -78,10 +79,12 @@ const MAINTAINER_ADDRESSES = [/\bpeat\.zabaca\.com\b/gi, /github\.com\/zabaca\/p
 /** A credit or licence line: "maintained by Zabaca", "Copyright 2026 Zabaca LLC". */
 const CREDIT = /(?:\b(?:maintained|made|built|published|developed|written)\s+by|copyright(?:\s+\(c\))?\s*(?:\d{4}\s*,?\s*)?)\s*\[?zabaca\b/i
 
-const DOC_RANGES = [/^192\.0\.2\.\d+$/, /^198\.51\.100\.\d+$/, /^203\.0\.113\.\d+$/, /^127\.\d+\.\d+\.\d+$/, /^0\.0\.0\.0$/, /^255\.255\.255\.255$/]
+// and the first address of each private, link-local and shared range (RFC 1918, 3927, 6598) as it names the range in a CIDR: a range, never
+// a host of anyone's
+const DOC_RANGES = [/^192\.0\.2\.\d+$/, /^198\.51\.100\.\d+$/, /^203\.0\.113\.\d+$/, /^127\.\d+\.\d+\.\d+$/, /^0\.0\.0\.0$/, /^255\.255\.255\.255$/, /^(10\.0\.0\.0|172\.16\.0\.0|192\.168\.0\.0|169\.254\.0\.0|100\.64\.0\.0)$/]
 
 const endsWithDomain = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`)
-const reservedHost = (host: string) => /(?:^|\.)(?:example|test|invalid|localhost)$/.test(host) || ['example.com', 'example.org', 'example.net'].some((d) => endsWithDomain(host, d))
+const reservedHost = (host: string) => /(?:^|\.)(?:example|test|invalid|localhost|home\.arpa)$/.test(host) || ['example.com', 'example.org', 'example.net'].some((d) => endsWithDomain(host, d))
 const realDomain = (host: string) => TLDS.has(host.split('.').pop()!)
 
 /**

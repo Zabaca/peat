@@ -96,6 +96,14 @@ whose pods have only IPv6 addresses that is not a valid URL (it needs brackets, 
 takes no address but a URL); such a cluster is not supported yet: it needs a wrapper that writes the address before the controller
 starts.
 
+Each piece's network rules let it reach only what it uses; the pieces that use the store (the pageservers, the safekeepers, the
+storage controller with its records' copy, the control layer) reach any address on the store's port, less
+`objectStore.egressExcept`. By default that is the private ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16,
+100.64.0.0/10) when the endpoint is a public host, so a piece on a machine of a home or office network cannot reach that network's
+devices on that port; and nothing when the endpoint is a cluster Service, a single-label or private name, or a private address, so an
+in-cluster or private-network store keeps working. Set it for a public name that leads to a private address (`[]`), or to ranges of
+your own.
+
 ## The objects
 
 A whole install is one `Platform` (cluster-scoped, one per cluster) and its databases are `Database` objects (namespaced). Every field, its

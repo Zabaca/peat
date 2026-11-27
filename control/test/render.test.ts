@@ -237,13 +237,26 @@ describe('policies', () => {
     expect(JSON.stringify(ctl.spec.ingress)).toContain('"app":"peat-compute"')
     expect(ctl.spec.ingress[0].ports).toEqual([{ protocol: 'TCP', port: 8080 }])
   })
-  test('the pieces that use the store reach it at its port only', () => {
-    for (const name of ['pageserver', 'safekeeper', 'peat-control']) {
-      const p = named(all, 'NetworkPolicy', name, 'peat')
-      expect(p.spec.egress).toContainEqual({ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: [{ protocol: 'TCP', port: 443 }] })
+  test('the pieces that use the store reach it at its port only, less the private ranges when the store is a public host', () => {
+    const PRIVATE = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10']
+    const storeRule = (ms: Manifest[], name: string) => (named(ms, 'NetworkPolicy', name, 'peat').spec.egress as any[]).find((e) => e.to?.[0]?.ipBlock && e.ports?.some((p: any) => p.port === 443 || p.port === 9000) && !e.ports.some((p: any) => p.port === 6443))
+    // a public host (the default here, s3.example.com): every piece that reaches the store leaves the private ranges out
+    for (const name of ['pageserver', 'safekeeper', 'peat-control', 'storage-controller']) expect(storeRule(all, name), name).toEqual({ to: [{ ipBlock: { cidr: '0.0.0.0/0', except: PRIVATE } }], ports: [{ protocol: 'TCP', port: 443 }] })
+    // a store in the cluster (MinIO behind a Service), a single-label name or a private address: nothing left out, so it keeps working
+    for (const endpoint of ['http://minio.store.svc:9000', 'http://minio.store.svc.cluster.local:9000', 'http://minio:9000', 'http://10.0.0.0:9000', 'http://nas.home.arpa:9000']) {
+      const ms = render(resolved({ objectStore: { endpoint, bucket: 'b', credentialsSecret: 's' } }), KEPT)
+      expect(storeRule(ms, 'pageserver'), endpoint).toEqual({ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: [{ protocol: 'TCP', port: 9000 }] })
     }
-    const minio = render(resolved({ objectStore: { endpoint: 'http://store.example.test:9000', bucket: 'b', credentialsSecret: 's' } }), KEPT)
-    expect(named(minio, 'NetworkPolicy', 'pageserver', 'peat').spec.egress).toContainEqual({ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: [{ protocol: 'TCP', port: 9000 }] })
+    // the setting overrides either way: [] leaves nothing out, a list of its own is used as given
+    const none = render(resolved({ objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's', egressExcept: [] } }), KEPT)
+    expect(storeRule(none, 'safekeeper')).toEqual({ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: [{ protocol: 'TCP', port: 443 }] })
+    const own = render(resolved({ objectStore: { endpoint: 'http://minio.store.svc:9000', bucket: 'b', credentialsSecret: 's', egressExcept: ['192.168.0.0/16'] } }), KEPT)
+    expect(storeRule(own, 'safekeeper')).toEqual({ to: [{ ipBlock: { cidr: '0.0.0.0/0', except: ['192.168.0.0/16'] } }], ports: [{ protocol: 'TCP', port: 9000 }] })
+  })
+  test('the ranges left out are CIDRs of IPv4, judged by the kind', () => {
+    const spec = (egressExcept: unknown) => specOf({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Platform', metadata: { name: 'peat' }, spec: { release: 'r', objectStore: { endpoint: 'https://s3.example.com', bucket: 'b', credentialsSecret: 's', egressExcept } } } as any)
+    expect('errors' in spec(['10.0.0.0/8', '172.16.0.0/12'])).toBe(false)
+    for (const bad of ['10.0.0.0', '10.0.0.0/33', '300.0.0.0/8', '2001:db8::/32', 'example.com']) expect('errors' in spec([bad]), bad).toBe(true)
   })
 })
 

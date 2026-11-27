@@ -69,8 +69,8 @@ const OPERATOR_PODS = { namespaceSelector: { matchLabels: { 'kubernetes.io/metad
 /** The API server, at whatever address the cluster gives it (a policy sees the endpoint's address and port, not the Service's). */
 const API_SERVER = { to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(443, 6443) }
 const storePort = (endpoint: string): number => { const u = new URL(endpoint); return Number(u.port || (u.protocol === 'https:' ? 443 : 80)) }
-/** The object store, at its port and only its port (it may be outside the cluster or a pod inside it). */
-const STORE = (r: Resolved) => ({ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(storePort(r.store.endpoint)) })
+/** The object store, at its port and only its port (it may be outside the cluster or a pod inside it), less the ranges the Platform leaves out (platform.ts, storeEgressExcept). */
+const STORE = (r: Resolved) => ({ to: [{ ipBlock: { cidr: '0.0.0.0/0', ...(r.store.egressExcept.length ? { except: r.store.egressExcept } : {}) } }], ports: tcp(storePort(r.store.endpoint)) })
 
 function meta(r: Resolved, name: string, namespace?: string, more: Record<string, string> = {}) {
   return { name, ...(namespace ? { namespace } : {}), labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name, ...more } }

@@ -34,7 +34,7 @@ export interface Resolved {
   spec: PlatformSpec
   names: Names
   images: Images
-  store: { endpoint: string; region: string; pageservers: StoreRef; safekeepers: StoreRef; records: StoreRef; walTrim: string }
+  store: { endpoint: string; region: string; egressExcept: string[]; pageservers: StoreRef; safekeepers: StoreRef; records: StoreRef; walTrim: string }
   placements: Placements
   /** What the platform survives, for the status. */
   survives: string
@@ -127,6 +127,23 @@ export function choosePlacements(spec: PlatformSpec, machines: string[], kept: P
 }
 
 /** The Platform resolved: everything the renderer needs. `release` is the release the pieces are rendered at (an upgrade renders each piece at its own). */
+/** The private and link-local ranges (RFC 1918, RFC 3927, RFC 6598): a home's or an office's devices, a cloud's metadata address. */
+export const PRIVATE_RANGES = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10']
+const privateIp = (ip: string) => { const [a, b] = ip.split('.').map(Number) as [number, number]; return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127) }
+/**
+ * What the pieces' way out to the store leaves out: the Platform's objectStore.egressExcept when it is set; else the private ranges when
+ * the endpoint is a public host (a name under a public domain, or a public address), and nothing when it is a cluster Service (`.svc`,
+ * `.cluster.local`), a single-label or private name (`.local`, `.internal`, `.lan`, `.home.arpa`), a private address or an IPv6 one.
+ */
+export function storeEgressExcept(endpoint: string, set?: string[]): string[] {
+  if (set) return set
+  const host = new URL(endpoint).hostname.toLowerCase()
+  if (host.includes(':') || host.startsWith('[')) return []
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return privateIp(host) ? [] : PRIVATE_RANGES
+  if (!host.includes('.') || /\.(svc|cluster\.local|local|internal|lan|home\.arpa|localhost)$/.test(host) || host === 'localhost') return []
+  return PRIVATE_RANGES
+}
+
 export function resolve(p: Platform, spec: PlatformSpec, placements: Placements): Resolved {
   return {
     name: p.metadata.name,
@@ -136,6 +153,7 @@ export function resolve(p: Platform, spec: PlatformSpec, placements: Placements)
     store: {
       endpoint: spec.objectStore.endpoint,
       region: spec.objectStore.region,
+      egressExcept: storeEgressExcept(spec.objectStore.endpoint, spec.objectStore.egressExcept),
       pageservers: storeRef(spec, spec.objectStore.pageservers, 'pageserver'),
       safekeepers: storeRef(spec, spec.objectStore.safekeepers, 'safekeeper'),
       records: storeRef(spec, spec.objectStore.records, 'storage-controller'),
