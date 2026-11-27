@@ -19,7 +19,8 @@ import { computeImageFor, pgVersionOf, requestedPgVersion } from './storage-spec
 import { ancestorFor, olderTimelineFor, ownMemberProbe, recoverDecision, recoverStep, recoveryPoint, recoveryScope, timelineOwnMembers, unfinishedRepoint, type MemberProbe, type RecoveryMark } from './storage-spec' // the recovery of a database under its own name (recoverDatabase)
 import { GROUP, controlUrl, fromEnv, frontDoor, parseLabel, placement } from './names'
 import { newLeaf } from './operator/keys'
-import { COPYING, FINALIZER, DRILL, databaseAction, deleteAfter, purgeDue } from './databases'
+import { COPYING, DB_NAME, DRILL, FINALIZER, databaseAction, deleteAfter } from './databases'
+import { DB_API, beginMaking, claimPort, copyRecords, dbObjectPath, endMaking, ensureLogin, fromStatus, hold, purgeHeld, readRecords, save as saveRecord, unfinishedMake, writeRecord, type Db, type Deps } from './records'
 import { parseWindows, windowAt } from './quiet-hours'
 
 const NAMES = fromEnv()
@@ -180,16 +181,17 @@ async function safekeepersOf(tenant: string, timeline: string): Promise<{ member
 
 // ---- records
 // A database's record is its Database object (peat.zabaca.com/v1alpha1), in whatever namespace it was made: the command and the API write
-// the object, this layer makes the storage behind it (reconcileDatabases, below) and keeps its record in the object's status. The status
-// is written by this layer alone (the status subresource); a name is unique across namespaces.
-interface Db { name: string; namespace: string; tenant: string; timeline: string; parent: string; root: boolean; mode: 'primary' | 'replica'; port: number; created: string; pg: number; closed: boolean }
-const DB_API = `/apis/${GROUP}/v1alpha1`
-const dbObjectPath = (ns: string, name: string) => `${DB_API}/namespaces/${ns}/databases/${name}`
-const recordOf = (o: any): Db | null => {
-  const s = o?.status, r = s?.record
-  if (!s?.tenant || !r) return null
-  return { name: o.metadata.name, namespace: o.metadata.namespace, tenant: s.tenant, timeline: s.timeline, parent: r.parent ?? '', root: r.root === true, mode: r.mode === 'replica' ? 'replica' : 'primary', port: Number(r.port ?? 0), created: s.createdAt ?? '', pg: pgVersionOf(s.pgVersion === undefined ? undefined : String(s.pgVersion)), closed: s.phase === 'Closed' }
+// the object, this layer makes the storage behind it (reconcileDatabases, below) and keeps its record in the object's status and, as the
+// durable copy, in a ConfigMap `db-<name>` of the platform namespace (records.ts says why and what else is kept beside it). The status is
+// written by this layer alone (the status subresource); a name is unique across namespaces.
+const RECORDS: Deps = {
+  kube, storcon: (m, p, b) => storcon(m, p, b), ns: NS, dbNs: DB_NS, domain: DB_DOMAIN, log: (l) => console.log(l),
+  ancestorOf: async (tenant, timeline) => {
+    const r = await fetch(`${await attachedPageserverApi(tenant)}/v1/tenant/${tenant}/timeline/${timeline}`, { headers: scoped('pageserverapi'), signal: AbortSignal.timeout(10_000) }).catch(() => null)
+    return r?.ok ? (((await r.json()) as any).ancestor_timeline_id ?? null) : null
+  },
 }
+const recordOf = fromStatus
 // Every Database of the cluster, read once a second at most: the gateways' rows, the hook and the loops all read the records
 let dbCache: { at: number; items: Promise<any[]> } | undefined
 const dbObjects = (): Promise<any[]> => {
@@ -202,34 +204,16 @@ const dbObjects = (): Promise<any[]> => {
 const forgetDbs = () => { dbCache = undefined; routesCache = undefined; clustersCache = undefined }
 const getDb = async (name: string): Promise<Db | null> => (await dbObjects()).map(recordOf).find((d) => d?.name === name) ?? null
 const listDbs = async (): Promise<Db[]> => (await dbObjects()).map(recordOf).filter((d): d is Db => d !== null)
-// A port is claimed by creating a ConfigMap `port-<n>` (the API server refuses a second create: 409), so two control layer pods cannot give one port to two databases (found 2026-11-17, making databases in batches of ten: idle-02
-// and idle-08 shared a route, a login for one reached the other's compute). A claim is released when the database is deleted. The records of databases made before claims existed are read as claims too.
-const withLock = <T>(fn: () => Promise<T>): Promise<T> => fn()
-const nextPort = async (owner: string): Promise<number> => {
-  const used = new Set((await listDbs()).map((d) => d.port))
-  for (let p = PORT_BASE; p < 19999; p++) { // a thousand databases need more than the 990 ports of 15010 to 15998; the gateway's own range is 15000 to 19999
-    if (used.has(p)) continue
-    const made = await kube('POST', `/api/v1/namespaces/${NS}/configmaps`, { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: `port-${p}`, namespace: NS, labels: { 'peat-port': 'true' } }, data: { owner } })
-    if (made.status === 409) continue
-    ok(made, `claim port ${p}`)
-    return p
-  }
-  throw new Error('no gateway port left')
-}
-/** Writes a database's record into its object's status (its fields only: the rest of the status is left as it is). */
-const saveDb = async (d: Db, more: Record<string, unknown> = {}) => {
-  ok(await kube('PATCH', `${dbObjectPath(d.namespace, d.name)}/status`, { status: {
-    tenant: d.tenant, timeline: d.timeline, pgVersion: d.pg, createdAt: d.created,
-    record: { mode: d.mode, root: d.root, parent: d.parent, port: d.port },
-    serviceHost: `${d.name}.${DB_NS}.svc`, ...(DB_DOMAIN ? { host: `${d.name}.${DB_DOMAIN}` } : {}), port: 5432,
-    ...more,
-  } }, 'application/merge-patch+json'), `record ${d.name}`)
-  forgetDbs()
-}
-const dbStatus = async (ns: string, name: string, status: Record<string, unknown>) => {
+/** The database as its object says now, past every cache (a start reads it so that a database closed a moment ago is not woken). */
+const freshDb = async (d: Db): Promise<Db | null> => recordOf(ok(await kube('GET', dbObjectPath(d.namespace, d.name)), `read ${d.name}`, [404]).json)
+/** Writes a database's record (its ConfigMap, then its object's status). */
+const saveDb = async (d: Db, more: Record<string, unknown> = {}) => { await saveRecord(RECORDS, d, more); forgetDbs() }
+const patchDbStatus = async (ns: string, name: string, status: Record<string, unknown>) => {
   await kube('PATCH', `${dbObjectPath(ns, name)}/status`, { status }, 'application/merge-patch+json')
   forgetDbs()
 }
+/** Whether a compute runs, in the status: written as it starts or stops, never in the way of either. */
+const markAwake = (d: { namespace: string; name: string }, awake: boolean) => { void patchDbStatus(d.namespace, d.name, { awake }).catch(() => {}) }
 // The gateways read each database's port from `GET /services` (built from the records below): there is no Service per database in the gateways' namespace, only the one front door `pg-front`.
 
 // ---- the compute's spec, as neon_local writes one for an endpoint (control_plane/src/endpoint.rs), reduced to what a pod needs
@@ -447,10 +431,13 @@ const nameService = (name: string) => ({
 })
 
 /** Make the database's compute exist: the spec Secret current, the Service, and the Deployment at one replica (made if it is not there). Returns the pod's name when a pod already exists, else the Deployment's. */
+/** A start refused because the database is closed (its object, read past every cache, says so). */
+class ClosedDb extends Error {}
 async function startCompute(d: Db): Promise<string> {
   const existing = await livePod(d.name)
   const dep = await kube('GET', depPath(d.name))
   if (existing && dep.status === 200 && dep.json.spec.replicas === 1) return existing.metadata.name
+  if ((await freshDb(d))?.closed) throw new ClosedDb(`${d.name} is closed: it is opened before anything connects`)
   // created once and left to cert-manager to renew: `apply` replaces on a conflict, and a replace of a custom resource needs its resourceVersion (found 2026-11-19, the first wake: 422), so an existing one is not touched
   await ensureCertificate(d.name)
   await writeSpec(d)
@@ -468,6 +455,7 @@ async function startCompute(d: Db): Promise<string> {
       spec: { replicas: 1, revisionHistoryLimit: 0, selector: { matchLabels: { app: 'peat-compute', compute: d.name } }, strategy: { type: 'RollingUpdate', rollingUpdate: { maxSurge: 1, maxUnavailable: 1 } }, template: computePodTemplate(d) },
     }), `create deployment compute-${d.name}`)
   }
+  markAwake(d, true)
   return `compute-${d.name}`
 }
 /**
@@ -532,6 +520,7 @@ async function stopCompute(name: string, waitGone = false): Promise<void> {
   if (sc.status >= 300 && sc.status !== 404) ok(sc, `scale compute-${name} down`)
   const r = ok(await kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=${encodeURIComponent(computeSelector(name))}`), 'list pods')
   for (const p of r.json.items as any[]) await kube('DELETE', `/api/v1/namespaces/${CNS}/pods/${p.metadata.name}`, { gracePeriodSeconds: 5 })
+  void getDb(name).then((d) => { if (d) markAwake(d, false) }, () => {})
   // a sleeping database has no compute Service: every Service is a rule on every machine's kube-proxy, and 2,000 of them (a route and a compute Service for each of 1,001 databases) made a Service's endpoint change
   // take 45 to 60 s to reach a client (seen 2026-11-19, the compute-worker cut: the pod and the gateway's own address answered at +13 to +27 s, the Service at +44 to +62 s). It is made again by the next start.
   // waitGone: the caller is about to delete the compute's timeline. A compute that is still shutting down keeps its walproposer reconnecting to the safekeepers, which answer "timeline not found" (3 ERROR lines on the
@@ -1328,21 +1317,25 @@ async function gatewayPeers(): Promise<{ name: string; ip: string }[]> {
 }
 
 // ---- calls
+// A make claims its name and its ids first (`making-<name>`, records.ts), so a pass that dies half way is finished by the next with the
+// same tenant and timeline, not begun again beside them; each step accepts what an earlier pass already made. The record (its ConfigMap,
+// then the status) is written last, by the loop, once everything it names exists.
 async function createDb(name: string, asked: unknown, namespace: string): Promise<Db> {
-  if (!/^[a-z][a-z0-9-]{0,30}$/.test(name)) throw new Error(`bad name ${name}`)
-  if (await getDb(name)) throw new Error(`${name} exists`)
+  if (!DB_NAME.test(name)) throw new Error(`bad name ${name}`)
   const pg = requestedPgVersion(asked, DEFAULT_PG)
   computeImageFor(pg, COMPUTE_IMAGES) // refused before anything is made when no compute could serve this version
-  const tenant = hex32(), timeline = hex32()
-  ok(await storcon('POST', '/v1/tenant', { new_tenant_id: tenant, placement_policy: { Attached: SECONDARIES } }), 'create tenant')
-  ok(await storcon('POST', `/v1/tenant/${tenant}/timeline`, { new_timeline_id: timeline, pg_version: pg }), 'create timeline')
-  const d: Db = { name, namespace, tenant, timeline, parent: '', root: true, mode: 'primary', port: 0, created: new Date().toISOString(), pg, closed: false }
-  const password = randomBytes(12).toString('hex')
-  await apply(`/api/v1/namespaces/${NS}/secrets`, `db-${name}-login`, { apiVersion: 'v1', kind: 'Secret', metadata: { name: `db-${name}-login`, namespace: NS }, stringData: { password } })
-  await withLock(async () => { d.port = await nextPort(d.name); await saveDb(d) })
+  const ids = await beginMaking(RECORDS, name, namespace, { tenant: hex32(), timeline: hex32() }, { root: true, mode: 'primary', parent: '', from: '' })
+  if ('taken' in ids) throw new Error(`the name ${name} is being made in ${ids.taken}`)
+  const { tenant, timeline } = ids
+  ok(await storcon('POST', '/v1/tenant', { new_tenant_id: tenant, placement_policy: { Attached: SECONDARIES } }), 'create tenant', [409])
+  ok(await storcon('POST', `/v1/tenant/${tenant}/timeline`, { new_timeline_id: timeline, pg_version: pg }), 'create timeline', [409])
+  await ensureLogin(RECORDS, name, tenant, () => randomBytes(12).toString('hex'))
+  const port = await claimPort(RECORDS, name, timeline, PORT_BASE, await usedPorts())
   await apply(`/api/v1/namespaces/${DB_NS}/services`, name, nameService(name))
-  return d
+  return { name, namespace, tenant, timeline, parent: '', from: '', root: true, mode: 'primary', port, created: new Date().toISOString(), pg, closed: false }
 }
+/** The ports the records and the statuses hold (a claim is the other half: claimPort). */
+const usedPorts = async () => new Set([...(await readRecords(RECORDS)).values()].map((r) => r.db.port).concat((await listDbs()).map((d) => d.port)))
 
 async function attachedPageserverApi(tenant: string): Promise<string> {
   return `http://${pageserverHost(await attachedNode(tenant))}:9898`
@@ -1351,7 +1344,9 @@ async function attachedPageserverApi(tenant: string): Promise<string> {
 async function makeBranch(from: string, name: string, at: string | undefined, namespace: string): Promise<{ db: Db; lsn: string | null; kind?: string }> {
   const parent = await getDb(from)
   if (!parent) throw new Error(`no database ${from}`)
-  if (await getDb(name)) throw new Error(`${name} exists`)
+  const root = parent.root ? parent.name : parent.parent
+  const ids = await beginMaking(RECORDS, name, namespace, { tenant: parent.tenant, timeline: hex32() }, { root: false, mode: 'primary', parent: root, from })
+  if ('taken' in ids) throw new Error(`the name ${name} is being made in ${ids.taken}`)
   let lsn: string | null = null
   let kind: string | undefined
   // a database recovered under its own name (recoverDatabase) starts its timeline at the recovery point: a moment before it is on the old timeline the recovery kept (the pageserver refuses a branch below a timeline's branch point)
@@ -1374,29 +1369,26 @@ async function makeBranch(from: string, name: string, at: string | undefined, na
       }
     }
   }
-  const timeline = hex32()
-  ok(await storcon('POST', `/v1/tenant/${parent.tenant}/timeline`, { new_timeline_id: timeline, ancestor_timeline_id: ancestor, ...(lsn ? { ancestor_start_lsn: lsn } : {}), pg_version: parent.pg }), 'create branch timeline')
-  const root = parent.root ? parent.name : parent.parent
-  const d: Db = { name, namespace, tenant: parent.tenant, timeline, parent: root, root: false, mode: 'primary', port: 0, created: new Date().toISOString(), pg: parent.pg, closed: false }
-  await withLock(async () => { d.port = await nextPort(d.name); await saveDb(d) })
+  const timeline = ids.timeline
+  ok(await storcon('POST', `/v1/tenant/${parent.tenant}/timeline`, { new_timeline_id: timeline, ancestor_timeline_id: ancestor, ...(lsn ? { ancestor_start_lsn: lsn } : {}), pg_version: parent.pg }), 'create branch timeline', [409])
+  const port = await claimPort(RECORDS, name, timeline, PORT_BASE, await usedPorts())
   await apply(`/api/v1/namespaces/${DB_NS}/services`, name, nameService(name))
-  return { db: d, lsn, kind }
+  return { db: { name, namespace, tenant: parent.tenant, timeline, parent: root, from, root: false, mode: 'primary', port, created: new Date().toISOString(), pg: parent.pg, closed: false }, lsn, kind }
 }
 
 async function makeReplica(from: string, name: string, namespace: string): Promise<Db> {
   const parent = await getDb(from)
   if (!parent) throw new Error(`no database ${from}`)
-  if (await getDb(name)) throw new Error(`${name} exists`)
   const root = parent.root ? parent.name : parent.parent
+  const ids = await beginMaking(RECORDS, name, namespace, { tenant: parent.tenant, timeline: parent.timeline }, { root: false, mode: 'replica', parent: root, from })
+  if ('taken' in ids) throw new Error(`the name ${name} is being made in ${ids.taken}`)
   // a replica is a second compute on the parent's own timeline: same tenant and timeline, read only; no route (it is reached through its own Service)
-  const d: Db = { name, namespace, tenant: parent.tenant, timeline: parent.timeline, parent: root, root: false, mode: 'replica', port: 0, created: new Date().toISOString(), pg: parent.pg, closed: false }
-  await saveDb(d)
-  return d
+  return { name, namespace, tenant: parent.tenant, timeline: parent.timeline, parent: root, from, root: false, mode: 'replica', port: 0, created: new Date().toISOString(), pg: parent.pg, closed: false }
 }
 
 // A deleted database's compute and names go at once; its data in the store stays for the Platform's hold (DELETE_HOLD: `7d` by default,
-// `never` keeps it), recorded in a ConfigMap `held-<name>` in the platform namespace, and is removed by purgeHeld when the hold is over. A
-// drill's database is removed at once. The port claim and the login go with the data.
+// `never` keeps it), recorded in a ConfigMap `held-<name>-<timeline>` in the platform namespace, and is removed by purgeHeld (records.ts)
+// when the hold is over. A drill's database is removed at once, once its record is gone. The port claim and the login go with the data.
 const DELETE_HOLD = process.env['DELETE_HOLD'] || '7d'
 async function deleteDb(d: Db, holdData: boolean): Promise<void> {
   const name = d.name
@@ -1407,30 +1399,13 @@ async function deleteDb(d: Db, holdData: boolean): Promise<void> {
   await del(`/api/v1/namespaces/${CNS}/secrets/${tlsSecret(name)}`)
   await del(`/api/v1/namespaces/${CNS}/secrets/compute-${name}`)
   const after = holdData ? deleteAfter(DELETE_HOLD) : new Date(0)
-  await apply(`/api/v1/namespaces/${NS}/configmaps`, `held-${name}`, {
-    apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: `held-${name}`, namespace: NS, labels: { 'peat-held': 'true' } },
-    data: { name, namespace: d.namespace, tenant: d.tenant, timeline: d.timeline, root: String(d.root), mode: d.mode, port: String(d.port), pg: String(d.pg), deletedAt: new Date().toISOString(), deleteAfter: after ? after.toISOString() : 'never' },
-  })
+  await hold(RECORDS, d, after)
+  forgetDbs()
   console.log(`delete: ${name} (${d.namespace}): compute removed; its data ${after === null ? 'is kept (the hold is never)' : after.getTime() === 0 ? 'goes now (a drill\'s)' : `is kept until ${after.toISOString()}`}`)
-  if (!holdData) await purgeHeld()
+  if (!holdData) await purgeHeld(RECORDS, await notDeleting())
 }
-/** Held data whose time has come is removed from the store: a branch's timeline, or a root's tenant once no database uses it. */
-async function purgeHeld(): Promise<void> {
-  const held = ok(await kube('GET', `/api/v1/namespaces/${NS}/configmaps?labelSelector=peat-held`), 'list held deletions').json.items as any[]
-  const live = await listDbs()
-  for (const h of held) {
-    const t = h.data ?? {}
-    const tenantInUse = live.some((d) => d.tenant === t.tenant) || held.some((o) => o !== h && o.data?.tenant === t.tenant && o.data?.root !== 'true')
-    if (!purgeDue({ deleteAfter: t.deleteAfter, tenant: t.tenant, root: t.root === 'true' }, new Date(), tenantInUse)) continue
-    if (t.mode === 'primary' && t.root === 'true') {
-      ok(await storcon('DELETE', `/v1/tenant/${t.tenant}`), `delete tenant ${t.tenant}`, [404])
-      await del(`/api/v1/namespaces/${NS}/secrets/db-${t.name}-login`)
-    } else if (t.mode === 'primary') ok(await storcon('DELETE', `/v1/tenant/${t.tenant}/timeline/${t.timeline}`), `delete timeline ${t.timeline}`, [404])
-    if (t.port && t.port !== '0') await del(`/api/v1/namespaces/${NS}/configmaps/port-${t.port}`)
-    await del(`/api/v1/namespaces/${NS}/configmaps/${h.metadata.name}`)
-    console.log(`purge: ${t.name}'s data removed from the store (held since ${t.deletedAt})`)
-  }
-}
+/** Every database whose object is not being deleted: what the purge must never take data from. */
+const notDeleting = async (): Promise<Db[]> => (await dbObjects()).filter((o) => !o.metadata.deletionTimestamp).map(recordOf).filter((d): d is Db => d !== null)
 
 // ---- an awake compute on an image the platform no longer names, restarted onto the current one inside the restart hours
 async function restartStaleComputes() {
@@ -1449,79 +1424,70 @@ async function restartStaleComputes() {
   }
 }
 
-// ---- the copy of older records into Database objects (`POST /records/copy`)
-async function copyRecords(dry: boolean): Promise<{ old: number; copied: string[]; equal: string[]; differ: { name: string; fields: string[] }[]; databases: number; countsEqual: boolean }> {
-  const old = (ok(await kube('GET', `/api/v1/namespaces/${NS}/configmaps?labelSelector=peat-record`), 'list the older records').json.items as any[]).map((i) => ({
-    name: String(i.metadata.name).slice(3), tenant: i.data.tenant, timeline: i.data.timeline, parent: i.data.parent ?? '', root: i.data.root === 'true', mode: i.data.mode === 'replica' ? 'replica' : 'primary', port: Number(i.data.port ?? 0), created: i.data.created ?? i.metadata.creationTimestamp, pg: pgVersionOf(i.data.pg), cm: i.metadata.name as string,
-  }))
-  const out = { old: old.length, copied: [] as string[], equal: [] as string[], differ: [] as { name: string; fields: string[] }[], databases: 0, countsEqual: false }
-  for (const r of old) {
-    forgetDbs()
-    let d = await getDb(r.name)
-    if (!d && !dry) {
-      const spec = { pgVersion: r.pg, ...(r.root ? {} : r.mode === 'replica' ? { replicaOf: r.parent } : { parent: r.parent }) }
-      ok(await kube('POST', `${DB_API}/namespaces/${DB_NS}/databases`, { apiVersion: `${GROUP}/v1alpha1`, kind: 'Database', metadata: { name: r.name, namespace: DB_NS, finalizers: [FINALIZER], annotations: { [COPYING]: 'true' } }, spec }), `copy ${r.name}`, [409])
-      const rec: Db = { name: r.name, namespace: DB_NS, tenant: r.tenant, timeline: r.timeline, parent: r.parent, root: r.root, mode: r.mode as Db['mode'], port: r.port, created: r.created, pg: r.pg, closed: false }
-      await saveDb(rec, { phase: 'Ready', message: 'copied from the older records' })
-      ok(await kube('PATCH', dbObjectPath(DB_NS, r.name), { metadata: { annotations: { [COPYING]: null } } }, 'application/merge-patch+json'), `release ${r.name}`)
-      await kube('PATCH', `/api/v1/namespaces/${NS}/configmaps/${r.cm}`, { metadata: { labels: { 'peat-superseded': 'true' } } }, 'application/merge-patch+json')
-      out.copied.push(r.name)
-      forgetDbs()
-      d = await getDb(r.name)
-    }
-    if (!d) continue
-    const fields = (['tenant', 'timeline', 'parent', 'root', 'mode', 'port', 'pg'] as const).filter((f) => String(d![f]) !== String(r[f]))
-    if (fields.length) out.differ.push({ name: r.name, fields })
-    else out.equal.push(r.name)
-  }
-  out.databases = (await listDbs()).length
-  out.countsEqual = out.equal.length === old.length && out.differ.length === 0
-  console.log(`records copy${dry ? ' (dry)' : ''}: ${old.length} older records, ${out.copied.length} copied, ${out.equal.length} equal, ${out.differ.length} differ, ${out.databases} Database records`)
-  return out
-}
-
 // ---- the Database objects: made, closed, opened, stopped and deleted as they ask (databaseAction, databases.ts, decides)
 const finalize = (o: any) => kube('PATCH', dbObjectPath(o.metadata.namespace, o.metadata.name), { metadata: { finalizers: [...(o.metadata.finalizers ?? []), FINALIZER] } }, 'application/merge-patch+json')
 const unfinalize = (o: any) => kube('PATCH', dbObjectPath(o.metadata.namespace, o.metadata.name), { metadata: { finalizers: (o.metadata.finalizers ?? []).filter((f: string) => f !== FINALIZER) } }, 'application/merge-patch+json')
 const working = new Set<string>()
+/** How long a close waits between refusing new starts and stopping the compute: longer than any control layer pod's cache of the records. */
+const CLOSE_SETTLE_MS = 1500
 async function reconcileDatabases() {
   if (!isLeader) return
   forgetDbs()
   const all = await dbObjects()
+  const recs = await readRecords(RECORDS)
+  const records = new Map([...recs].map(([n, r]) => [n, { namespace: r.db.namespace }]))
   const busy = await replacementOpen()
   for (const o of all) {
     const key = `${o.metadata.namespace}/${o.metadata.name}`
     if (working.has(key)) continue
-    const act = databaseAction(o, all, { replacementOpen: busy })
+    const ns = o.metadata.namespace, name = o.metadata.name
+    // a record the status holds and the platform's ConfigMaps lost is written again from the status
+    const s = recordOf(o)
+    if (s && !o.metadata.deletionTimestamp && !o.metadata.annotations?.[COPYING] && !recs.has(name)) await writeRecord(RECORDS, s).then(() => console.log(`database: ${key}: its record written again from its status`), (e) => console.log(`database ${key}: write its record: ${e}`))
+    const act = databaseAction(o, all, { replacementOpen: busy, records })
     if (act.do === 'none') continue
     working.add(key)
-    const ns = o.metadata.namespace, name = o.metadata.name
     try {
       if (act.do === 'finalize') ok(await finalize(o), `finalize ${key}`)
-      else if (act.do === 'refuse') { if (o.status?.message !== act.why) await dbStatus(ns, name, recordOf(o) ? { message: act.why } : { phase: 'Failed', message: act.why }) }
-      else if (act.do === 'wait') { if (o.status?.message !== act.why) await dbStatus(ns, name, { ...(recordOf(o) ? {} : { phase: 'Creating' }), message: act.why }) }
-      else if (act.do === 'make') {
-        await dbStatus(ns, name, { phase: 'Creating', message: `making a ${act.kind === 'root' ? 'new database' : act.kind === 'branch' ? (act.at ? `restore of ${act.from} at ${act.at}` : `branch of ${act.from}`) : `replica of ${act.from}`}` })
+      else if (act.do === 'refuse') { if (o.status?.message !== act.why) await patchDbStatus(ns, name, s ? { message: act.why } : { phase: 'Failed', message: act.why }) }
+      else if (act.do === 'wait') { if (o.status?.message !== act.why) await patchDbStatus(ns, name, { ...(s ? {} : { phase: 'Creating' }), message: act.why }) }
+      else if (act.do === 'rebuild') {
+        await saveDb(recs.get(name)!.db, { phase: 'Ready', message: "ready: its status was written again from the platform's record of it" })
+        await endMaking(RECORDS, name)
+        console.log(`database: ${key}: its status written again from its record`)
+      } else if (act.do === 'make') {
+        await patchDbStatus(ns, name, { phase: 'Creating', message: `making a ${act.kind === 'root' ? 'new database' : act.kind === 'branch' ? (act.at ? `restore of ${act.from} at ${act.at}` : `branch of ${act.from}`) : `replica of ${act.from}`}` })
         const d = act.kind === 'root' ? await createDb(name, act.pg, ns) : act.kind === 'branch' ? (await makeBranch(act.from!, name, act.at, ns)).db : await makeReplica(act.from!, name, ns)
         await saveDb(d, { phase: 'Ready', message: 'ready: it sleeps until a client connects', awake: false })
+        await endMaking(RECORDS, name)
         console.log(`database: ${key} made (${act.kind}${act.from ? ` of ${act.from}` : ''})`)
       } else if (act.do === 'delete') {
-        const d = recordOf(o)
-        await dbStatus(ns, name, { phase: 'Deleting', message: 'deleting' }).catch(() => {})
+        const rec = recs.get(name)?.db
+        const d = s ?? (rec && rec.namespace === ns ? rec : null)
+        await patchDbStatus(ns, name, { phase: 'Deleting', message: 'deleting' }).catch(() => {})
         if (d) await deleteDb(d, act.holdData)
+        else {
+          // a make that never finished: what it made of the storage goes at once (no client had it)
+          const u = await unfinishedMake(RECORDS, name, ns)
+          if (u) { await hold(RECORDS, u, new Date(0)); await purgeHeld(RECORDS, await notDeleting()) }
+        }
         ok(await unfinalize(o), `let ${key} go`, [404])
       } else if (act.do === 'close') {
+        // closed first, so that a start from here on refuses it (a start reads the object past every cache), then the compute stops: a
+        // pooled client that reconnects the moment its session ends finds the database closed, not woken
+        await patchDbStatus(ns, name, { phase: 'Closed', message: 'closed: every connection is refused until it is opened' })
+        await new Promise((res) => setTimeout(res, CLOSE_SETTLE_MS))
         await stopCompute(name)
-        await dbStatus(ns, name, { phase: 'Closed', message: 'closed: every connection is refused until it is opened', awake: false })
+        await patchDbStatus(ns, name, { awake: false })
       } else if (act.do === 'open') {
-        await dbStatus(ns, name, { phase: 'Ready', message: 'ready: it sleeps until a client connects' })
+        await patchDbStatus(ns, name, { phase: 'Ready', message: 'ready: it sleeps until a client connects' })
       } else if (act.do === 'stop') {
         await stopCompute(name)
-        await dbStatus(ns, name, { answered: { ...(o.status?.answered ?? {}), stop: act.request }, awake: false, message: 'asleep: the next connection wakes it' })
+        await patchDbStatus(ns, name, { answered: { ...(o.status?.answered ?? {}), stop: act.request }, awake: false, message: 'asleep: the next connection wakes it' })
       }
     } catch (e) {
       console.log(`database ${key}: ${act.do}: ${e}`)
-      if (act.do === 'make') await dbStatus(ns, name, { phase: 'Creating', message: `making it failed, tried again: ${String(e).slice(0, 300)}` }).catch(() => {})
+      if (act.do === 'make') await patchDbStatus(ns, name, { phase: 'Creating', message: `making it failed, tried again: ${String(e).slice(0, 300)}` }).catch(() => {})
     } finally { working.delete(key) }
   }
 }
@@ -1755,8 +1721,8 @@ async function resafekeepers(tenant: string, timeline: string, generation: numbe
 // connections from ANY pod of the cluster, so are the piece an attacker would reach first), the safekeepers (one question), the storage controller (its hook) and the computes (one question: a compute runs tenants' SQL). **It fails
 // closed:** an address that is in no class gets `/healthz` and `/metrics` and nothing else (the kubelet's probes and Prometheus are such callers); only a call from the pod's own loopback (`kubectl exec`, a port-forward) is not
 // narrowed. A pod that is new (a replacement gateway, a restarted compute) is not in a map made seconds ago, so an address not found is looked up once more, fresh (at most twice a second), before it is called unknown.
-// DB_NAME and POD_NAME are what a name in a path or a query may be: the control layer builds a Kubernetes API path from it with its own token, so it never carries a `/` or a `..`.
-const DB_NAME = /^[a-z][a-z0-9-]{0,30}$/
+// DB_NAME (databases.ts), NAMESPACE_NAME and POD_NAME are what a name in a path, a query or a body may be: the control layer builds a Kubernetes API path from it with its own token, so it never carries a `/` or a `..`.
+const NAMESPACE_NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
 const POD_NAME = /^[a-z0-9]([a-z0-9-]{0,250}[a-z0-9])?$/
 const CALLER_ROUTES: Record<string, [string, RegExp][]> = {
   gateway: [
@@ -1930,11 +1896,12 @@ Bun.serve({
         console.log(`sk-decommission: safekeeper ${id} decommissioned by an operator`)
         return json({ decommissioned: id })
       }
-      // An operator's way to bring an install's older records (ConfigMaps `db-<name>` labelled `peat-record`, what this layer kept before
-      // Database objects) into Database objects, with the control layer's loops stopped from acting on them until each is written
-      // (the COPYING mark), and to compare the two: every name, tenant, timeline, version, port, mode, root and parent, and the counts.
-      // `?dry=1` compares and writes nothing. The old ConfigMaps stay, marked `peat-superseded`. Loopback only, like the routes below.
-      if (req.method === 'POST' && path === '/records/copy') return json(await copyRecords(url.searchParams.get('dry') === '1'))
+      // An operator's way to bring the records (ConfigMaps `db-<name>` labelled `peat-record`: what this layer kept before Database
+      // objects, and the durable copy it keeps of each since) into Database objects, with the control layer's loops stopped from acting on
+      // them until each is written (the COPYING mark), and to compare the two (records.ts, copyRecords). `?dry=1` compares and writes
+      // nothing; `?held=<name>` (repeated) brings a deleted database back from its held data first. The ConfigMaps stay, marked
+      // `peat-superseded`. Loopback only, like the routes below.
+      if (req.method === 'POST' && path === '/records/copy') return json(await copyRecords(RECORDS, { dry: url.searchParams.get('dry') === '1', held: url.searchParams.getAll('held').filter((n) => DB_NAME.test(n)) }))
       if (req.method === 'GET' && path === '/hook-log') return json(hookLog)
       if (req.method === 'GET' && path === '/compute/current') {
         // is this pod still the current compute of its database? (asked by the compute pod's own shell when compute_ctl exits)
@@ -2035,7 +2002,7 @@ Bun.serve({
       if (req.method === 'GET' && path.startsWith('/cluster/')) { if (!DB_NAME.test(path.slice('/cluster/'.length))) return json({ error: 'bad name' }, 400); const row = await clusterOne(path.slice('/cluster/'.length)); return row ? json(row) : json({ error: 'no such database' }, 404) }
       if (req.method === 'GET' && path === '/services') return json(await routeRows())
       if (req.method === 'GET' && path === '/compute-addrs') return json(await computeAddrs())
-      if (req.method === 'GET' && path.startsWith('/route/')) { if (!DB_NAME.test(path.slice('/route/'.length))) return json({ error: 'bad name' }, 400); const d = await getDb(path.slice('/route/'.length)); return d && d.mode === 'primary' ? json({ port: d.port }) : json({ error: 'no such database' }, 404) }
+      if (req.method === 'GET' && path.startsWith('/route/')) { if (!DB_NAME.test(path.slice('/route/'.length))) return json({ error: 'bad name' }, 400); const d = await getDb(path.slice('/route/'.length)); return d && d.mode === 'primary' && !d.closed ? json({ port: d.port }) : d?.closed ? json({ error: `${d.name} is closed` }, 409) : json({ error: 'no such database' }, 404) }
       if (req.method === 'GET' && path.startsWith('/pod/')) { if (!POD_NAME.test(path.slice(5))) return json({ error: 'bad name' }, 400); const r = await kube('GET', `/api/v1/namespaces/${CNS}/pods/${path.slice(5)}`); return json(r.json, r.status) }
       // Making a database through the API writes its Database object (in DB_NS, or `namespace`; a branch, a restore and a replica in their
       // parent's) and waits for the acting layer to make it, as the command does: one record, whoever asks.
@@ -2044,9 +2011,12 @@ Bun.serve({
         if (reservedName(b.name, req)) return json(RESERVED_MESSAGE, 403)
         if (typeof b.name !== 'string' || !DB_NAME.test(b.name)) return json({ error: `bad name ${JSON.stringify(b.name)}` }, 400)
         if (path === '/restore' && !b.at) return json({ error: 'restore needs "at"' }, 400)
+        if (b.namespace !== undefined && (typeof b.namespace !== 'string' || !NAMESPACE_NAME.test(b.namespace))) return json({ error: `bad namespace ${JSON.stringify(b.namespace)}` }, 400)
         const parent = path === '/db' ? null : await getDb(String(b.from ?? ''))
         if (path !== '/db' && !parent) return json({ error: `no database ${b.from}` }, 404)
-        const ns = parent?.namespace ?? (typeof b.namespace === 'string' && b.namespace ? b.namespace : DB_NS)
+        const open = await replacementOpen()
+        if (open) return json({ error: `new databases wait while a safekeeper replacement is open: ${open}` }, 503)
+        const ns = parent?.namespace ?? (b.namespace || DB_NS)
         const spec = path === '/db' ? (b.pg_version !== undefined ? { pgVersion: Number(b.pg_version) } : {}) : path === '/replica' ? { replicaOf: b.from } : { parent: b.from, ...(b.at ? { at: String(b.at) } : {}) }
         const t0 = Date.now()
         const made = await kube('POST', `${DB_API}/namespaces/${ns}/databases`, { apiVersion: `${GROUP}/v1alpha1`, kind: 'Database', metadata: { name: b.name, namespace: ns, ...(req.headers.get('x-peat-drill') === '1' ? { annotations: { [DRILL]: 'true' } } : {}) }, spec })
@@ -2058,9 +2028,15 @@ Bun.serve({
           forgetDbs()
           last = ok(await kube('GET', dbObjectPath(ns, b.name)), 'read the Database').json
           d = recordOf(last)
-          if (!d && last?.status?.phase === 'Failed') return json({ error: last.status.message }, 409)
+          if (!d && last?.status?.phase === 'Failed') break
         }
-        if (!d) return json({ error: `${b.name} was not made in 120 s: ${last?.status?.message ?? 'no word from the acting control layer'}` }, 504)
+        if (!d) {
+          // a call that did not get its database takes its object back, so the name is not held by an object nobody waits for
+          await kube('DELETE', dbObjectPath(ns, b.name), { preconditions: { uid: made.json.metadata?.uid } })
+          forgetDbs()
+          if (last?.status?.phase === 'Failed') return json({ error: last.status.message }, 409)
+          return json({ error: `${b.name} was not made in 120 s: ${last?.status?.message ?? 'no word from the acting control layer'}` }, 504)
+        }
         const madeMs = Date.now() - t0
         if (b.start !== false) await startCompute(d)
         return json({ ...d, ms: { made: madeMs, total: Date.now() - t0 } })
@@ -2074,7 +2050,8 @@ Bun.serve({
         if (req.method === 'DELETE') { ok(await kube('DELETE', dbObjectPath(d.namespace, name)), `delete ${name}`, [404]); forgetDbs(); return json({ deleted: name }) }
         if (req.method === 'POST' && m[2] === 'start') {
           if (d.closed) return json({ error: `${name} is closed: it is opened before anything connects` }, 409)
-          const r = await startPlaced(d, reqAt)
+          const r = await startPlaced(d, reqAt).catch((e) => { if (e instanceof ClosedDb) return { closed: e.message }; throw e })
+          if ('closed' in r) return json({ error: r.closed }, 409)
           if ('refused' in r) return json({ error: `cannot start ${name}: the machines are full: ${r.refused}`, refused: r.refused }, 503)
           return json(r)
         }
@@ -2101,7 +2078,7 @@ void loop('reload renewed certificates', 300_000, reloadRenewedCerts)
 void loop('renew the certificates this layer signs', 3_600_000, renewOwnCerts)
 void loop('databases', 2000, reconcileDatabases)
 void loop('restart hours', 60_000, restartStaleComputes)
-void loop('remove held data whose hold is over', 3_600_000, async () => { if (isLeader) await purgeHeld() })
+void loop('remove held data whose hold is over', 3_600_000, async () => { if (isLeader) await purgeHeld(RECORDS, await notDeleting()) })
 // JavaScriptCore collects lazily and does not know the container's memory limit: run in the pod, the garbage of the loops and of every call piled up until the kernel killed the process at 256 MiB (read 2026-11-21: with the
 // program's own loops and calls, a local run of the same Bun held 1.6 MiB of heap with a full collection every 30 s and grew its live promises and closures without one). A full collection of a heap this small takes
 // milliseconds. `GC_EVERY_S` 0 turns it off.
