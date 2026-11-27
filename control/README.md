@@ -27,7 +27,10 @@ shard attached, nothing reconciling, every secondary copy warm, every safekeeper
 (it goes on from that step) or until the earlier release is set back (only what had moved goes back, last first, with the same checks,
 except that the check before each step back leaves out that step's own piece and its own storage readings: it is the broken piece the way
 back mends). With two pieces broken at once the way back halts at the first it reaches: for the keepers this is the safe side (a write needs
-two of three); the way out is `suspend: true` on the Platform and a fix by hand. Changing the target's images while an upgrade is under way
+two of three); the way out is `suspend: true` on the Platform and a fix by hand. The storage readings of every check, and a pageserver's
+drain and fill, go through the storage controller, and the way back reaches the controller last: a controller that breaks after later
+pieces moved halts the way back at the first of those it takes back. The way out is `suspend: true` on the Platform and the controller put
+back on its earlier image by hand. Changing the target's images while an upgrade is under way
 (the release kept, its images pinned anew to mend a bad one) takes back what moved and then runs the upgrade again to the new images. No
 upgrade starts from pieces that do not all run the same images (one changed by hand while no release is recorded), nor from images no
 release records (pieces without the operator's release stamp): the status says which, and nothing is recorded or started until they
