@@ -20,6 +20,7 @@ use crate::persistence::{
     ControllerPersistence, DatabaseResult, NodePersistence, SafekeeperTimelineOpKind, TenantFilter,
     TenantShardPersistence, TimelineImportPersistence,
 };
+use crate::records_tool::CopyOptions;
 
 /// The error of what was to be refused.
 trait Refused {
@@ -1098,6 +1099,391 @@ async fn a_restore_raises_every_generation_and_refuses_what_it_must() {
         .await
         .unwrap()
         .stop_copy();
+}
+
+/// A copy with --replace refuses, in both directions, to empty the destination from a source
+/// with no pageserver, and to lower or drop what the destination holds (a shard at a higher
+/// generation, or missing from the source), unless told that is meant.
+#[tokio::test]
+async fn a_replacing_copy_refuses_to_empty_or_lower_the_destination() {
+    const TENANT_C: &str = "3d5a1b7c9e2f4a6b8c0d1e2f3a4b5c6d";
+    let Some(db) = test_database().await else {
+        return;
+    };
+    let Some(c) = controller(KubernetesRecords::default()).await else {
+        return;
+    };
+    let copy_reader = c.reader().await;
+    fill(&c.p).await;
+    let filled = c.p.read_all_records().await.unwrap();
+    wait_for_copy(&copy_reader, |d| {
+        d.records.diff(&filled).unwrap().is_empty()
+    })
+    .await;
+    c.p.stop_copy();
+    let stores = both(&c, &db);
+    let stopped = Running {
+        assume_stopped: true,
+        ..Default::default()
+    };
+    let none = BTreeSet::new();
+    let refused = |o: Outcome| match o {
+        Outcome::Refused(r) => r,
+        o => panic!("not refused: {o:?}"),
+    };
+    let accepting = |names: &[String]| CopyOptions {
+        replace: true,
+        accept_older: names.iter().cloned().collect(),
+        ..Default::default()
+    };
+    let emptying = CopyOptions {
+        replace: true,
+        empty_destination: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            false,
+            &stopped,
+            &none
+        )
+        .await
+        .unwrap(),
+        Outcome::Done
+    );
+
+    // Back into Postgres: a shard the source holds at a lower generation than the destination,
+    // and one it lacks
+    let pg = stores.open(Store::Postgres, true).await.unwrap();
+    pg.increment_generation(shard_id(TENANT_B, 1, 2), NodeId(1))
+        .await
+        .unwrap();
+    pg.insert_tenant_shards(vec![shard_row(TENANT_C, 0, 0)])
+        .await
+        .unwrap();
+    let r = refused(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            true,
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(
+        r.contains(&format!("Tenant/{TENANT_B} shard 1/2: generation")),
+        "{r}"
+    );
+    assert!(
+        r.contains(&format!("Tenant/{TENANT_C} shard 0/0: not in the source")),
+        "{r}"
+    );
+    // --empty-destination from a source with pageservers: refused, pointing to --accept-older
+    let r = refused(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            emptying.clone(),
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(
+        r.contains("--empty-destination is for a source with no pageserver"),
+        "{r}"
+    );
+    assert!(r.contains("--accept-older"), "{r}");
+    // Each loss is accepted by name: one named, the other still refused
+    let b = format!("Tenant/{TENANT_B}");
+    let c3 = format!("Tenant/{TENANT_C}");
+    let r = refused(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            accepting(&[b.clone()]),
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(!r.contains(&b), "{r}");
+    assert!(r.contains(&c3), "{r}");
+    assert_eq!(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            accepting(&[b.clone(), c3]),
+            &stopped,
+            &none
+        )
+        .await
+        .unwrap(),
+        Outcome::Done
+    );
+    // Without the bucket: refused, unless asked to go without its check
+    let unchecked = Stores {
+        records_copy_storage: None,
+        ..stores.clone()
+    };
+    let r = refused(
+        copy(
+            &unchecked,
+            Store::Kubernetes,
+            Store::Postgres,
+            false,
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(r.contains("needs --records-copy-storage"), "{r}");
+    let without = CopyOptions {
+        replace: true,
+        no_bucket_check: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        copy(
+            &unchecked,
+            Store::Kubernetes,
+            Store::Postgres,
+            without,
+            &stopped,
+            &none
+        )
+        .await
+        .unwrap(),
+        Outcome::Done
+    );
+
+    // Into Kubernetes: a shard the destination holds and the source lacks
+    pg.delete_tenant(tenant(TENANT)).await.unwrap();
+    let r = refused(
+        copy(
+            &stores,
+            Store::Postgres,
+            Store::Kubernetes,
+            true,
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(r.contains(&format!("Tenant/{TENANT} shard")), "{r}");
+    assert!(r.contains("not in the source"), "{r}");
+
+    // Back into Postgres, a source below what the bucket's copy has seen: refused even with
+    // --accept-older, which speaks only for the destination
+    let mut lowered = c.raw::<TenantSpec>().get(TENANT_B).await.unwrap();
+    for shard in &mut lowered.spec.shards {
+        shard.generation = Some(0);
+    }
+    c.raw::<TenantSpec>()
+        .replace(TENANT_B, &PostParams::default(), &lowered)
+        .await
+        .unwrap();
+    let r = refused(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            accepting(&[b.clone()]),
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(
+        r.contains("below what the copy in the bucket has seen"),
+        "{r}"
+    );
+    assert!(r.contains(&format!("Tenant/{TENANT_B}")), "{r}");
+
+    // An empty source, both ways: refused, unless the destination is meant to be emptied
+    let empty = Stores {
+        database_url: Some(test_database().await.unwrap()),
+        ..stores.clone()
+    };
+    Persistence::new(empty.database_url.clone().unwrap())
+        .await
+        .migration_run()
+        .await
+        .unwrap();
+    let r = refused(
+        copy(
+            &empty,
+            Store::Postgres,
+            Store::Kubernetes,
+            true,
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(r.contains("holds no pageserver"), "{r}");
+    let Some(d) = controller(KubernetesRecords::default()).await else {
+        return;
+    };
+    d.p.stop_copy();
+    let r = refused(
+        copy(
+            &both(&d, &db),
+            Store::Kubernetes,
+            Store::Postgres,
+            true,
+            &stopped,
+            &none,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(r.contains("holds no pageserver"), "{r}");
+    // Meant: emptied, with nothing of what it loses to name
+    assert_eq!(
+        copy(
+            &both(&d, &db),
+            Store::Kubernetes,
+            Store::Postgres,
+            emptying,
+            &stopped,
+            &none
+        )
+        .await
+        .unwrap(),
+        Outcome::Done
+    );
+    assert!(pg.load_active_tenant_shards().await.unwrap().is_empty());
+}
+
+/// Going back after a tenant was split on the Kubernetes records: the destination's parent shard
+/// is held split by the source, so it is not taken for a loss; children below its generation are.
+#[tokio::test]
+async fn a_split_after_the_switch_goes_back() {
+    let Some(db) = test_database().await else {
+        return;
+    };
+    let Some(c) = controller(KubernetesRecords::default()).await else {
+        return;
+    };
+    c.p.insert_node(&node(1)).await.unwrap();
+    c.p.insert_tenant_shards(vec![shard_row(TENANT, 0, 0)])
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        c.p.increment_generation(shard_id(TENANT, 0, 0), NodeId(1))
+            .await
+            .unwrap();
+    }
+    let stores = both(&c, &db);
+    let stopped = Running {
+        assume_stopped: true,
+        ..Default::default()
+    };
+    let none = BTreeSet::new();
+    let copy_reader = c.reader().await;
+    let wait = |records: Records| {
+        let copy_reader = &copy_reader;
+        async move {
+            wait_for_copy(copy_reader, |d| {
+                d.records.diff(&records).unwrap().is_empty()
+            })
+            .await;
+        }
+    };
+    wait(c.p.read_all_records().await.unwrap()).await;
+    // With --replace into a new database: migrated before what it holds is read
+    assert_eq!(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            true,
+            &stopped,
+            &none
+        )
+        .await
+        .unwrap(),
+        Outcome::Done
+    );
+    // Split on Kubernetes after the switch: the children at the parent's generation (2)
+    let children = |generation| -> Vec<TenantShardPersistence> {
+        (0..2)
+            .map(|n| TenantShardPersistence {
+                splitting: SplitState::Splitting,
+                generation: Some(generation),
+                generation_pageserver: Some(1),
+                ..shard_row(TENANT, n, 2)
+            })
+            .collect()
+    };
+    c.p.begin_shard_split(
+        ShardCount::new(0),
+        tenant(TENANT),
+        vec![(shard_id(TENANT, 0, 0), children(2))],
+    )
+    .await
+    .unwrap();
+    c.p.complete_shard_split(tenant(TENANT), ShardCount::new(0), ShardCount::new(2))
+        .await
+        .unwrap();
+    wait(c.p.read_all_records().await.unwrap()).await;
+    // Back: the parent the destination holds is covered by the children
+    assert_eq!(
+        copy(
+            &stores,
+            Store::Kubernetes,
+            Store::Postgres,
+            true,
+            &stopped,
+            &none
+        )
+        .await
+        .unwrap(),
+        Outcome::Done
+    );
+
+    // A child below the parent's generation is a loss: the destination's parent is not covered
+    let pg = stores.open(Store::Postgres, true).await.unwrap();
+    pg.delete_tenant(tenant(TENANT)).await.unwrap();
+    let mut parent = shard_row(TENANT, 0, 0);
+    parent.generation = Some(3);
+    pg.insert_tenant_shards(vec![parent]).await.unwrap();
+    match copy(
+        &stores,
+        Store::Kubernetes,
+        Store::Postgres,
+        true,
+        &stopped,
+        &none,
+    )
+    .await
+    .unwrap()
+    {
+        Outcome::Refused(r) => {
+            assert!(
+                r.contains(&format!("Tenant/{TENANT} shard 0/0: not in the source")),
+                "{r}"
+            )
+        }
+        o => panic!("not refused: {o:?}"),
+    }
+    c.p.stop_copy();
 }
 
 // ---------------------------------------------------------------------------------------------
