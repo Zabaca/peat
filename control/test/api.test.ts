@@ -116,7 +116,7 @@ describe('the CustomResourceDefinitions', () => {
   test('the rules across fields the descriptions promise are the API server\'s to judge, in the CustomResourceDefinitions', () => {
     const text = JSON.stringify(all)
     for (const message of [
-      'the namespaces cannot change', "may not be default, the operator's peat-system or one of the kube- namespaces", 'the store needs the one bucket', 'records postgres needs controller.postgres', 'spread none runs one pageserver',
+      'the namespaces cannot change', "may not be default, the operator's peat-system or one of the kube- namespaces", 'the store needs the one bucket', 'records postgres needs controller.postgres', 'spread none runs one pageserver', 'adopt is not in this release', 'requests.applyPending is not in this release',
       'at is the moment of a parent', 'not both', 'parent cannot change', 'at cannot change', 'replicaOf cannot change', 'pgVersion is never lowered',
     ]) expect([message, text.includes(message)]).toEqual([message, true])
   })

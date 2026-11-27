@@ -29,27 +29,22 @@ except that the check before each step back leaves out that step's own piece and
 back mends). With two pieces broken at once the way back halts at the first it reaches: for the keepers this is the safe side (a write needs
 two of three); the way out is `suspend: true` on the Platform and a fix by hand. Changing the target's images while an upgrade is under way
 (the release kept, its images pinned anew to mend a bad one) takes back what moved and then runs the upgrade again to the new images. No
-upgrade starts from pieces that do not all run the same images, nor from images no release records (a platform installed another way):
-pin `spec.images` to what runs, and the release is recorded under the spec's name. A drain asked again when its node reads Active also
+upgrade starts from pieces that do not all run the same images (one changed by hand while no release is recorded), nor from images no
+release records (pieces without the operator's release stamp): the status says which, and nothing is recorded or started until they
+agree (pinning `spec.images` to what runs records the release under the spec's name). A drain asked again when its node reads Active also
 restarts one a person cancelled, until `upgrades.checkTimeout` halts it.
 No step starts inside `upgrades.quietHours`: an upgrade under way waits at the next step boundary. A compute takes the new image at its
 next start, or, awake, inside `upgrades.restartHours`, one at a time. The state is in `status.upgrade`, so a restarted operator goes on.
 
-## Adoption
+## What the operator does not take over
 
-A platform installed another way is taken over by naming its objects in the Platform's `adopt` list (kind, namespace, name). The operator
-compares each with what it would make (the fields it sets, the annotations it sets, a Secret's values): one it would not change is
-taken over as it is, and is the operator's from then on, listed or not; one it would change is left alone, marked adopted, and the change
-is listed in `status.pendingChanges` until `requests.applyPending` asks for it (taking it off the list applies nothing). A change of a
-field that cannot change in place (a Deployment's or StatefulSet's selector, a StatefulSet's volume claims, serviceName or
-podManagementPolicy, a Job's template, a Service's clusterIP, a binding's roleRef) is listed as one that cannot be applied. A change to a
-pageserver's pods is not applied by `requests.applyPending`: the ordered upgrade makes it, when the release or the images change. A step
-waits, before it changes anything, while one of its adopted pieces holds a difference beyond its images, and says which; once
-`requests.applyPending` asks, the step applies the whole render to it (every difference, not only the new images). No upgrade starts on
-the pass that adopts. Once any piece runs, a changed release goes through the ordered
-steps, from the images the live pieces run when no release has been recorded yet. While anything is pending the platform reads Installing,
-not Ready (the release is recorded all the same once every piece is ready). An entry that names nothing the operator makes is said in the
-status. It never deletes what it did not make or adopt.
+Adoption, taking over a platform installed another way, is not in this release: a Platform that names `adopt` or `requests.applyPending`
+is refused. An existing object of a piece's name that the operator did not make is refused and left alone (the Platform reads Installing,
+naming it); the operator's record of what it made, in its own namespace, decides what is its own, and it never applies over, nor deletes,
+an object outside it. A lost record (its ConfigMap deleted, a cluster restored with new UIDs) has no way back in this release: every piece
+is then refused and left alone, the status says the record was made new, and the recovery is by hand (the record rebuilt from the objects'
+UIDs, or the objects removed so the operator makes them again). Once any piece runs, a changed release goes through the ordered steps,
+from the images the live pieces run when no release has been recorded yet.
 
 ## Databases
 
@@ -97,8 +92,8 @@ platform.spec` and `kubectl explain database.spec` print the same text. In short
   per piece), `pageservers`, `safekeepers` (three or five, their zone label, `outside` machines that may hold one member), `controller`
   (`records: kubernetes` or `postgres`), `gateways` (count, `domain`, how the front door is exposed), `certificates` (a cert-manager issuer,
   or the platform's own authority), `computes` (default Postgres version, `idleAfter`, memory), `databases.deleteHold`, `upgrades`
-  (`quietHours`, `restartHours`, `checkTimeout`), `keys` (given, or made), `control`, `adopt`, `suspend`, `requests.retry`,
-  `requests.applyPending`. Every duration is a number and a unit (`30m`, `7d`). Rules across fields (a namespace never changes; a
+  (`quietHours`, `restartHours`, `checkTimeout`), `keys` (given, or made), `control`, `suspend`, `requests.retry` (`adopt` and
+  `requests.applyPending` are refused: not in this release). Every duration is a number and a unit (`30m`, `7d`). Rules across fields (a namespace never changes; a
   version never lowered; `parent`, `at` and `replicaOf` fixed once made) are the API server's, in the CustomResourceDefinitions.
 - **Database** `spec`: `pgVersion` (raising it moves the database to the newer major under its own name), `parent` and `at` (a branch, or
   a restore to a moment as a new database), `replicaOf`, `idleAfter`, `memory`, `closed`, `keepOldFor`, `requests.stop`,
