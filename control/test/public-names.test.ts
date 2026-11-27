@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { publicNameHits } from '../src/public-names'
 
-// The public-names check (src/public-names.ts): its rules on made-up lines, then the whole folder, which must hold no finding.
+// The public-names check (src/public-names.ts): its rules on made-up lines, then the whole folder and the repository's .github, which must hold no finding.
 // The scan leaves out the check's own two files: this one holds offending lines on purpose, and the check's source names what it allows.
 
 const kinds = (line: string, path = 'notes.txt') => publicNameHits(path, line).map((h) => h.kind)
@@ -150,6 +150,39 @@ describe('the third review\'s follow-ups', () => {
   })
 })
 
+describe('the allowances the CI files need, each as narrow as its case', () => {
+  test('Python: code is not prose (tarfile.open, entry.name); its comments and strings are', () => {
+    expect(kinds('with tarfile.open(path, "w:gz") as tar:', 'ci/report.py')).toEqual([])
+    expect(kinds('if not entry.name[len(stem) :].isdigit():', 'ci/report.py')).toEqual([])
+    expect(kinds('# the results are copied to evil.com', 'ci/report.py')).toEqual(['host'])
+    expect(kinds('url = "https://evil.com/x"', 'ci/report.py')).toEqual(['host'])
+    expect(kinds('doc = """see evil.com"""', 'ci/report.py')).toEqual(['host'])
+  })
+  test('a workflow: its own expressions are code; every other host counts', () => {
+    expect(kinds('          username: ${{ github.actor }}', '.github/workflows/ci.yml')).toEqual([])
+    expect(kinds('          registry: evil.com', '.github/workflows/ci.yml')).toEqual(['host'])
+  })
+  test('a shell script: jq and JSONPath fields and SQL columns are not hosts; a host is', () => {
+    expect(kinds("k get configmap peat-ca -o jsonpath='{.data.ca\\.crt}'", 'ci/test.sh')).toEqual([])
+    expect(kinds('select 1 from w where w.id = a.id', 'ci/test.sh')).toEqual([])
+    expect(kinds('curl -fsS https://evil.com/install.sh', 'ci/test.sh')).toEqual(['host'])
+    expect(kinds('curl -fsS https://x.acme-corp.com/install.sh', 'ci/test.sh')).toEqual(['host'])
+    expect(kinds('the field .data.ca', 'README.md')).toEqual(['host']) // not in a script
+  })
+  test('pip-compile\'s input file in a pinned requirements file, and pytest ids in the durations file', () => {
+    expect(kinds('    # via -r poetry.in', 'ci/poetry-requirements.txt')).toEqual([])
+    expect(kinds('poetry.in', 'README.md')).toEqual(['host'])
+    expect(kinds('  "test_x[release-pg17-EmptyTimeline.EMPTY-DeletionSubject.TENANT-RestartStorcon.ONLINE]": 9.1,', 'ci/test-durations.json')).toEqual([])
+    expect(kinds('  "see evil.com": 1,', 'ci/test-durations.json')).toEqual(['host'])
+  })
+  test('the CI files\' third parties: the Rust installer, cargo-nextest and actionlint', () => {
+    expect(kinds('curl https://static.rust-lang.org/rustup/dist/x', 'ci/deps.sh')).toEqual([])
+    expect(kinds('https://github.com/nextest-rs/nextest/releases', 'ci/deps.sh')).toEqual([])
+    expect(kinds('https://github.com/rhysd/actionlint', 'ci/lint.yml')).toEqual([])
+    expect(kinds('https://github.com/someone-else/tool', 'ci/lint.yml')).toEqual(['host'])
+  })
+})
+
 describe('the folder', () => {
   test('no file of this folder has a finding', () => {
     const root = join(import.meta.dir, '..')
@@ -160,6 +193,15 @@ describe('the folder', () => {
     expect(files.length).toBeGreaterThan(5)
     const repo = join(root, '..')
     const found = files.flatMap((f) => publicNameHits(f, readFileSync(join(root, f), 'utf8'), (p) => existsSync(join(repo, p))).map((h) => `${h.path}:${h.line}  ${h.kind}  ${h.detail}`))
+    expect(found).toEqual([])
+  })
+  test('no file of the repository\'s CI (.github) has a finding', () => {
+    const repo = join(import.meta.dir, '..', '..')
+    const listed = spawnSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '.github'], { cwd: repo, encoding: 'utf8' })
+    expect(listed.status).toBe(0)
+    const files = listed.stdout.split('\0').filter(Boolean)
+    expect(files.length).toBeGreaterThan(5)
+    const found = files.flatMap((f) => publicNameHits(f, readFileSync(join(repo, f), 'utf8'), (p) => existsSync(join(repo, p))).map((h) => `${h.path}:${h.line}  ${h.kind}  ${h.detail}`))
     expect(found).toEqual([])
   })
 })

@@ -376,8 +376,8 @@ jobs:
 
   # The control folder (control/: the control layer, the gateways, the drills and the two object
   # kinds, TypeScript run by Bun): its tests, its typecheck and the public-names check, which
-  # fails on anything in the folder that names a host, an address, a person or a record that is
-  # not public. Every run; it needs nothing else of the tree and takes about a minute.
+  # fails on anything in the folder or in .github that names a host, an address, a person or a
+  # record that is not public. Every run; it needs nothing else of the tree and takes about a minute.
   control:
     name: control folder (tests, typecheck, public names)
     runs-on: ubuntu-24.04

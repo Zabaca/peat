@@ -53,6 +53,7 @@ export const THIRD_PARTY_DOMAINS: Record<string, string> = {
   'ietf.org': 'IETF: RFCs',
   'iana.org': 'IANA: the list of top-level domains this check reads (src/tlds.txt)',
   'rfc-editor.org': 'RFCs',
+  'rust-lang.org': 'Rust: the toolchain installer the CI images fetch (static.rust-lang.org)',
 }
 
 /** The GitHub and registry owners an address may name, each with why. */
@@ -66,6 +67,8 @@ export const GITHUB_OWNERS: Record<string, string> = {
   minio: 'MinIO',
   library: "Docker Hub's official images (docker.io/library/postgres, busybox)",
   bitnamilegacy: 'The MinIO image the install test runs as its store',
+  'nextest-rs': 'cargo-nextest, the Rust test runner CI installs',
+  rhysd: 'actionlint, the workflow linter CI runs',
 }
 
 /** The maintainer's name, and the places it may stand: its public addresses. */
@@ -136,7 +139,32 @@ export function proseOf(text: string): string {
   return out.join('')
 }
 
-const CODE_FILE = /\.(?:[cm]?[jt]sx?)$/
+/**
+ * The text of a Python file where a host could be: its comments and the text of its strings (single, double and triple quoted), every
+ * other character blanked, line breaks kept. `tarfile.open` and `entry.name` are code.
+ */
+export function pythonProseOf(text: string): string {
+  const out: string[] = text.split('').map((c) => (c === '\n' ? '\n' : ' '))
+  const keep = (i: number) => { out[i] = text[i]! }
+  let i = 0
+  while (i < text.length) {
+    const c = text[i]!
+    if (c === '#') { while (i < text.length && text[i] !== '\n') { keep(i); i++ } continue }
+    if (c === '"' || c === "'") {
+      const triple = text.slice(i, i + 3) === c.repeat(3)
+      const end = triple ? c.repeat(3) : c
+      let j = i + end.length
+      while (j < text.length && text.slice(j, j + end.length) !== end && (triple || text[j] !== '\n')) { if (text[j] === '\\') { keep(j); j++ } keep(j); j++ }
+      i = j + end.length; continue
+    }
+    i++
+  }
+  return out.join('')
+}
+
+const CODE_FILE = /\.(?:[cm]?[jt]sx?|py)$/
+/** Shell scripts and workflows: their jq and JSONPath (`.data.ca`) and their SQL (`w.id = a.id`) name fields, not hosts. */
+const SCRIPT_FILE = /\.(?:sh|ya?ml)$/
 /**
  * Last labels that are top-level domains and also property names this code reads (quoted in its comments, its tests' strings and its
  * kinds' rules), each with its reason: a host under one of these is not found.
@@ -156,7 +184,12 @@ const CODE_PROPERTIES = new Set([
 export function publicNameHits(path: string, text: string, exists: (repoPath: string) => boolean = () => true): Hit[] {
   const hits: Hit[] = []
   const lines = text.split(/\r?\n/)
-  const prose = (CODE_FILE.test(path) ? proseOf(text) : text).split(/\r?\n/)
+  // a workflow's own expressions (`${{ github.actor }}`) are code, not prose
+  const prose = (/\.py$/.test(path) ? pythonProseOf(text) : CODE_FILE.test(path) ? proseOf(text) : /\.ya?ml$/.test(path) ? text.replace(/\$\{\{[^}]*\}\}/g, (m) => ' '.repeat(m.length)) : text).split(/\r?\n/)
+  // pip-compile's input files (`-r poetry.in`) in a pinned requirements file, and the parameters of a pytest id (`test_x[A-B.C]`) in a
+  // file of test durations: names, not hosts
+  const pipInput = /requirements[^/]*\.txt$/.test(path)
+  const durations = /test-durations\.json$/.test(path)
   const licence = /(?:^|\/)(?:LICENSE|NOTICE|COPYING)(?:\.[a-z]+)?$/i.test(path)
   for (const [i, line] of lines.entries()) {
     const said = prose[i] ?? ''
@@ -175,9 +208,14 @@ export function publicNameHits(path: string, text: string, exists: (repoPath: st
       if (m[1] === 'git' && domain === 'github.com') continue
       if (!reservedHost(domain) && realDomain(domain)) add('email', m[0])
     }
+    const params = durations ? [...said.matchAll(/\btest_\w+\[([^\]]*)\]/g)].map((x) => [x.index! + x[0].indexOf('[') + 1, x.index! + x[0].length - 1] as const) : []
     for (const m of said.matchAll(/(?<![A-Za-z0-9_-])((?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9])(?![A-Za-z0-9_-])/g)) {
       const host = m[1]!.toLowerCase()
       if (!realDomain(host) || reservedHost(host)) continue
+      if (pipInput && host.endsWith('.in')) continue
+      if (params.some(([a, b]) => m.index! >= a && m.index! < b)) continue
+      // a jq or JSONPath field begins with a dot; an SQL column is a one-letter alias and a field name of the code (`w.id`)
+      if (SCRIPT_FILE.test(path) && (said[m.index! - 1] === '.' || (host.split('.').some((l) => l.length === 1) && CODE_PROPERTIES.has(host.split('.').at(-1)!)))) continue
       // in code, a name with a label of one letter (`d.name`, `i.data.pg`) is a property chain, not a host; so is one ending in a property
       // name of this code. In a document or a configuration file (README, YAML, the examples) every host counts.
       const labels = host.split('.')

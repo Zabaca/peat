@@ -120,5 +120,5 @@ Peat's CI runs the same on every pull request and every merge (the `control` job
 
 **Everything here is public.** Code, tests, comments and examples name no real person, company, host, address, bucket or record: hosts are
 `example.com` and its kind, addresses are in the documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24), and machines are
-`machine-1` and the like. `test/public-names.test.ts` fails on anything else it can recognise (`src/public-names.ts` says what it looks for
-and what it allows); the maintainer also runs a check with a private list of names before a change here merges. No em dashes or en dashes.
+`machine-1` and the like. `test/public-names.test.ts` fails on anything else it can recognise, in this folder and in the repository's
+`.github` (`src/public-names.ts` says what it looks for and what it allows); the maintainer also runs a check with a private list of names before a change here merges. No em dashes or en dashes.
