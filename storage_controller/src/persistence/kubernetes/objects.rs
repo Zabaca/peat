@@ -163,12 +163,12 @@ mod micros {
     use chrono::{DateTime, SecondsFormat, SubsecRound, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub(crate) fn round(t: DateTime<Utc>) -> DateTime<Utc> {
+    pub(crate) fn truncate(t: DateTime<Utc>) -> DateTime<Utc> {
         t.trunc_subsecs(6)
     }
 
     pub(crate) fn serialize<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&round(*t).to_rfc3339_opts(SecondsFormat::Micros, true))
+        s.serialize_str(&truncate(*t).to_rfc3339_opts(SecondsFormat::Micros, true))
     }
 
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
@@ -202,7 +202,7 @@ mod micros {
     }
 }
 
-pub(crate) use micros::round as round_to_micros;
+pub(crate) use micros::truncate as truncate_to_micros;
 
 // ---------------------------------------------------------------------------------------------
 // Tenant
@@ -328,7 +328,7 @@ impl HealthRecord {
             shard_number: row.shard_number,
             shard_count: row.shard_count,
             healthy: row.healthy,
-            last_scrubbed_at: round_to_micros(row.last_scrubbed_at),
+            last_scrubbed_at: truncate_to_micros(row.last_scrubbed_at),
         }
     }
 
@@ -491,7 +491,7 @@ impl Membership {
             new_sk_set: row.new_sk_set.clone(),
             cplane_notified_generation: row.cplane_notified_generation,
             sk_set_notified_generation: row.sk_set_notified_generation,
-            deleted_at: row.deleted_at.map(round_to_micros),
+            deleted_at: row.deleted_at.map(truncate_to_micros),
         }
     }
 
@@ -706,7 +706,7 @@ impl LeaderSpec {
     pub(crate) fn from_row(row: &ControllerPersistence) -> Self {
         LeaderSpec {
             address: row.address.clone(),
-            started_at: round_to_micros(row.started_at),
+            started_at: truncate_to_micros(row.started_at),
         }
     }
 
@@ -734,7 +734,7 @@ mod tests {
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["startedAt"], "2026-11-26T12:00:00.123456Z");
         let back: LeaderSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(back.started_at, round_to_micros(t));
+        assert_eq!(back.started_at, truncate_to_micros(t));
     }
 
     #[test]

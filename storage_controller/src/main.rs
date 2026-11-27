@@ -289,8 +289,14 @@ impl Default for StrictMode {
 
 /// Secrets may either be provided on the command line (for testing), or loaded from AWS SecretManager: this
 /// type encapsulates the logic to decide which and do the loading.
+/// Where the records are kept, with what each store needs.
+enum RecordsStore {
+    Postgres { database_url: String },
+    Kubernetes,
+}
+
 struct Secrets {
-    database_url: Option<String>,
+    records: RecordsStore,
     public_key: Option<JwtAuth>,
     pageserver_jwt_token: Option<String>,
     safekeeper_jwt_token: Option<String>,
@@ -313,16 +319,17 @@ impl Secrets {
     /// - Environment variables if DATABASE_URL is set.
     async fn load(args: &Cli) -> anyhow::Result<Self> {
         let database_url = Self::load_secret(&args.database_url, Self::DATABASE_URL_ENV);
-        match args.records {
-            Records::Postgres if database_url.is_none() => anyhow::bail!(
+        let records = match (args.records, database_url) {
+            (Records::Postgres, Some(database_url)) => RecordsStore::Postgres { database_url },
+            (Records::Postgres, None) => anyhow::bail!(
                 "Database URL is not set (set `--database-url`, or `DATABASE_URL` environment)"
             ),
+            (Records::Kubernetes, None) => RecordsStore::Kubernetes,
             // A setting that would be silently ignored is refused.
-            Records::Kubernetes if database_url.is_some() => anyhow::bail!(
+            (Records::Kubernetes, Some(_)) => anyhow::bail!(
                 "`--records kubernetes` keeps no records in Postgres: unset `--database-url` and `DATABASE_URL`"
             ),
-            _ => {}
-        }
+        };
 
         let public_key = match Self::load_secret(&args.public_key, Self::PUBLIC_KEY_ENV) {
             Some(v) => Some(JwtAuth::from_key(v).context("Loading public key")?),
@@ -330,7 +337,7 @@ impl Secrets {
         };
 
         let this = Self {
-            database_url,
+            records,
             public_key,
             pageserver_jwt_token: Self::load_secret(
                 &args.jwt_token,
@@ -568,13 +575,13 @@ async fn async_main() -> anyhow::Result<()> {
         handle_ps_local_disk_loss: args.handle_ps_local_disk_loss,
     };
 
-    let persistence = match (args.records, secrets.database_url) {
-        (Records::Postgres, Some(database_url)) => {
+    let persistence = match secrets.records {
+        RecordsStore::Postgres { database_url } => {
             // Validate that we can connect to the database
             Persistence::await_connection(&database_url, args.db_connect_timeout.into()).await?;
             Persistence::new(database_url).await
         }
-        (Records::Kubernetes, None) => {
+        RecordsStore::Kubernetes => {
             let max_lag: Duration = args.records_copy_max_lag.into();
             Persistence::new_kubernetes(
                 None,
@@ -588,9 +595,8 @@ async fn async_main() -> anyhow::Result<()> {
                 },
             )
             .await
-            .context("connecting to the Kubernetes API server")?
+            .context("connect to the Kubernetes API server")?
         }
-        _ => unreachable!("checked when the secrets were loaded"),
     };
     // Before a candidate asks the current leader to step down (in Service::spawn), so one that
     // would refuse never takes the leader down first.

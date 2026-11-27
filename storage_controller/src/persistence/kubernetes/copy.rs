@@ -178,8 +178,11 @@ impl BucketCopy {
 
     /// The copy, or `None` when the bucket holds none yet.
     pub(crate) async fn read(&self) -> anyhow::Result<Option<CopyDocument>> {
-        let doc: Option<CopyDocument> = self.get(COPY_KEY).await?;
-        if let Some(doc) = &doc {
+        let mut doc: Option<CopyDocument> = self.get(COPY_KEY).await?;
+        if let Some(doc) = &mut doc {
+            // Health entries left without their shard (a removal, or a split's abort, between
+            // its two writes) are not records, and Postgres would refuse them.
+            doc.records.drop_orphaned_health();
             if doc.records.format != crate::persistence::records::FORMAT {
                 anyhow::bail!(
                     "the copy is in format {}, this program reads format {}",
@@ -332,6 +335,7 @@ impl Mirror {
         r.safekeepers = take(&self.safekeepers, SafekeeperSpec::KIND, &mut revisions);
         let leaders = take(&self.leaders, LeaderSpec::KIND, &mut revisions);
         r.leader = leaders.get(LEADER_OBJECT_NAME).cloned();
+        r.drop_orphaned_health();
         let mut doc = CopyDocument::new(r);
         doc.revisions = revisions;
         doc
@@ -408,13 +412,15 @@ async fn follow<S: Mirrored>(
     while !cancel.is_cancelled() {
         // List, then watch from the list's version until the watch can no longer go on. A list
         // is compared with everything this controller has seen.
+        // Compared with what was seen before the list was sent.
+        let sent = guard.before_read();
         let listed = async {
             let mut items = BTreeMap::new();
             let mut params = ListParams::default().limit(500);
             let version = loop {
                 let page = api.list(&params).await?;
                 for o in page.items {
-                    guard.observe(&o)?;
+                    guard.observe(&o, sent)?;
                     let rev = o.revision()?;
                     items.insert(o.name().to_string(), (o.spec, rev));
                 }
@@ -432,7 +438,7 @@ async fn follow<S: Mirrored>(
                 for name in S::slot(&mut m).keys() {
                     if !items.contains_key(name) {
                         // A list missing what the watch held: compared with everything seen.
-                        if let Err(e) = guard.observe_absent::<S>(name) {
+                        if let Err(e) = guard.observe_absent::<S>(name, sent) {
                             tracing::error!("records copy: {e}");
                             return;
                         }
