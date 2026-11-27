@@ -606,26 +606,23 @@ sw_password=$(k -n shop get secret sw18-login -o jsonpath='{.data.password}' | b
 swsql() { PGPASSWORD="$sw_password" psql "host=sw18.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=${2:-app} sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
 t0=$(date +%s); until swsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'sw18 did not answer'; sleep 3; done
 swsql 'create table w (id int primary key)'
-# a database compared after app, large enough (2M rows) that its comparison takes a while: a row written to app then is past app's own comparison
+# a database compared after app, large enough (3M rows) that its comparison takes a while: a row written to app then is past app's own comparison
 swsql 'create database zbig'
-swsql "create table big as select g as id, md5(g::text) as note from generate_series(1, 2000000) g" zbig
+swsql "create table big as select g as id, md5(g::text) as note from generate_series(1, 3000000) g" zbig
 curl -fsS -X POST localhost:18080/db/sw18/stop >/dev/null || fail 'sw18 was not stopped'
 t0=$(date +%s); while k -n peat-compute get pods -l compute=sw18 -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail 'sw18 did not stop'; sleep 2; done
-# moveVerify full: a comparison of every row, long enough on zbig's 2M rows to write during it (row counts take a moment)
+# moveVerify full: a comparison of every row, long enough on zbig's 3M rows to write during it (row counts take a moment)
 k -n shop patch database sw18 --type merge -p '{"spec":{"pgVersion":19,"moveVerify":"full"}}' >/dev/null
 t0=$(date +%s); until sw_pod=$(ready_pod peat-compute compute=sw18) && [ -n "$sw_pod" ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the source of the move was not started'; sleep 1; done
 k -n peat-compute port-forward "pod/$sw_pod" 25433:5432 >>"$work/tunnel-sw.log" 2>&1 &
 pids+=($!); sw_tunnel=$!
 tunnel_up 25433
 # the moment: the comparison is reading zbig (app's own comparison is over), seen as the session the compute's own superuser holds on the
-# source's zbig while it reads it (the target's side is read after it): looked for every 50 ms over the pod's 127.0.0.1, since a CI
-# runner read 1M rows before a look every few tenths of a second (one with the state read each time) caught it
-reading_zbig() { psql "host=127.0.0.1 port=25433 user=cloud_admin dbname=postgres sslmode=disable connect_timeout=5" -XAtc "select count(*) from pg_stat_activity where datname = 'zbig' and usename = 'cloud_admin' and pid <> pg_backend_pid()" 2>/dev/null; }
-t0=$(date +%s); n=0; until [ "$(reading_zbig)" = 1 ]; do
-  [ "$(since "$t0")" -lt 600 ] || fail "sw18's move did not reach the comparison of zbig: $(k -n shop get database sw18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
-  n=$((n + 1)); if [ $((n % 40)) = 0 ]; then case "$(k -n shop get database sw18 -o jsonpath='{.status.move.state}')" in done|failed|refused) fail "sw18's move ended before the comparison of zbig was seen";; esac; fi
-  sleep 0.05
-done
+# source's zbig while it reads it (the target's side is read after it). Looked for every 50 ms by one session of its own over the pod's
+# 127.0.0.1 (a new session for each look took too long: a runner hashes 2M rows in about a second); 600 s at most (psql 16's \watch count)
+watch_out=$(printf "select count(*) from pg_stat_activity where datname = 'zbig' and usename = 'cloud_admin' and pid <> pg_backend_pid();\n\\watch i=0.05 c=12000\n" \
+  | psql "host=127.0.0.1 port=25433 user=cloud_admin dbname=postgres sslmode=disable connect_timeout=5" -XAt 2>/dev/null | grep -m1 -x '1' ) || true
+[ "$watch_out" = 1 ] || fail "sw18's move ended before the comparison of zbig was seen: $(k -n shop get database sw18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
 # one session: in, one row, out
 psql "host=127.0.0.1 port=25433 user=app dbname=app sslmode=disable connect_timeout=10" -XAtq -v ON_ERROR_STOP=1 -c 'insert into w values (1)' || fail "the client's row was not written during the comparison (the move was $(k -n shop get database sw18 -o jsonpath='{.status.move.state}'))"
 kill "$sw_tunnel" 2>/dev/null || true
