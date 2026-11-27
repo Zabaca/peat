@@ -88,18 +88,30 @@ describe('where the pods run', () => {
 })
 
 describe('volumes', () => {
-  test('every hostPath is of type Directory unless the Platform asks for create (then DirectoryOrCreate): a volume that did not provision fails the pod', () => {
+  test('every hostPath is of type Directory unless the Platform asks for create (then unchecked, made by the runtime on the machine): a volume that did not provision fails the pod', () => {
     const paths = (ms: Manifest[]) => workloads(ms).flatMap((m) => (podOf(m).volumes ?? []).filter((v: any) => v.hostPath).map((v: any) => v.hostPath))
     expect(paths(all).length).toBeGreaterThan(0)
     for (const h of paths(all)) expect(h.type).toBe('Directory')
     const made = paths(render(resolved({ pageservers: { storage: { hostPath: { path: '/var/lib/peat/pageserver', create: true } } } }), KEPT)).filter((h) => h.path === '/var/lib/peat/pageserver')
-    expect(made.map((h) => h.type)).toEqual(['DirectoryOrCreate', 'DirectoryOrCreate'])
+    expect(made.map((h) => h.type)).toEqual(['', ''])
   })
   test('the pageserver\'s data is a directory of its own in the machine\'s volume, made by a root init container, refused when it holds another node\'s identity', () => {
     const ps = named(all, 'StatefulSet', 'pageserver-w1')
     expect(podOf(ps).initContainers[0]).toMatchObject({ name: 'prep', securityContext: { runAsUser: 0 } })
     expect(podOf(ps).initContainers[1].args[0]).toContain('refusing to start: this directory belongs to')
-    expect(podOf(ps).containers[0].volumeMounts).toContainEqual({ name: 'volume', mountPath: '/data/.neon', subPath: 'neon' })
+    // the machine's volume mounted as itself and its folder `neon` addressed inside: never a subPath, which Talos's kubelet resolves in its own view
+    for (const c of [...podOf(ps).initContainers, ...podOf(ps).containers]) for (const m of c.volumeMounts) expect(m.subPath).toBeUndefined()
+    expect(podOf(ps).containers[0].volumeMounts).toContainEqual({ name: 'volume', mountPath: '/vol' })
+    expect(podOf(ps).containers[0].command).toEqual(['/usr/local/bin/pageserver', '-D', '/vol/neon'])
+    expect(podOf(ps).initContainers[1].args[0]).toContain('echo "id=$id" > /vol/neon/identity.toml')
+    expect(podOf(ps).initContainers[1].args[0]).not.toContain('/data')
+  })
+  test('no workload of the render mounts a host directory through subPath', () => {
+    for (const m of workloads(all)) {
+      const pod = podOf(m)
+      const host = new Set((pod.volumes ?? []).filter((v: any) => v.hostPath).map((v: any) => v.name))
+      for (const c of [...(pod.initContainers ?? []), ...(pod.containers ?? [])]) for (const v of c.volumeMounts ?? []) if (host.has(v.name)) expect(v.subPath, `${m.metadata.name}/${c.name}`).toBeUndefined()
+    }
   })
   test('a compute\'s scratch is capped: the setting reaches the control layer', () => {
     const env = Object.fromEntries((podOf(named(all, 'Deployment', 'peat-control')).containers[0].env as any[]).filter((e) => 'value' in e).map((e) => [e.name, e.value]))

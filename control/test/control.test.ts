@@ -277,11 +277,22 @@ describe('the program\'s settings for the pieces it makes', () => {
     expect(control).not.toContain('node-fs')
   })
 
-  test('a safekeeper\'s volume must exist by default; it is made only when the install asks for DirectoryOrCreate', () => {
+  test('a safekeeper\'s volume must exist by default; it is made only when the install asks (unchecked, so the runtime makes it on the machine)', () => {
     expect(safekeeperStatefulSet(baseOptions).spec.template.spec.volumes[0].hostPath).toEqual({ path: '/var/lib/peat/safekeeper', type: 'Directory' })
-    expect(safekeeperStatefulSet({ ...baseOptions, volumeType: 'DirectoryOrCreate' }).spec.template.spec.volumes[0].hostPath.type).toBe('DirectoryOrCreate')
-    expect(control).toContain("process.env['SAFEKEEPER_VOLUME_TYPE'] === 'DirectoryOrCreate' ? 'DirectoryOrCreate' : 'Directory'")
-    expect(control).toContain('volumeRoot: SK_VOLUME, volumeType: SK_VOLUME_TYPE,')
+    expect(safekeeperStatefulSet({ ...baseOptions, volumeCreate: true }).spec.template.spec.volumes[0].hostPath.type).toBe('')
+    expect(control).toContain("const SK_VOLUME_CREATE = process.env['SAFEKEEPER_VOLUME_TYPE'] === 'DirectoryOrCreate'")
+    expect(control).toContain('volumeRoot: SK_VOLUME, volumeCreate: SK_VOLUME_CREATE,')
+  })
+
+  test('a safekeeper mounts its volume as itself, never through subPath (Talos\'s kubelet resolves one in its own view), and keeps its data in its own folder sk-<id>, as before', () => {
+    const t = safekeeperStatefulSet(baseOptions).spec.template.spec
+    for (const c of [...t.initContainers, ...t.containers]) for (const m of c.volumeMounts) expect(m.subPath).toBeUndefined()
+    expect(t.containers[0].volumeMounts[0]).toEqual({ name: 'volume', mountPath: '/vol' })
+    const script = t.containers[0].args[0] as string
+    expect(script).toContain('d=/vol/sk-$id')
+    expect(script).toContain('exec /usr/local/bin/safekeeper -D $d --id')
+    expect(script).not.toContain('/data')
+    expect(t.initContainers[0].command[2]).toContain(`mkdir -p /vol/sk-${baseOptions.id}; chown 1000:1000 /vol/sk-${baseOptions.id}`)
   })
 
   test('nothing the program writes turns on rel_size_v2 (under which a drop_dbdir change of the storage reaches Postgres 18)', () => {
@@ -534,7 +545,8 @@ describe('the safekeeper\'s pod', () => {
     expect(script).toContain('/sk/$id/may-start-empty')
     const pod = safekeeperStatefulSet(baseOptions).spec.template.spec
     expect(pod.initContainers[0].securityContext.runAsUser).toBe(0)
-    expect(pod.containers[0].volumeMounts[0]).toEqual({ name: 'volume', mountPath: '/data', subPath: 'sk-3' })
+    expect(pod.containers[0].volumeMounts[0]).toEqual({ name: 'volume', mountPath: '/vol' })
+    expect(script).toContain('d=/vol/sk-$id')
     expect(pod.nodeSelector).toEqual({ [LABEL.key]: LABEL.value, 'kubernetes.io/hostname': 'machine-3' })
   })
 })

@@ -15,7 +15,7 @@
 // would otherwise take the pieces with it). Each object carries the operator's own two labels and nothing of the Platform's.
 import { durationMs } from '../api/schema'
 import { GROUP, controlUser, frontDoor, placement, toEnv, type Names } from '../names'
-import { SAFEKEEPER_RESOURCES } from '../storage-spec'
+import { SAFEKEEPER_RESOURCES, hostDir } from '../storage-spec'
 import { MOVE_EXECS_CONFIG_MAP, MOVE_SCRIPT, MOVE_SCRIPT_CONFIG_MAP, MOVE_SCRIPT_PATH, MOVE_TARGET_LABEL } from '../move'
 import type { Resolved } from './platform'
 import { TOKENS, type Holder } from './keys'
@@ -210,13 +210,13 @@ export function pageserver(r: Resolved, at: { id: number; node: string }, image 
   const vol = r.spec.pageservers.storage.hostPath!
   const script = `set -eu
 id=${id}
-if [ -f /data/.neon/identity.toml ] && [ "$(cat /data/.neon/identity.toml)" != "id=$id" ]; then
-  echo "refusing to start: this directory belongs to $(cat /data/.neon/identity.toml), not id=$id" >&2
+if [ -f /vol/neon/identity.toml ] && [ "$(cat /vol/neon/identity.toml)" != "id=$id" ]; then
+  echo "refusing to start: this directory belongs to $(cat /vol/neon/identity.toml), not id=$id" >&2
   exit 1
 fi
 host="${host}"
-echo "id=$id" > /data/.neon/identity.toml
-cat > /data/.neon/pageserver.toml <<TOML
+echo "id=$id" > /vol/neon/identity.toml
+cat > /vol/neon/pageserver.toml <<TOML
 broker_endpoint='http://storage-broker:${PORTS.brokerGrpc}'
 pg_distrib_dir='/usr/local/'
 listen_pg_addr='0.0.0.0:${PORTS.pageserverPg}'
@@ -229,7 +229,7 @@ auth_validation_public_key_path='/auth/auth_public_key.pem'
 control_plane_api_token='$(cat /tok/pageserver_to_controller.jwt)'
 remote_storage=${remoteStorage(r, r.store.pageservers)}
 TOML
-printf '{"host":"%s","http_host":"%s","http_port":${PORTS.pageserverHttp},"port":${PORTS.pageserverPg},"availability_zone_id":"%s"}' "$host" "$host" "$NODE_NAME" > /data/.neon/metadata.json
+printf '{"host":"%s","http_host":"%s","http_port":${PORTS.pageserverHttp},"port":${PORTS.pageserverPg},"availability_zone_id":"%s"}' "$host" "$host" "$NODE_NAME" > /vol/neon/metadata.json
 `
   return {
     apiVersion: 'apps/v1', kind: 'StatefulSet', metadata: meta(r, pageserverPiece(id), n.namespace),
@@ -239,19 +239,19 @@ printf '{"host":"%s","http_host":"%s","http_port":${PORTS.pageserverHttp},"port"
         nodeSelector: pinTo(at.node),
         initContainers: [
           { name: 'prep', image, securityContext: { runAsUser: 0 }, command: ['/bin/sh', '-c', 'set -eu; mkdir -p /vol/neon; chown 1000:1000 /vol/neon'], volumeMounts: [{ name: 'volume', mountPath: '/vol' }] },
-          { name: 'config', image, env: [{ name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } }], command: ['/bin/sh', '-c'], args: [script], volumeMounts: [{ name: 'volume', mountPath: '/data/.neon', subPath: 'neon' }, { name: 'tok', mountPath: '/tok' }] },
+          { name: 'config', image, env: [{ name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } }], command: ['/bin/sh', '-c'], args: [script], volumeMounts: [{ name: 'volume', mountPath: '/vol' }, { name: 'tok', mountPath: '/tok' }] },
         ],
         containers: [{
           name: 'pageserver', image,
           env: [...storeEnv(r.store.pageservers.credentialsSecret), secretEnv('NEON_AUTH_TOKEN', SECRETS.pageserverTokens, 'pageserver_to_safekeepers.jwt')],
-          command: ['/usr/local/bin/pageserver', '-D', '/data/.neon'],
+          command: ['/usr/local/bin/pageserver', '-D', '/vol/neon'],
           ports: [{ containerPort: PORTS.pageserverPg }, { containerPort: PORTS.pageserverHttp }],
           resources: { requests: { cpu: '500m', memory: r.spec.pageservers.memory.request }, limits: { memory: r.spec.pageservers.memory.limit } },
           readinessProbe: { httpGet: { path: '/v1/status', port: PORTS.pageserverHttp }, periodSeconds: 5 },
-          volumeMounts: [{ name: 'volume', mountPath: '/data/.neon', subPath: 'neon' }, { name: 'auth', mountPath: '/auth' }],
+          volumeMounts: [{ name: 'volume', mountPath: '/vol' }, { name: 'auth', mountPath: '/auth' }],
         }],
         volumes: [
-          { name: 'volume', hostPath: { path: vol.path, type: vol.create ? 'DirectoryOrCreate' : 'Directory' } },
+          { name: 'volume', hostPath: hostDir(vol.path, vol.create) },
           { name: 'auth', secret: { secretName: SECRETS.authPublic } },
           { name: 'tok', secret: { secretName: SECRETS.pageserverTokens } },
         ],
@@ -540,7 +540,8 @@ export function guards(r: Resolved, storageImages: string[] = [r.images.storage]
   const imagesOf = (o: 'object' | 'oldObject', list: string) => `(has(${o}.spec.template.spec.${list}) ? dyn(${o}.spec.template.spec.${list}.map(c, c.image)) : dyn([]))`
   const falseOrUnset = (path: string) => `(!has(${path}) || ${path} == false)`
   const skVolume = r.spec.safekeepers.storage.hostPath!.path
-  const skVolumeTypes = r.spec.safekeepers.storage.hostPath!.create ? `['Directory', 'DirectoryOrCreate']` : `['Directory']`
+  // made when missing: unchecked ('', what a safekeeper made by this release carries) or DirectoryOrCreate (one made by an earlier release)
+  const skVolumeTypes = r.spec.safekeepers.storage.hostPath!.create ? `['Directory', 'DirectoryOrCreate', '']` : `['Directory']`
   const front = frontDoor(n)
   return [
     {

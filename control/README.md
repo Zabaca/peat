@@ -84,6 +84,13 @@ control image against main's published storage images) and on every merge (that 
 built. It needs kind, kubectl, docker, bun and psql; locally, `KIND=<path to kind> .github/peat/install-test.sh <storage> <compute 18>
 <compute 19> <control>` with the control image built into the local Docker.
 
+On Talos the kubelet runs in a container of its own, with its own view of the machine's folders: another folder under `/var/lib`, and
+the machine's own under `/var/mnt`, read-only. So a pageserver and a safekeeper mount their host directory as itself, never through
+`subPath` (which the kubelet resolves in its view), and address their own folder inside it (`neon`, `sk-<id>`); with `create: true` the
+directory is mounted unchecked, so the container runtime makes a missing one on the machine itself. Both the default paths under
+`/var/lib/peat` and paths under `/var/mnt` (a disk Talos mounts there) then work with `create: true`, and an existing directory with
+`create: false`.
+
 ## The objects
 
 A whole install is one `Platform` (cluster-scoped, one per cluster) and its databases are `Database` objects (namespaced). Every field, its
@@ -111,15 +118,15 @@ login. Neon has no in-place major upgrade, so a move is a copy, in the control l
 - A new timeline of the newer version is made in the database's own tenant, and a compute of its own (an internal name, `mv-...`) is
   started on it.
 - The door is shut (`phase: Moving`: new connections are refused, open sessions ended) for the copy's length. The control layer waits
-  12 s (two of a gateway's reads of its routes) before it stops the old compute and starts it again for the copy. A gateway whose read
-  failed keeps the old route, so a client may still get in. Before the comparison every session on the old compute that is not the
-  compute's own is ended (what it wrote is compared), and the old compute's counts of rows written are read (`pg_stat_database`). After
-  it, a session still open, or a count that grew (a client that came, wrote and left), fails the move, and the old compute is stopped at
-  once. What remains: a write that lands between that last look and the old compute's shutdown (the stop's calls to the API server, 10 to 12 ms
-  in the install test, then the kubelet's signal to the pod and Postgres's fast shutdown, not measured), and one by a session that ends
-  at the very moment of the look, between leaving the list of sessions and its counts reaching the totals (microseconds). A control layer
-  that restarts during the comparison starts the copy again; once `switching` is recorded the old compute was already stopped after the
-  last look, and nothing starts it again while the door is shut.
+  12 s (two of a gateway's reads of its routes) before it stops the old compute and starts it again for the copy. A gateway whose read failed
+  keeps the old route, so a client may still get in. Before the comparison every session on the old compute that is not the compute's own
+  is ended (what it wrote is compared), and the old compute's counts of rows written are read (`pg_stat_database`). After it, a session
+  still open, or a count that grew (a client that came, wrote and left), fails the move, and the old compute is stopped at once. What
+  remains: a write that lands between that last look and the old compute's shutdown (the stop's calls to the API server, tens of
+  milliseconds in the install test, then the kubelet's signal to the pod and Postgres's fast shutdown, not measured), and one by a session
+  that ends at the very moment of the look, between leaving the list of sessions and its counts reaching the totals (microseconds). A
+  control layer that restarts during the comparison starts the copy again; once `switching` is recorded the old compute was already
+  stopped after the last look, and nothing starts it again while the door is shut.
 - A temporary superuser, `peat_move_<hex>`, is made on the old compute. The new compute reads the old one over TLS as that role,
   verified against the platform's authority:
   - every role (its password's verifier, its attributes, its memberships, its settings), then every database (each object made by
