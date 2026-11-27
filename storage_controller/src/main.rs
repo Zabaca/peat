@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use camino::Utf8PathBuf;
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 use futures::future::OptionFuture;
 use http_utils::tls_certs::ReloadingCertificateResolver;
 use hyper0::Uri;
@@ -97,6 +97,16 @@ struct Cli {
     /// URL to connect to postgres, like postgresql://localhost:1234/storage_controller
     #[arg(long)]
     database_url: Option<String>,
+
+    /// Where the controller's records are kept: `postgres`, the database at `--database-url`,
+    /// or `kubernetes`, objects in the cluster's API server (storage_controller/kubernetes/README.md).
+    #[arg(long, value_enum, default_value = "postgres")]
+    records: Records,
+
+    /// With `--records kubernetes`: the namespace of the record objects. By default the
+    /// namespace of the pod's service account, and outside a pod the kubeconfig's current one.
+    #[arg(long)]
+    records_namespace: Option<String>,
 
     /// Flag to enable dev mode, which permits running without auth
     #[arg(long, default_value = "false")]
@@ -231,6 +241,12 @@ struct Cli {
     handle_ps_local_disk_loss: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Records {
+    Postgres,
+    Kubernetes,
+}
+
 enum StrictMode {
     /// In strict mode, we will require that all secrets are loaded, i.e. security features
     /// may not be implicitly turned off by omitting secrets in the environment.
@@ -247,10 +263,16 @@ impl Default for StrictMode {
     }
 }
 
+/// Where the records are kept, with what each store needs.
+enum RecordsStore {
+    Postgres { database_url: String },
+    Kubernetes,
+}
+
 /// Secrets may either be provided on the command line (for testing), or loaded from AWS SecretManager: this
 /// type encapsulates the logic to decide which and do the loading.
 struct Secrets {
-    database_url: String,
+    records: RecordsStore,
     public_key: Option<JwtAuth>,
     pageserver_jwt_token: Option<String>,
     safekeeper_jwt_token: Option<String>,
@@ -272,11 +294,17 @@ impl Secrets {
     /// - CLI args if database URL is provided on the CLI
     /// - Environment variables if DATABASE_URL is set.
     async fn load(args: &Cli) -> anyhow::Result<Self> {
-        let Some(database_url) = Self::load_secret(&args.database_url, Self::DATABASE_URL_ENV)
-        else {
-            anyhow::bail!(
+        let database_url = Self::load_secret(&args.database_url, Self::DATABASE_URL_ENV);
+        let records = match (args.records, database_url) {
+            (Records::Postgres, Some(database_url)) => RecordsStore::Postgres { database_url },
+            (Records::Postgres, None) => anyhow::bail!(
                 "Database URL is not set (set `--database-url`, or `DATABASE_URL` environment)"
-            )
+            ),
+            (Records::Kubernetes, None) => RecordsStore::Kubernetes,
+            // A setting that would be silently ignored is refused.
+            (Records::Kubernetes, Some(_)) => anyhow::bail!(
+                "`--records kubernetes` keeps no records in Postgres: unset `--database-url` and `DATABASE_URL`"
+            ),
         };
 
         let public_key = match Self::load_secret(&args.public_key, Self::PUBLIC_KEY_ENV) {
@@ -285,7 +313,7 @@ impl Secrets {
         };
 
         let this = Self {
-            database_url,
+            records,
             public_key,
             pageserver_jwt_token: Self::load_secret(
                 &args.jwt_token,
@@ -371,6 +399,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     let secrets = Secrets::load(&args).await?;
 
+    if args.records_namespace.is_some() && args.records == Records::Postgres {
+        anyhow::bail!("`--records-namespace` is only meaningful with `--records kubernetes`");
+    }
+
     // Validate required secrets and arguments are provided in strict mode
     match strict_mode {
         StrictMode::Strict
@@ -394,6 +426,11 @@ async fn async_main() -> anyhow::Result<()> {
         }
         StrictMode::Strict if args.use_local_compute_notifications => {
             anyhow::bail!("`--use-local-compute-notifications` is only permitted in `--dev` mode");
+        }
+        // The Kubernetes store's copy in a bucket, its way back from a lost cluster, is not
+        // built yet (storage_controller/kubernetes/README.md); until it is, it is for testing.
+        StrictMode::Strict if args.records == Records::Kubernetes => {
+            anyhow::bail!("`--records kubernetes` is only permitted in `--dev` mode for now");
         }
         StrictMode::Strict if args.timeline_safekeeper_count < 3 => {
             anyhow::bail!(
@@ -484,10 +521,17 @@ async fn async_main() -> anyhow::Result<()> {
         handle_ps_local_disk_loss: args.handle_ps_local_disk_loss,
     };
 
-    // Validate that we can connect to the database
-    Persistence::await_connection(&secrets.database_url, args.db_connect_timeout.into()).await?;
-
-    let persistence = Arc::new(Persistence::new(secrets.database_url).await);
+    let persistence = match secrets.records {
+        RecordsStore::Postgres { database_url } => {
+            // Validate that we can connect to the database
+            Persistence::await_connection(&database_url, args.db_connect_timeout.into()).await?;
+            Persistence::new(database_url).await
+        }
+        RecordsStore::Kubernetes => Persistence::new_kubernetes(args.records_namespace)
+            .await
+            .context("connect to the Kubernetes API server")?,
+    };
+    let persistence = Arc::new(persistence);
 
     let service = Service::spawn(config, persistence.clone()).await?;
 

@@ -401,6 +401,7 @@ pub(crate) enum DatabaseErrorLabel {
     Logical,
     Migration,
     Cas,
+    Kubernetes,
 }
 
 impl DatabaseError {
@@ -412,6 +413,9 @@ impl DatabaseError {
             Self::Logical(_) => DatabaseErrorLabel::Logical,
             Self::Migration(_) => DatabaseErrorLabel::Migration,
             Self::Cas(_) => DatabaseErrorLabel::Cas,
+            Self::Kubernetes(_) => DatabaseErrorLabel::Kubernetes,
+            // The Kubernetes store's unique violation, counted as Postgres counts one.
+            Self::Exists(_) => DatabaseErrorLabel::Query,
         }
     }
 }

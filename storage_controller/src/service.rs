@@ -19,7 +19,6 @@ use anyhow::Context;
 use control_plane::storage_controller::{
     AttachHookRequest, AttachHookResponse, InspectRequest, InspectResponse,
 };
-use diesel::result::DatabaseErrorKind;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use http_utils::error::ApiError;
@@ -504,6 +503,16 @@ impl From<DatabaseError> for ApiError {
                 ApiError::InternalServerError(anyhow::anyhow!(reason))
             }
             DatabaseError::Cas(reason) => ApiError::Conflict(reason),
+            // The API server refused the request itself (other than for too many requests).
+            DatabaseError::Kubernetes(kube::Error::Api(status))
+                if status.code < 500 && status.code != 429 =>
+            {
+                ApiError::InternalServerError(anyhow::anyhow!(status))
+            }
+            // The API server could not be reached, or answered that it cannot serve now (429 or
+            // 5xx): as a lost connection to Postgres is.
+            DatabaseError::Kubernetes(_) => ApiError::ShuttingDown,
+            DatabaseError::Exists(reason) => ApiError::InternalServerError(anyhow::anyhow!(reason)),
         }
     }
 }
@@ -2079,10 +2088,7 @@ impl Service {
 
             match self.persistence.insert_tenant_shards(vec![tsp]).await {
                 Err(e) => match e {
-                    DatabaseError::Query(diesel::result::Error::DatabaseError(
-                        DatabaseErrorKind::UniqueViolation,
-                        _,
-                    )) => {
+                    e if e.is_unique_violation() => {
                         tracing::info!(
                             "Raced with another request to insert tenant {}",
                             attach_req.tenant_shard_id
@@ -2538,12 +2544,18 @@ impl Service {
     ) -> Result<ValidateResponse, DatabaseError> {
         // Fast in-memory check: we may reject validation on anything that doesn't match our
         // in-memory generation for a shard
+        // The pageservers the passing shards' generations were issued to: a validation comes from
+        // one pageserver, so normally one, and the records are then read by that pageserver.
+        let mut issued_to = HashSet::new();
         let in_memory_result = {
             let mut in_memory_result = Vec::new();
             let locked = self.inner.read().unwrap();
             for req_tenant in validate_req.tenants {
                 if let Some(tenant_shard) = locked.tenants.get(&req_tenant.id) {
                     let valid = tenant_shard.generation == Some(Generation::new(req_tenant.r#gen));
+                    if valid {
+                        issued_to.insert(*tenant_shard.intent.get_attached());
+                    }
                     tracing::info!(
                         "handle_validate: {}(gen {}): valid={valid} (latest {:?})",
                         req_tenant.id,
@@ -2572,14 +2584,17 @@ impl Service {
 
         // Database calls to confirm validity for anything that passed the in-memory check.  We must do this
         // in case of controller split-brain, where some other controller process might have incremented the generation.
-        let db_generations = self
-            .persistence
-            .shard_generations(
-                in_memory_result
-                    .iter()
-                    .filter_map(|i| if i.2 { Some(&i.0) } else { None }),
-            )
-            .await?;
+        let passing = in_memory_result
+            .iter()
+            .filter_map(|i| if i.2 { Some(&i.0) } else { None });
+        let db_generations = match issued_to.into_iter().collect::<Vec<_>>().as_slice() {
+            [Some(node)] => {
+                self.persistence
+                    .shard_generations_on(*node, passing)
+                    .await?
+            }
+            _ => self.persistence.shard_generations(passing).await?,
+        };
         let db_generations = db_generations.into_iter().collect::<HashMap<_, _>>();
 
         let mut response = ValidateResponse {
@@ -2723,10 +2738,7 @@ impl Service {
             .await
         {
             Ok(_) => {}
-            Err(DatabaseError::Query(diesel::result::Error::DatabaseError(
-                DatabaseErrorKind::UniqueViolation,
-                _,
-            ))) => {
+            Err(e) if e.is_unique_violation() => {
                 // Unique key violation: this is probably a retry.  Because the shard count is part of the unique key,
                 // if we see a unique key violation it means that the creation request's shard count matches the previous
                 // creation's shard count.
@@ -6475,10 +6487,7 @@ impl Service {
             .await
         {
             match e {
-                DatabaseError::Query(diesel::result::Error::DatabaseError(
-                    DatabaseErrorKind::UniqueViolation,
-                    _,
-                )) => {
+                e if e.is_unique_violation() => {
                     // Inserting a child shard violated a unique constraint: we raced with another call to
                     // this function
                     tracing::warn!("Conflicting attempt to split {tenant_id}: {e}");
@@ -7830,15 +7839,7 @@ impl Service {
         match registration_status {
             RegistrationStatus::New => {
                 self.persistence.insert_node(&new_node).await.map_err(|e| {
-                    if matches!(
-                        e,
-                        crate::persistence::DatabaseError::Query(
-                            diesel::result::Error::DatabaseError(
-                                diesel::result::DatabaseErrorKind::UniqueViolation,
-                                _,
-                            )
-                        )
-                    ) {
+                    if e.is_unique_violation() {
                         // The node can be deleted by tombstone API, and not show up in the list of nodes.
                         // If you see this error, check tombstones first.
                         ApiError::Conflict(format!("Node {} is already exists", new_node.get_id()))
