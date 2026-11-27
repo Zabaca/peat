@@ -509,21 +509,27 @@ impl RemoteStorage for LocalFs {
     ) -> Result<Download, DownloadError> {
         let target_path = from.with_base(&self.storage_root);
 
-        let file_metadata = file_metadata(&target_path).await?;
+        let mut file = match fs::OpenOptions::new().read(true).open(&target_path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(DownloadError::NotFound),
+            Err(e) => {
+                return Err(DownloadError::Other(anyhow::Error::new(e).context(
+                    format!("Failed to open source file {target_path:?} to use in the download"),
+                )));
+            }
+        };
+        // The length and mtime of the file opened, not of the path: an upload renames a new file
+        // over the path, and one landing between a look at the path and the open would have the
+        // new file read to the old one's length, cut short.
+        let file_metadata = file
+            .metadata()
+            .await
+            .map_err(|e| DownloadError::BadInput(e.into()))?;
         let etag = mock_etag(&file_metadata);
 
         if opts.etag.as_ref() == Some(&etag) {
             return Err(DownloadError::Unmodified);
         }
-
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .open(&target_path)
-            .await
-            .with_context(|| {
-                format!("Failed to open source file {target_path:?} to use in the download")
-            })
-            .map_err(DownloadError::Other)?;
 
         let mut take = file_metadata.len();
         if let Some((start, end)) = opts.byte_range() {
@@ -722,6 +728,56 @@ mod fs_tests {
         // Correct size is 5, this should succeed.
         storage.upload(content(), 5, &id, None, &cancel).await?;
 
+        Ok(())
+    }
+
+    /// A download made while uploads replace the file reads one whole version of it, never a
+    /// newer, longer version cut to an older one's length.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn download_while_uploads_replace_the_file() -> anyhow::Result<()> {
+        async fn put(
+            storage: &LocalFs,
+            id: &RemotePath,
+            content: Bytes,
+            cancel: &CancellationToken,
+        ) -> anyhow::Result<()> {
+            let len = content.len();
+            let stream = futures::stream::once(futures::future::ready(Ok(content)));
+            storage.upload(stream, len, id, None, cancel).await
+        }
+        let (storage, cancel) = create_storage()?;
+        let storage = std::sync::Arc::new(storage);
+        let id = RemotePath::new(Utf8Path::new("replaced"))?;
+        let short = Bytes::from(vec![b's'; 10]);
+        let long = Bytes::from(vec![b'l'; 100_000]);
+        put(&storage, &id, short.clone(), &cancel).await?;
+        let writer = {
+            let (storage, id, cancel) = (storage.clone(), id.clone(), cancel.clone());
+            let (short, long) = (short.clone(), long.clone());
+            tokio::spawn(async move {
+                for i in 0..2000 {
+                    let content = if i % 2 == 0 {
+                        long.clone()
+                    } else {
+                        short.clone()
+                    };
+                    put(&storage, &id, content, &cancel).await?;
+                }
+                anyhow::Ok(())
+            })
+        };
+        while !writer.is_finished() {
+            let download = storage
+                .download(&id, &DownloadOpts::default(), &cancel)
+                .await?;
+            let got = aggregate(download.download_stream).await?;
+            assert!(
+                got == short || got == long,
+                "read {} bytes, neither version",
+                got.len()
+            );
+        }
+        writer.await??;
         Ok(())
     }
 
