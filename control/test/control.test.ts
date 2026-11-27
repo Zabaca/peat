@@ -248,6 +248,10 @@ describe('who may call which route', () => {
     expect(asking).toContain('await patchDbStatus(ns, name, { move: { pods } })')
     expect(asking).toContain('if (Date.now() - t0 > GRANT_WAIT_MS) throw new Error(')
     expect(asking).not.toMatch(/roles|rolebindings/)
+    // a Database being deleted (or gone) asks for no exec in its cleanup: it would only wait out the grant in the loop that serves the others
+    const cleanup = control.slice(control.indexOf('async function cleanupMove'), control.indexOf('async function runMove'))
+    expect(cleanup).toContain("const going = obj.status === 404 || Boolean(obj.json?.metadata?.deletionTimestamp)")
+    expect(cleanup).toContain('const src = going ? null : await livePod(name)')
     expect(control).toContain("labelSelector=app%3Dpeat-compute`), 'list compute pods'")
     // names that reach an API path are held to a pattern, and a name with a slash or `..` matches neither
     const DB = /^[a-z][a-z0-9-]{0,30}$/

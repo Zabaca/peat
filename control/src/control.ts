@@ -1512,12 +1512,16 @@ async function cleanupMove(ns: string, name: string, mv: MoveStatus, key: string
     await stopCompute(mv.target, true).catch(() => {})
     for (const path of [depPath(mv.target), `/api/v1/namespaces/${CNS}/secrets/compute-${mv.target}`, `/api/v1/namespaces/${CNS}/secrets/${tlsSecret(mv.target)}`, `/apis/cert-manager.io/v1/namespaces/${CNS}/certificates/${tlsSecret(mv.target)}`]) await del(path)
   }
-  const d = recordOf(ok(await kube('GET', dbObjectPath(ns, name)), `read ${name}`, [404]).json)
+  const obj = ok(await kube('GET', dbObjectPath(ns, name)), `read ${name}`, [404])
+  const d = recordOf(obj.json)
   if (d && mv.toTimeline && d.timeline !== mv.toTimeline) ok(await storcon('DELETE', `/v1/tenant/${d.tenant}/timeline/${mv.toTimeline}`), 'remove the copy\'s timeline', [404])
-  // a role left on the source (an attempt the layer's restart cut short) is dropped there: it is a superuser login
-  const src = await livePod(name)
+  // A role left on the source (an attempt the layer's restart cut short) is dropped there: it is a superuser login. Not for a Database
+  // being deleted (or gone): its compute goes with it, role and all, and the operator grants no exec to one, so asking would only wait out
+  // GRANT_WAIT_MS in the database loop, which serves every other database meanwhile.
+  const going = obj.status === 404 || Boolean(obj.json?.metadata?.deletionTimestamp)
+  const src = going ? null : await livePod(name)
   if (src && podReady(src)) { await grantExecs(ns, name, [src.metadata.name]); await dropMoveRoles(src.metadata.name).catch((e) => console.log(`move ${ns}/${name}: drop the move roles: ${e}`)) }
-  await grantExecs(ns, name, null)
+  if (obj.status !== 404) await grantExecs(ns, name, null)
 }
 
 /** Runs (or goes on with) the move of one database. */
