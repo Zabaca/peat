@@ -371,6 +371,28 @@ describe('keeping it as declared', () => {
   })
 })
 
+describe('a move\'s exec, granted per move', () => {
+  const compute = (name: string, db: string, more: Record<string, string> = {}) => ({ apiVersion: 'v1', kind: 'Pod', metadata: { name, namespace: 'peat-compute', labels: { app: 'peat-compute', compute: db, ...more } } })
+  const moving = (state: string, pods: string[] | null) => ({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders', namespace: 'shop' }, spec: {},
+    status: { tenant: 'a'.repeat(32), timeline: 'b'.repeat(32), pgVersion: 18, phase: 'Moving', record: { mode: 'primary', root: true, parent: '', port: 15010 }, move: { from: 18, to: 19, state, target: 'mv-0123456789ab', oldDatabase: 'orders-pg18', pods } } })
+  test('a Role of the move\'s own pods while it execs, another database\'s pod left out; taken back after, by a pass that stops early too', async () => {
+    k.put(platform())
+    await reconcile(k)
+    for (const p of [compute('src-1', 'orders'), compute('tgt-1', 'mv-0123456789ab', { 'peat-move': 'target' }), compute('other-1', 'shop')]) k.put(p)
+    k.put(moving('copying', ['src-1', 'tgt-1', 'other-1']))
+    await reconcile(k)
+    const role = k.get('rbac.authorization.k8s.io/v1', 'roles', 'peat-compute', 'peat-move-orders')
+    expect(role.rules).toEqual([{ apiGroups: [''], resources: ['pods/exec'], resourceNames: ['src-1', 'tgt-1'], verbs: ['create', 'get'] }])
+    expect(k.get('rbac.authorization.k8s.io/v1', 'rolebindings', 'peat-compute', 'peat-move-orders').subjects).toEqual([{ kind: 'ServiceAccount', name: 'peat-control', namespace: 'peat' }])
+    // the move failed (its source still runs under the same name) and the next pass stops early: the grant goes all the same
+    k.put({ ...moving('failed', ['src-1']), status: { ...moving('failed', ['src-1']).status, phase: 'Ready' } })
+    k.objects.delete([...k.objects.keys()].find((x) => x.endsWith('|machine-3'))!)
+    expect((await reconcile(k)).phase).toBe('Failed')
+    expect(k.get('rbac.authorization.k8s.io/v1', 'roles', 'peat-compute', 'peat-move-orders')).toBeUndefined()
+    expect(k.get('rbac.authorization.k8s.io/v1', 'rolebindings', 'peat-compute', 'peat-move-orders')).toBeUndefined()
+  })
+})
+
 describe('what a client of a database needs, in its own namespace', () => {
   test('the authority\'s certificate in every namespace that holds a Database, each made database\'s login (a branch uses its root\'s), named in its status; removed with the database', async () => {
     k.put(platform({ gateways: { domain: 'db.example.com' } }))

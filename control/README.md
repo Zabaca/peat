@@ -167,6 +167,11 @@ What guards it:
   fails and goes on when asked again. A pod is the database's own when it exists, is not on its way out, is a compute, and is the
   database's compute, its move's target (a name `mv-<hex>` with the target label) or the old copy its last move left (by the name the
   move gives it). A stale name (a compute restarted mid-move) names no pod and is never granted.
+- The grant is taken back by the operator: at the end of each pass, and also by a pass that stops early (a Platform not valid, the
+  keys, the placements). With the operator down (or the Platform suspended), a grant outlives its move until the operator's next pass;
+  after a failed move the source compute runs on under the same name, so the control layer can still run psql there until then.
+- A move under way on the old control layer while the platform is upgraded to this release fails safely: the new operator takes exec
+  out of the control layer's Role before the move asks the new way. Ask again with `requests.retryMove` once the upgrade is done.
 - What the control layer could still widen: it writes `status.move` (and so the target and old copy's names), and it makes the
   computes' Deployments (and so their labels). A control layer that misbehaves could name, or relabel, another database's compute as
   a move's target and be granted it. The check bounds a fault in the control layer (a pod of another database named by mistake is

@@ -16,7 +16,7 @@ import { UNRECORDED, decide, imagesFor, sameImages, stepsOf, type UpgradeState }
 import { piecesOf, runStep } from './upgrade-run'
 import { differences } from './differences'
 import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, moveExecGrant, render, type Manifest } from './render'
-import { moveExecPods } from '../move'
+import { moveExecPods, moveExecRole } from '../move'
 
 export const FIELD_MANAGER = OPERATOR
 /** The operator's record of where each pinned piece runs, in the platform namespace. */
@@ -212,6 +212,30 @@ const imagesOfPod = (o: any): string[] => [...(o?.spec?.template?.spec?.containe
 /** One pass. Returns what it did, for the log and the tests. */
 export interface Deps { storage?: (r: Resolved, keys: Record<string, string>) => Storage; now?: () => Date }
 
+/**
+ * Takes back each move grant (the Role and RoleBinding peat-move-<database> the operator made in the compute namespace) that no Database's
+ * move needs now, by the same rule the render grants it (moveExecPods). Run by a pass that stops before its prune, so that a grant never
+ * outlives its move by more than a pass while the operator runs.
+ */
+async function pruneMoveGrants(k: Kube, computeNs: string | undefined, platform: string): Promise<void> {
+  if (!computeNs) return
+  const mine = (x: any) => String(x.metadata?.name).startsWith('peat-move-') && x.metadata?.labels?.[MANAGED_BY] === OPERATOR && x.metadata?.labels?.[PLATFORM_LABEL] === platform
+  const roles = (ok(await k.request('GET', `/apis/rbac.authorization.k8s.io/v1/namespaces/${computeNs}/roles`), 'list the move grants', [404]).json.items ?? []).filter(mine) as any[]
+  if (roles.length === 0) return
+  const dbs = (ok(await k.request('GET', `/apis/${API_VERSION}/databases`), 'list the Databases', [404]).json.items ?? []) as any[]
+  const pods = ((ok(await k.request('GET', `/api/v1/namespaces/${computeNs}/pods?labelSelector=app%3Dpeat-compute`), 'list the computes').json.items ?? []) as any[])
+    .map((x) => ({ name: String(x.metadata.name), labels: (x.metadata.labels ?? {}) as Record<string, string>, deleting: Boolean(x.metadata.deletionTimestamp) }))
+  for (const role of roles) {
+    const db = dbs.find((d) => moveExecRole(String(d.metadata.name)) === role.metadata.name)
+    if (db && moveExecPods(db, pods).length) continue
+    for (const kind of ['rolebindings', 'roles']) {
+      const path = `/apis/rbac.authorization.k8s.io/v1/namespaces/${computeNs}/${kind}/${role.metadata.name}`
+      const live = await k.request('GET', path)
+      if (live.status === 200 && mine(live.json)) ok(await k.request('DELETE', path, { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: String(live.json.metadata.uid) } }), `remove ${kind}/${role.metadata.name}`, [404, 409])
+    }
+  }
+}
+
 export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const now = (deps.now ?? (() => new Date()))()
   const all = (ok(await k.request('GET', platformsPath), 'list the Platforms').json.items ?? []) as Platform[]
@@ -223,27 +247,33 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
     await writeStatus(k, p, { phase, message, ...more })
     return { platform: p.metadata.name, phase, message, ...counts }
   }
+  // a pass that stops before its prune still takes back the move grants no move needs now (they hang on no key and no placement)
+  const failed = async (message: string, computeNamespace: string | undefined): Promise<PassResult> => {
+    await pruneMoveGrants(k, computeNamespace, p.metadata.name).catch((e) => console.log(`move grants: ${String(e).slice(0, 200)}`))
+    return done('Failed', message)
+  }
+  const recordedComputes = ((p.status as any)?.namespaces?.computes as string | undefined)
   if (p.spec?.suspend) return done('Suspended', 'suspend is true: the operator changes nothing')
   const checked = specOf(p)
-  if ('errors' in checked) return done('Failed', `the Platform is not valid: ${checked.errors.join('; ')}`)
+  if ('errors' in checked) return failed(`the Platform is not valid: ${checked.errors.join('; ')}`, recordedComputes)
   const spec = checked.spec
   // the operator's own namespace holds its record of what it made: none of the platform's may be it
   const mine = Object.entries(spec.namespaces).find(([, ns]) => ns === k.namespace)
-  if (mine) return done('Failed', `the Platform is not valid: namespaces.${mine[0]}: ${k.namespace} is the operator's own namespace; the platform needs namespaces of its own`)
+  if (mine) return failed(`the Platform is not valid: namespaces.${mine[0]}: ${k.namespace} is the operator's own namespace; the platform needs namespaces of its own`, recordedComputes)
   // the namespaces are where the platform's pieces and data are: once recorded they never change (the kind's rule says so too, on a cluster that judges it)
   const recordedNs = (p.status as any)?.namespaces
   const sameNamespaces = (a: Record<string, string>, b: Record<string, string>) => (['platform', 'computes', 'gateways', 'databases'] as const).every((f) => a[f] === b[f])
-  if (recordedNs && !sameNamespaces(recordedNs, spec.namespaces)) return done('Failed', `the namespaces cannot change: the platform runs in ${JSON.stringify(recordedNs)}; set them back`)
+  if (recordedNs && !sameNamespaces(recordedNs, spec.namespaces)) return failed(`the namespaces cannot change: the platform runs in ${JSON.stringify(recordedNs)}; set them back`, recordedComputes)
   // records kubernetes needs the storage controller's record kinds, which come with the storage image that keeps them
   if (spec.controller.records === 'kubernetes') {
     const served = await k.request('GET', `/apis/${RECORDS_GROUP}/v1alpha1`)
-    if (served.status !== 200) return done('Failed', `controller.records kubernetes needs the storage controller's record kinds (${RECORDS_GROUP}), which this cluster does not serve: apply an install file and storage images of a release that has them, or set records postgres`)
+    if (served.status !== 200) return failed(`controller.records kubernetes needs the storage controller's record kinds (${RECORDS_GROUP}), which this cluster does not serve: apply an install file and storage images of a release that has them, or set records postgres`, spec.namespaces.computes)
   }
   const machines = await labelledMachines(k, spec.machines.label)
   const kept = await readPlacements(k, spec.namespaces.platform)
   const zones = Object.fromEntries(machines.nodes.map((n) => [String(n.metadata.name), String(n.metadata?.labels?.[spec.safekeepers.zoneLabel] ?? n.metadata.name)]))
   const chosen = choosePlacements(spec, machines.names, kept, zones)
-  if ('errors' in chosen) return done('Failed', chosen.errors.join('; '))
+  if ('errors' in chosen) return failed(chosen.errors.join('; '), spec.namespaces.computes)
   const r = resolve(p, spec, chosen.placements)
 
   // the record of what the operator made, in its own namespace; a record that cannot be read stops the pass here
@@ -295,7 +325,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   }
   const problems = keyProblems(keys)
   if (read.issuer) problems.push(...read.issuer.problems)
-  if (problems.length) return done('Failed', `the keys: ${problems.join('; ')}`)
+  if (problems.length) return failed(`the keys: ${problems.join('; ')}`, r.names.computeNamespace)
   // what is published from here on: the issuer's certificate in peat-ca, in place of the operator's own (which then signs nothing)
   if (read.issuer?.cert) keys = { ...keys, [CA_CERT]: read.issuer.cert }
   if (JSON.stringify(kept) !== JSON.stringify(r.placements)) {
