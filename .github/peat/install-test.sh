@@ -551,7 +551,9 @@ metadata: { name: test-hold-the-way-back }
 spec: { policyName: test-hold-the-way-back, validationActions: [Deny] }
 EOF
 # in force once the API server refuses it (a policy takes a moment to reach it)
-t0=$(date +%s); until printf 'apiVersion: peat.zabaca.com/v1alpha1\nkind: Database\nmetadata: { name: mv18-pg19, namespace: shop }\nspec: {}\n' | k "${as[@]}" create --dry-run=server -f - 2>&1 | grep -q 'held by the install test'; do [ "$(since "$t0")" -lt 60 ] || fail "the test's rule holding the way back did not take"; sleep 1; done
+held_probe() { printf 'apiVersion: peat.zabaca.com/v1alpha1\nkind: Database\nmetadata: { name: mv18-pg19, namespace: shop }\nspec: { pgVersion: 19, parent: mv18 }\n' | k "${as[@]}" create --dry-run=server -f - 2>&1; }
+# (its answer read first: under pipefail a refused kubectl would fail the pipe even when the grep matches)
+t0=$(date +%s); until grep -q 'held by the install test' <<< "$(held_probe)"; do [ "$(since "$t0")" -lt 60 ] || fail "the test's rule holding the way back did not take: $(held_probe)"; sleep 1; done
 t0=$(date +%s)
 k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"moveBack":"b1"}}}' >/dev/null
 t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}')" = going-back ] && k -n shop get database mv18 -o jsonpath='{.status.message}' | grep -q 'not finished (goes on at the next pass)'; do
