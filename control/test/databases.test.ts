@@ -74,9 +74,24 @@ describe('kept as its spec says', () => {
     expect(act(db('orders', { made: true, spec: { requests: { stop: '1' } } }))).toEqual({ do: 'stop', request: '1' })
     expect(act(db('orders', { made: true, spec: { requests: { stop: '1' } }, status: { answered: { stop: '1' } } }))).toEqual({ do: 'none' })
   })
-  test('a version lowered is refused; raised, it waits for the move (not in this release)', () => {
+  test('a version lowered is refused; raised, the database moves; a move under way goes on before anything else', () => {
     expect(act(db('orders', { made: true, pg: 19, spec: { pgVersion: 18 } }))).toMatchObject({ do: 'refuse', why: expect.stringContaining('cannot be moved back') })
-    expect(act(db('orders', { made: true, pg: 18, spec: { pgVersion: 19 } }))).toMatchObject({ do: 'refuse', why: expect.stringContaining('not in this release') })
+    expect(act(db('orders', { made: true, pg: 18, spec: { pgVersion: 19 } }))).toEqual({ do: 'move' })
+    expect(act(db('orders', { made: true, pg: 18, spec: { pgVersion: 19, closed: true }, status: { move: { state: 'copying' } } }))).toEqual({ do: 'move' })
+    expect(act(db('orders', { made: true, pg: 18, spec: { requests: { rehearseMove: '19@now' } } }))).toEqual({ do: 'move' })
+    expect(act(db('orders', { made: true, pg: 18, spec: { requests: { moveBack: 'b1' } } }))).toEqual({ do: 'moveBack', request: 'b1' })
+  })
+  test('a replica does not move, nor a primary with replicas on its timeline', () => {
+    const primary = db('orders', { made: true, pg: 18, spec: { pgVersion: 19 } }), ro = db('orders-ro', { made: true, pg: 18, spec: { replicaOf: 'orders', pgVersion: 19 } })
+    expect(act(primary, [primary, ro])).toMatchObject({ do: 'refuse', why: 'orders-ro is a replica on its timeline: delete it before the move, and make it again after' })
+    expect(act(ro, [primary, ro])).toMatchObject({ do: 'refuse', why: expect.stringContaining('a replica runs its primary') })
+  })
+  test('a restore to a moment before its parent moved is refused, naming the old copy that holds that history', () => {
+    const parent = db('orders', { made: true, pg: 19, status: { move: { state: 'done', to: 19, switchedAt: '2026-12-01T12:00:00Z', oldDatabase: 'orders-pg18' } } })
+    const before = db('orders-then', { spec: { parent: 'orders', at: '2026-12-01T11:00:00Z' } })
+    expect(act(before, [parent, before])).toEqual({ do: 'refuse', why: '2026-12-01T11:00:00Z is before orders moved to Postgres 19 (2026-12-01T12:00:00Z): restore from its old copy orders-pg18, which holds that history' })
+    const after = db('orders-later', { spec: { parent: 'orders', at: '2026-12-01T13:00:00Z' } })
+    expect(act(after, [parent, after])).toMatchObject({ do: 'make', kind: 'branch' })
   })
 })
 

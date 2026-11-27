@@ -213,7 +213,9 @@ export const databaseSpec: Schema = obj('A database on the platform. Its name is
   keepOldFor: duration('After a move to a newer Postgres version, how long the old copy is kept, stopped, as the way back. A duration (30d).', { default: '30d' }),
   requests: obj('One-off requests: set a new value to ask again; the status says which value was answered.', {
     stop: str('Put it to sleep now (the next connection wakes it).'),
-    rehearseMove: str('Copy and compare to the version named in pgVersion without shutting the door or switching: how long the move would take.'),
+    rehearseMove: str('Copy and compare to a newer version without shutting the door or switching, to learn how long the move would take: the version, then @ and anything (19@2026-12-01T12:00:00Z; a new value asks again).'),
+    retryMove: str('Try a failed move again (a new value asks again).'),
+    moveBack: str('Go back to the version the last move came from, while its old copy is kept: refused when the database was written since the move (a new value asks again).'),
   }),
 }, rules(
   ['!has(self.at) || has(self.parent)', 'at is the moment of a parent: name the parent'],
@@ -238,12 +240,15 @@ export const databaseStatus: Schema = obj('The database as it is.', {
   tenant: str("The storage's tenant id."),
   timeline: str("The storage's timeline id."),
   createdAt: str('When it was made.', { format: 'date-time' }),
-  answered: obj('The requests answered, by the value that was asked.', { stop: str('The stop request answered.'), rehearseMove: str('The rehearsal answered.') }),
+  answered: obj('The requests answered, by the value that was asked.', { stop: str('The stop request answered.'), rehearseMove: str('The rehearsal answered.'), retryMove: str('The retry answered.'), moveBack: str('The way back answered.') }),
   move: obj('The move to a newer Postgres version under way, or the last one (or the last rehearsal).', {
     from: int('The version it moved from.'), to: int('The version it moved to.'),
-    rehearsal: bool('Whether this was a rehearsal.'), state: str('The step it is on, or done, or failed.'),
-    seconds: int('How long the copy took, or the door was shut.'), equal: bool('Whether every table, role, privilege and extension compared equal.'),
-    oldDatabase: str('The old copy, kept stopped.'), message: str('What it found.'),
+    rehearsal: bool('Whether this was a rehearsal.'), state: str('preparing, copying, comparing, switching, then done; or failed, back or refused.'),
+    request: str('What asked for it.'), target: str("The move's own compute, made for the copy."), toTimeline: str('The timeline the copy is made in.'),
+    startedAt: str('When it started.', { format: 'date-time' }), switchedAt: str('When the database was switched to the new version.', { format: 'date-time' }),
+    seconds: int('How long the copy took, or the door was shut.'), equal: bool('Whether every database, role, table, privilege and extension compared equal.'),
+    oldDatabase: str('The old copy, kept stopped.'), deleteOldAfter: str('When the old copy is deleted (its data then held as any deleted database\'s).', { format: 'date-time' }),
+    message: str('What it found.'),
   }),
   record: obj("The control layer's own record of the database, written by it alone; it keeps a copy in the platform namespace and writes this again from it if it is lost.", {
     mode: str('primary, or replica (a read replica on its parent\'s timeline).', { enum: ['primary', 'replica'] }),

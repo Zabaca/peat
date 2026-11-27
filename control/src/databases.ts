@@ -3,6 +3,8 @@
 // storage behind it, keeps its record in the object's status, and takes it apart when the object is deleted.
 import { durationMs } from './api/schema'
 import { GROUP } from './names'
+import { moveAction, type MoveStatus } from './move'
+import { PG_VERSIONS } from './storage-spec'
 
 /** The finalizer that keeps a deleted Database until its compute is gone and its data's hold is recorded. */
 export const FINALIZER = `${GROUP}/storage`
@@ -14,14 +16,16 @@ export const DB_NAME = /^[a-z][a-z0-9-]{0,30}$/
 
 export interface DbObject {
   metadata: { name: string; namespace: string; creationTimestamp?: string; deletionTimestamp?: string; finalizers?: string[]; annotations?: Record<string, string> }
-  spec?: { pgVersion?: number; parent?: string; at?: string; replicaOf?: string; closed?: boolean; requests?: { stop?: string; rehearseMove?: string } }
-  status?: { tenant?: string; timeline?: string; pgVersion?: number; phase?: string; message?: string; awake?: boolean; answered?: { stop?: string; rehearseMove?: string } }
+  spec?: { pgVersion?: number; parent?: string; at?: string; replicaOf?: string; closed?: boolean; requests?: { stop?: string; rehearseMove?: string; retryMove?: string; moveBack?: string } }
+  status?: { tenant?: string; timeline?: string; pgVersion?: number; phase?: string; message?: string; awake?: boolean; answered?: { stop?: string; rehearseMove?: string; retryMove?: string; moveBack?: string }; move?: MoveStatus }
 }
 
 export type Action =
   | { do: 'finalize' }
   | { do: 'make'; kind: 'root' | 'branch' | 'replica'; from?: string; at?: string; pg?: number }
   | { do: 'rebuild' }
+  | { do: 'move' }
+  | { do: 'moveBack'; request: string }
   | { do: 'delete'; holdData: boolean }
   | { do: 'close' }
   | { do: 'open' }
@@ -74,6 +78,11 @@ export function databaseAction(o: DbObject, all: DbObject[], ctx: { replacementO
       if (!p) return { do: 'wait', why: `no database ${from} in ${o.metadata.namespace} to make it from` }
       if (!made(p)) return { do: 'wait', why: `${from} is not made yet` }
       if (o.spec?.pgVersion && p.status?.pgVersion && o.spec.pgVersion !== p.status.pgVersion) return { do: 'refuse', why: `a branch or a replica is of its parent's version (${p.status.pgVersion}), not ${o.spec.pgVersion}` }
+      // a restore to a moment before the parent moved to a newer version: the parent's timeline then was the old copy's
+      const mv = p.status?.move
+      if (o.spec?.at && mv?.state === 'done' && !mv.rehearsal && mv.switchedAt && !/^[0-9A-F]+\/[0-9A-F]+$/i.test(o.spec.at) && Date.parse(o.spec.at) < Date.parse(mv.switchedAt)) {
+        return { do: 'refuse', why: `${o.spec.at} is before ${from} moved to Postgres ${mv.to} (${mv.switchedAt}): restore from its old copy ${mv.oldDatabase ?? ''}, which holds that history` }
+      }
     }
     if (o.spec?.at && !o.spec.parent) return { do: 'refuse', why: 'at is the moment of a parent: name the parent' }
     if (ctx.replacementOpen) return { do: 'wait', why: `new databases wait while a safekeeper replacement is open: ${ctx.replacementOpen}` }
@@ -81,13 +90,23 @@ export function databaseAction(o: DbObject, all: DbObject[], ctx: { replacementO
     if (o.spec?.parent) return { do: 'make', kind: 'branch', from: o.spec.parent, ...(o.spec.at ? { at: o.spec.at } : {}) }
     return { do: 'make', kind: 'root', ...(o.spec?.pgVersion ? { pg: o.spec.pgVersion } : {}) }
   }
+  // a move under way runs to its end first (it shuts and opens the door itself)
+  const mv = moveAction(o, PG_VERSIONS)
+  if (mv.do === 'resume') return { do: 'move' }
   if (o.spec?.closed && (o.status?.phase !== 'Closed' || o.status?.awake)) return { do: 'close' }
   if (!o.spec?.closed && o.status?.phase === 'Closed') return { do: 'open' }
   const stop = o.spec?.requests?.stop
   if (stop && stop !== o.status?.answered?.stop) return { do: 'stop', request: stop }
-  if (o.spec?.pgVersion && o.status?.pgVersion && o.spec.pgVersion !== o.status.pgVersion && o.status.phase !== 'Failed') {
-    if (o.spec.pgVersion < o.status.pgVersion) return { do: 'refuse', why: `Postgres ${o.status.pgVersion} cannot be moved back to ${o.spec.pgVersion}: make a new database and copy into it` }
-    return { do: 'refuse', why: `the move from Postgres ${o.status.pgVersion} to ${o.spec.pgVersion} is not in this release: the database stays on ${o.status.pgVersion}` }
+  if (o.spec?.pgVersion && o.status?.pgVersion && o.spec.pgVersion < o.status.pgVersion) return { do: 'refuse', why: `Postgres ${o.status.pgVersion} cannot be moved back to ${o.spec.pgVersion} (requests.moveBack goes back while the last move's old copy is kept)` }
+  const back = o.spec?.requests?.moveBack
+  if (back && back !== o.status?.answered?.moveBack) return { do: 'moveBack', request: back }
+  if (mv.do === 'refuse') return { do: 'refuse', why: mv.why }
+  if (mv.do === 'start') {
+    // a replica is a second compute on its primary's timeline: it cannot move apart from it, and a primary cannot move from under it
+    if (o.spec?.replicaOf) return { do: 'refuse', why: 'a replica runs its primary\'s version: move the primary (after deleting its replicas)' }
+    const replicas = others.filter((x) => x.spec?.replicaOf === name && x.metadata.namespace === o.metadata.namespace)
+    if (replicas.length) return { do: 'refuse', why: `${replicas.map((x) => x.metadata.name).join(', ')} ${replicas.length === 1 ? 'is a replica' : 'are replicas'} on its timeline: delete ${replicas.length === 1 ? 'it' : 'them'} before the move, and make ${replicas.length === 1 ? 'it' : 'them'} again after` }
+    return { do: 'move' }
   }
   return { do: 'none' }
 }

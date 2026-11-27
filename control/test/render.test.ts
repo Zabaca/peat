@@ -3,7 +3,7 @@ import type { Platform } from '../src/api/v1alpha1'
 import { controlUser, frontDoor } from '../src/names'
 import { makeMissing } from '../src/operator/keys'
 import { choosePlacements, resolve, specOf, type Resolved } from '../src/operator/platform'
-import { CONTROL_ACCOUNT, NODE_POLICY, SECRETS, SERVICE_POLICY, STATEFULSET_POLICY, render, type Manifest } from '../src/operator/render'
+import { COMPUTE_POLICY, CONTROL_ACCOUNT, EXEC_POLICY, NODE_POLICY, SECRETS, SERVICE_POLICY, STATEFULSET_POLICY, render, type Manifest } from '../src/operator/render'
 
 // What the operator renders for a platform: where each pod runs, what it mounts and reads, what each account may do, what may reach each
 // pod, and the admission rules that hold the control layer's account. Read from the objects, as the API server would receive them.
@@ -78,7 +78,7 @@ describe('where the pods run', () => {
     for (const m of all) if (m.metadata.namespace) expect([m.kind, m.metadata.name, nss.has(m.metadata.namespace)]).toEqual([m.kind, m.metadata.name, true])
     expect(all.filter((m) => !m.metadata.namespace).map((m) => m.kind).sort()).toEqual([
       'ClusterRole', 'ClusterRole', 'ClusterRoleBinding', 'ClusterRoleBinding', 'Namespace', 'Namespace', 'Namespace', 'Namespace',
-      'ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicyBinding', 'ValidatingAdmissionPolicyBinding', 'ValidatingAdmissionPolicyBinding',
+      ...Array(5).fill('ValidatingAdmissionPolicy'), ...Array(5).fill('ValidatingAdmissionPolicyBinding'),
     ])
   })
   test('the namespaces\' pod security: the platform\'s privileged (host directories), the computes\' baseline, the gateways\' and the databases\' restricted', () => {
@@ -153,6 +153,7 @@ describe('the control layer\'s account', () => {
     ],
     'peat-compute': [
       { group: '', resource: 'pods', verbs: ['get', 'list', 'delete'] },
+      { group: '', resource: 'pods/exec', verbs: ['create'] },
       { group: '', resource: 'secrets', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },
       { group: 'apps', resource: 'deployments', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },
       { group: 'cert-manager.io', resource: 'certificates', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },
@@ -290,9 +291,15 @@ describe('the storage pieces', () => {
 describe('the guards', () => {
   const policies = all.filter((m) => m.kind === 'ValidatingAdmissionPolicy')
   const bindings = all.filter((m) => m.kind === 'ValidatingAdmissionPolicyBinding')
-  test('three policies, each bound and denying', () => {
-    expect(policies.map((p) => p.metadata.name).sort()).toEqual([NODE_POLICY, SERVICE_POLICY, STATEFULSET_POLICY].sort())
-    for (const p of policies) expect(bindings.find((b) => b.metadata.name === p.metadata.name)!.spec).toEqual({ policyName: p.metadata.name, validationActions: ['Deny'] })
+  test('five policies, each bound and denying; the exec guard reads the pods a move lists, and denies when the list is not there', () => {
+    expect(policies.map((p) => p.metadata.name).sort()).toEqual([NODE_POLICY, SERVICE_POLICY, STATEFULSET_POLICY, COMPUTE_POLICY, EXEC_POLICY].sort())
+    for (const p of policies.filter((x) => x.metadata.name !== EXEC_POLICY)) expect(bindings.find((b) => b.metadata.name === p.metadata.name)!.spec).toEqual({ policyName: p.metadata.name, validationActions: ['Deny'] })
+    expect(bindings.find((b) => b.metadata.name === EXEC_POLICY)!.spec).toEqual({ policyName: EXEC_POLICY, validationActions: ['Deny'], paramRef: { name: 'peat-move-execs', namespace: 'peat', parameterNotFoundAction: 'Deny' } })
+    const exec = JSON.stringify(policies.find((p) => p.metadata.name === EXEC_POLICY))
+    for (const k of ["object.command[0] == 'psql'", "object.command[0] == 'bash' && object.command[1] == '/move/copy.sh'", "object.container == 'compute'", "request.namespace == 'peat-compute'"]) expect(exec).toContain(k)
+    const compute = JSON.stringify(policies.find((p) => p.metadata.name === COMPUTE_POLICY))
+    expect(compute).toContain('compute-pg18:release-2026-12-01')
+    expect(compute).toContain('compute-pg19:release-2026-12-01')
   })
   test('each judges the control layer\'s account and no one else\'s, and fails closed', () => {
     for (const p of policies) {

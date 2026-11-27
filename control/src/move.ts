@@ -201,7 +201,7 @@ export const MOVE_SCRIPT = [
 
 // ---- what the database loop does about a move
 
-export interface MoveStatus { from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string }
+export interface MoveStatus { from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string }
 export type MoveAction =
   | { do: 'none' }
   | { do: 'start'; to: number; rehearsal: boolean; request: string }

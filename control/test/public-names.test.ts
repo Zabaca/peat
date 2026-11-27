@@ -175,6 +175,10 @@ describe('the allowances the CI files need, each as narrow as its case', () => {
     expect(kinds('  "test_x[release-pg17-EmptyTimeline.EMPTY-DeletionSubject.TENANT-RestartStorcon.ONLINE]": 9.1,', 'ci/test-durations.json')).toEqual([])
     expect(kinds('  "see evil.com": 1,', 'ci/test-durations.json')).toEqual(['host'])
   })
+  test('an admission rule\'s CEL in code reads its roots\' fields, not hosts; the same name in a document is a host', () => {
+    expect(kinds("{ expression: \"has(params.data) && params.data.exists(m, true)\" }", 'src/render.ts')).toEqual([])
+    expect(kinds('see params.data', 'README.md')).toEqual(['host'])
+  })
   test('the CI files\' third parties: the Rust installer, cargo-nextest and actionlint', () => {
     expect(kinds('curl https://static.rust-lang.org/rustup/dist/x', 'ci/deps.sh')).toEqual([])
     expect(kinds('https://github.com/nextest-rs/nextest/releases', 'ci/deps.sh')).toEqual([])
