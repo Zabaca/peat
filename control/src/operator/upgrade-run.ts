@@ -59,8 +59,10 @@ export async function runStep(k: Kube, r: Resolved, storage: Storage, u: Upgrade
     const ownReading = (x: string) => (pageserverId ? ownNode.test(x) : keeperId ? x === `safekeeper ${keeperId} does not answer` : false)
     const read = await storage.problems(back && pageserverId ? psIds.filter((x) => x !== pageserverId) : psIds).then((x) => ({ problems: x, failed: false }), (e) => ({ problems: [String(e)], failed: true }))
     // a node a dropped draining step left paused is filled again first, at any check: the check waits until it reads Active (bounded by
-    // checkTimeout, as every wait), and a failed reading or fill is a wait too
-    if (u.refill) {
+    // checkTimeout, as every wait), and a failed reading or fill is a wait too. Not at the controller's check before its step on the way
+    // back: the fill goes through the controller, which may be the broken piece; the refill stays in the state for the controller's check
+    // after its step, against the controller restored
+    if (u.refill && !(back && step === 'controller')) {
       const id = u.refill
       try {
         const n = await storage.node(id)

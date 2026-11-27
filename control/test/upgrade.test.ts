@@ -485,6 +485,23 @@ describe('the fourth review\'s upgrade points, adoption cut', () => {
     expect(statusOf().upgrade.lastCheck.message).toContain('node 1 scheduling is "Pause"')
     unsettled = []
   })
+  test('a way back mid-drain past a broken controller: its check does not fill through it; the node is filled once it is restored', async () => {
+    const drained = storage.drained, node = storage.node, fill = storage.fill
+    storage.drained = async () => ({ done: false, why: 'shards still attached' })
+    respec('release-b')
+    for (let i = 0; i < 40 && !(statusOf().upgrade?.step === 'pageserver-w1' && statusOf().upgrade?.phase === 'draining' && calls.includes('drain 1')); i++) await pass()
+    storage.drained = drained
+    // the new controller broken: every call through it fails until the way back restores it
+    const brokenNow = () => image('deployments', 'peat', 'storage-controller').endsWith(':release-b')
+    storage.node = async (id) => { if (brokenNow()) throw new Error('the storage controller: fetch failed'); return node(id) }
+    storage.fill = async (id) => { if (brokenNow()) throw new Error('the storage controller: fetch failed'); return fill(id) }
+    respec('release-a')
+    for (let i = 0; i < 60 && !(statusOf().phase === 'Ready' && statusOf().release === 'release-a'); i++) await pass()
+    expect(statusOf()).toMatchObject({ phase: 'Ready', release: 'release-a' })
+    expect(calls).toContain('fill 1')
+    expect(scheduling.get(1)).toBe('Active')
+    storage.node = node; storage.fill = fill
+  })
   test('a refill is waited for at every check, and a fill that fails is a wait', async () => {
     const fill = storage.fill
     storage.fill = async () => { throw new Error('fill of pageserver 1: 503') }
