@@ -155,7 +155,9 @@ A failed move switches nothing, opens the door and waits for `requests.retryMove
 nothing; `status.move.seconds` is how long the copy took. While the old copy is kept, `requests.moveBack` (`peat move <db> --back`) goes
 back: the door is shut and the database compared with its old copy, every row whatever the move checked, and only if they are the
 same (nothing written since the move) is the record pointed back at the old timeline. Every row, because the way back gives up what
-the database holds now: a row updated since the move, which no count shows, must stop it. A database written since is refused; copying it down to the older version is by hand. A
+the database holds now: a row updated since the move, which no count shows, must stop it. After a way back `spec.pgVersion` still
+names the newer version (the API server refuses to lower it, the guard against an accidental downgrade) while `status.pgVersion` says
+what runs; nothing moves again until `requests.retryMove` asks. A database written since is refused; copying it down to the older version is by hand. A
 restore of a moved database to a moment before its move is refused, and names the old copy, which holds that history. A replica does
 not move, nor a database that has replicas (delete them, move, make them again); branches stay on the old version.
 
