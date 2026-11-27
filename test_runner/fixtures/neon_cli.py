@@ -15,6 +15,13 @@ from fixtures.common_types import Lsn, TenantId, TimelineId
 from fixtures.log_helper import log
 from fixtures.pageserver.common_types import IndexPartDump
 
+# neon_local's own default of 10 s for starting a pageserver assumes Neon's larger CI machines.
+# On a 4 vCPU hosted runner with a loop-mounted test filesystem under four workers' writes, a
+# start stalled for over 10 s with the pageserver silent after claiming its pid file
+# (test_pageserver_gc_compaction_interrupt, 2026-11-26 and -27), so a start gets a minute
+# unless the test gives its own timeout.
+PAGESERVER_START_TIMEOUT_SECONDS = 60
+
 if TYPE_CHECKING:
     from pathlib import Path
     from typing import (
@@ -445,8 +452,9 @@ class NeonLocalCli(AbstractNeonCli):
         timeout_in_seconds: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
         start_args = ["pageserver", "start", f"--id={id}"]
-        if timeout_in_seconds is not None:
-            start_args.append(f"--start-timeout={timeout_in_seconds}s")
+        if timeout_in_seconds is None:
+            timeout_in_seconds = PAGESERVER_START_TIMEOUT_SECONDS
+        start_args.append(f"--start-timeout={timeout_in_seconds}s")
         return self.raw_cli(start_args, extra_env_vars=extra_env_vars)
 
     def pageserver_stop(self, id: int, immediate=False) -> subprocess.CompletedProcess[str]:
