@@ -8,6 +8,8 @@
 //! controller relies on for generations (an increment, a split's begin, completion and abort,
 //! one tenant's part of a re-attach) is one write of one object.
 
+pub(crate) mod checks;
+pub(crate) mod copy;
 pub(crate) mod objects;
 
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +25,7 @@ use pageserver_api::controller_api::{
 use pageserver_api::models::{ShardImportStatus, TenantConfig};
 use pageserver_api::shard::{ShardCount, ShardNumber, TenantShardId};
 use safekeeper_api::membership::SafekeeperGeneration;
+use tokio_util::sync::CancellationToken;
 use utils::generation::Generation;
 use utils::id::{NodeId, TenantId, TimelineId};
 
@@ -52,10 +55,34 @@ const RE_ATTACH_CONCURRENCY: usize = 32;
 /// The page size of a list.
 const LIST_PAGE: u32 = 500;
 
+/// The Kubernetes store's settings, beside its client and namespace.
+#[derive(Clone, Default)]
+pub(crate) struct Settings {
+    /// The copy in the bucket (`--records-copy-storage`); none only with `--dev`.
+    pub(crate) copy: Option<Arc<copy::BucketCopy>>,
+    /// This controller's `--address-for-peers`, which the Leader record names while it leads.
+    pub(crate) own_address: Option<String>,
+    /// A generation is not raised while the copy is further behind than this
+    /// (`--records-copy-max-lag`); none for no limit.
+    pub(crate) copy_max_lag: Option<std::time::Duration>,
+    /// `--records-accept-deleted`, by record key.
+    pub(crate) accept_deleted: std::collections::BTreeSet<String>,
+    /// `--records-start-without-copy`, still within its time.
+    pub(crate) start_without_copy: bool,
+}
+
 pub(crate) struct KubernetesStore {
     client: kube::Client,
     namespace: String,
-    guard: Guard,
+    settings: Settings,
+    copy_state: Arc<copy::CopyState>,
+    /// Stops the copy's writing (on stepping down).
+    copy_cancel: CancellationToken,
+    /// The copy's writer, while this controller leads.
+    writer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What the start found to do once this controller leads.
+    pending: std::sync::Mutex<checks::Verdict>,
+    guard: Arc<Guard>,
     /// The page size of a list (smaller in tests, to read across pages).
     list_page: u32,
     /// One write at a time per object within this controller (`storage_controller/kubernetes/
@@ -77,10 +104,14 @@ type Locks = std::sync::Mutex<HashMap<(&'static str, String), Arc<tokio::sync::M
 /// A read is compared only with what was seen before it was sent: a write this controller makes
 /// while a read is in flight is not a reason to refuse the read's older answer. Every note of an
 /// object takes a sequence number, and a read takes the number current when it is sent.
-struct Guard {
+pub(crate) struct Guard {
     seen: std::sync::Mutex<HashMap<(&'static str, String), Seen>>,
     /// The sequence of notes.
     sequence: std::sync::atomic::AtomicU64,
+    /// Set once the records went back: from then on nothing is read, written or answered.
+    halted: std::sync::atomic::AtomicBool,
+    /// Where the went-back record is written before the controller exits.
+    copy: Option<Arc<copy::BucketCopy>>,
 }
 
 /// How many notes of one object are kept: the changes one read can overlap (a read at an
@@ -89,14 +120,15 @@ struct Guard {
 const SEEN_HISTORY: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Noted {
+pub(crate) enum Noted {
     /// Read or written at the revision.
     Live,
-    /// Deleted by this controller, at the revision.
+    /// Deleted by this controller (or by its mark, or seen deleted by the watch), at the
+    /// revision.
     Deleted,
     /// A delete of it at the revision was sent and is not known to have been done (its answer
-    /// not yet back, lost, a refusal, or the object found already gone): it may be there still,
-    /// or gone.
+    /// not yet back or lost, the object found already gone, or held by a finalizer): it may be
+    /// there still, or gone.
     InDoubt,
 }
 
@@ -136,42 +168,109 @@ impl Seen {
 }
 
 impl Guard {
-    fn new() -> Self {
+    fn new(copy: Option<Arc<copy::BucketCopy>>) -> Self {
         Guard {
             seen: Default::default(),
             sequence: Default::default(),
+            halted: Default::default(),
+            copy,
         }
     }
 
     /// The sequence number a read is sent at.
-    fn before_read(&self) -> u64 {
+    pub(crate) fn before_read(&self) -> u64 {
         self.sequence.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn went_back(&self, what: String) -> DatabaseError {
-        tracing::error!(
-            "The records went back under this controller ({what}): the cluster's store was \
-             taken back, or lost objects. Writing nothing more and exiting; the next start \
-             checks every record against the copy."
-        );
-        // Tests take the error instead.
-        if !cfg!(test) {
-            std::process::exit(1);
+    fn halted(&self) -> DatabaseResult<()> {
+        if self.halted.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(DatabaseError::Logical(
+                "the records went back under this controller: it answers nothing until it has \
+                 recorded that in the bucket and exited"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The records went back: answer nothing from now on, write the went-back record to the
+    /// bucket (with every revision seen, so the next start refuses even if the copy is behind),
+    /// and exit once it is written; while the bucket cannot be written, stay up, answering
+    /// nothing. Tests take the error instead of the exit.
+    pub(crate) fn went_back_now(&self, what: String) -> DatabaseError {
+        let first = !self.halted.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if first {
+            tracing::error!(
+                "The records went back under this controller ({what}): the cluster's store was \
+                 taken back, or lost objects. Writing nothing more; recording it in the bucket, \
+                 then exiting, so the next start refuses until a restore."
+            );
+            let record = copy::WentBack {
+                at: chrono::Utc::now(),
+                what: what.clone(),
+                seen: self.snapshot(),
+            };
+            match self.copy.clone() {
+                Some(bucket) => {
+                    tokio::spawn(async move {
+                        loop {
+                            match bucket.write_went_back(&record).await {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "writing the went-back record failed, retrying: {e:#}"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                }
+                            }
+                        }
+                        tracing::error!("the went-back record is written; exiting");
+                        if !cfg!(test) {
+                            std::process::exit(1);
+                        }
+                    });
+                }
+                None => {
+                    if !cfg!(test) {
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
         DatabaseError::Logical(format!("the records went back: {what}"))
+    }
+
+    fn went_back(&self, what: String) -> DatabaseError {
+        self.went_back_now(what)
+    }
+
+    /// The highest revision seen of each record.
+    fn snapshot(&self) -> BTreeMap<String, u64> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|((kind, name), s)| {
+                s.latest()
+                    .map(|n| (copy::record_key(kind, name), n.revision))
+            })
+            .collect()
     }
 
     /// Note an object at a revision. Not noted: a revision below the latest note (a read never
     /// lowers what was seen), the same as the latest note (so reads alone do not fill the
     /// history), and a live read at the revision of a delete, done or in doubt (the read may
     /// have been answered from before the delete; only a new revision shows the name live again).
-    fn note(&self, kind: &'static str, name: &str, revision: u64, noted: Noted) {
+    /// `force_live` notes it live at the revision of a delete that is known not to have been
+    /// done: refused, or a mark the start found not done (until it is finished).
+    fn note(&self, kind: &'static str, name: &str, revision: u64, noted: Noted, force_live: bool) {
         let mut seen = self.seen.lock().unwrap();
         let s = seen.entry((kind, name.to_string())).or_default();
         if let Some(l) = s.latest() {
-            if revision < l.revision
-                || (revision == l.revision && (noted == l.noted || noted == Noted::Live))
-            {
+            let same = revision == l.revision && noted == l.noted;
+            let undeletes = revision == l.revision && noted == Noted::Live && !force_live;
+            if revision < l.revision || same || undeletes {
                 return;
             }
         }
@@ -189,8 +288,23 @@ impl Guard {
         }
     }
 
+    /// Take note of a revision (a watch event, or what the start read) without comparing it.
+    pub(crate) fn saw<S: Spec>(&self, name: &str, revision: u64, noted: Noted) {
+        self.note(S::KIND, name, revision, noted, false);
+    }
+
+    fn saw_kind(&self, kind: &'static str, name: &str, revision: u64, noted: Noted) {
+        self.note(kind, name, revision, noted, false);
+    }
+
+    /// An object the start found exactly at its mark: live until its delete is finished.
+    fn saw_live(&self, kind: &'static str, name: &str, revision: u64) {
+        self.note(kind, name, revision, Noted::Live, true);
+    }
+
     /// Check an object returned by a read sent at `sent` against what was seen before it.
-    fn observe<S: Spec>(&self, obj: &Object<S>, sent: u64) -> DatabaseResult<()> {
+    pub(crate) fn observe<S: Spec>(&self, obj: &Object<S>, sent: u64) -> DatabaseResult<()> {
+        self.halted()?;
         let revision = obj.revision()?;
         let before = self
             .seen
@@ -214,14 +328,15 @@ impl Guard {
                 )));
             }
         }
-        self.note(S::KIND, obj.name(), revision, Noted::Live);
+        self.note(S::KIND, obj.name(), revision, Noted::Live, false);
         Ok(())
     }
 
     /// Check that an object a read sent at `sent` found absent was not one this controller saw
     /// live before it, and has not deleted (or tried to) since: any delete noted from the read's
     /// baseline on makes the absence possible (deleted, then perhaps made again).
-    fn observe_absent<S: Spec>(&self, name: &str, sent: u64) -> DatabaseResult<()> {
+    pub(crate) fn observe_absent<S: Spec>(&self, name: &str, sent: u64) -> DatabaseResult<()> {
+        self.halted()?;
         let gone = {
             let seen = self.seen.lock().unwrap();
             match seen.get(&(S::KIND, name.to_string())) {
@@ -244,16 +359,22 @@ impl Guard {
     }
 
     fn wrote<S: Spec>(&self, name: &str, revision: u64, noted: Noted) {
-        self.note(S::KIND, name, revision, noted);
+        self.note(S::KIND, name, revision, noted, false);
     }
 
     /// A delete at `revision` about to be sent: until a delete is noted done, it may or may not
     /// have happened.
     fn delete_in_doubt<S: Spec>(&self, name: &str, revision: u64) {
-        self.note(S::KIND, name, revision, Noted::InDoubt);
+        self.note(S::KIND, name, revision, Noted::InDoubt, false);
     }
 
-    /// The revision a new object of this name starts at: above any this controller has seen.
+    /// A delete at `revision` the API server refused: the object is there still.
+    fn delete_refused<S: Spec>(&self, name: &str, revision: u64) {
+        self.note(S::KIND, name, revision, Noted::Live, true);
+    }
+
+    /// The revision a new object of this name starts at: above any this controller has seen,
+    /// which includes the copy's revision and the mark (noted at start and on taking over).
     fn next_revision<S: Spec>(&self, name: &str) -> u64 {
         self.seen
             .lock()
@@ -299,11 +420,22 @@ enum Write<S> {
 }
 
 impl KubernetesStore {
-    pub(crate) fn new(client: kube::Client, namespace: String) -> Self {
+    pub(crate) fn new(client: kube::Client, namespace: String, settings: Settings) -> Self {
+        let guard = Arc::new(Guard::new(settings.copy.clone()));
+        let copy_state = copy::CopyState::new();
+        // With no copy (--dev) there is nothing to read before making things.
+        copy_state
+            .read
+            .store(settings.copy.is_none(), std::sync::atomic::Ordering::SeqCst);
         KubernetesStore {
             client,
             namespace,
-            guard: Guard::new(),
+            settings,
+            copy_state: Arc::new(copy_state),
+            copy_cancel: CancellationToken::new(),
+            writer: Default::default(),
+            pending: Default::default(),
+            guard,
             list_page: LIST_PAGE,
             locks: Default::default(),
             #[cfg(test)]
@@ -326,14 +458,26 @@ impl KubernetesStore {
     /// Another store on the same records, as a second controller would have.
     #[cfg(test)]
     pub(crate) fn second_client(&self) -> Self {
-        KubernetesStore {
-            client: self.client.clone(),
-            namespace: self.namespace.clone(),
-            guard: Guard::new(),
-            list_page: LIST_PAGE,
-            locks: Default::default(),
-            #[cfg(test)]
-            delete_answer_delay: Default::default(),
+        KubernetesStore::new(
+            self.client.clone(),
+            self.namespace.clone(),
+            Settings::default(),
+        )
+    }
+
+    /// Stop writing the copy, as a controller lost with its cluster stops.
+    #[cfg(test)]
+    pub(crate) fn stop_copy(&self) {
+        self.copy_cancel.cancel();
+    }
+
+    /// Stepping down: stop writing the copy, and let a write under way finish first, so the
+    /// controller taking over reads a copy no one is still writing.
+    pub(crate) async fn step_down(&self) {
+        self.copy_cancel.cancel();
+        let writer = self.writer.lock().unwrap().take();
+        if let Some(w) = writer {
+            let _ = w.await;
         }
     }
 
@@ -474,6 +618,18 @@ impl KubernetesStore {
             let written = match (write, current) {
                 (Write::Keep, _) | (Write::Delete, None) => return Ok(result),
                 (Write::Put(spec), None) => {
+                    // A create starts above the name's mark and the copy's revision, so until
+                    // both are read (only under --records-start-without-copy) nothing is made.
+                    if !self
+                        .copy_state
+                        .read
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Err(DatabaseError::Logical(format!(
+                            "{} {name} is not made before the copy and its marks are read",
+                            S::KIND
+                        )));
+                    }
                     let obj = Object::new(name, spec, self.guard.next_revision::<S>(name));
                     match self.write_strict(None, &obj).await {
                         Ok(stored) => self.stored(name, &obj, &stored),
@@ -490,6 +646,8 @@ impl KubernetesStore {
                     }
                 }
                 (Write::Delete, Some(current)) => {
+                    // The mark first, at the revision read: the delete waits for it.
+                    self.write_mark::<S>(name, current.revision()?).await?;
                     let params = DeleteParams {
                         preconditions: Some(Preconditions {
                             resource_version: current.metadata.resource_version.clone(),
@@ -497,18 +655,11 @@ impl KubernetesStore {
                         }),
                         ..Default::default()
                     };
-                    // In doubt from before it is sent: a read of the name answered between the
-                    // API server committing the delete and its answer arriving here finds it
-                    // gone. A refusal leaves the note; the name's next revision supersedes it.
-                    let revision = current.revision()?;
-                    self.guard.delete_in_doubt::<S>(name, revision);
-                    match api.delete(name, &params).await {
-                        Ok(_) => {
-                            #[cfg(test)]
-                            tokio::time::sleep(self.delete_answer_delay).await;
-                            self.guard.wrote::<S>(name, revision, Noted::Deleted);
-                            Ok(())
-                        }
+                    match self
+                        .delete_noted(api, name, current.revision()?, &params)
+                        .await
+                    {
+                        Ok(()) => Ok(()),
                         Err(e) if is_conflict(&e) || is_not_found(&e) => continue,
                         Err(e) => Err(e.into()),
                     }
@@ -520,6 +671,51 @@ impl KubernetesStore {
             "{} {name}: still conflicting after {MAX_RETRIES} attempts",
             S::KIND
         )))
+    }
+
+    /// Send a delete of `name` at `revision`, noting what is known of it: in doubt from before
+    /// it is sent (a read answered between the API server committing it and its answer arriving
+    /// here finds the name gone), done once answered done, live again when refused (400, 403,
+    /// 422, 429: nothing was deleted). It stays in doubt when no answer came, when the object was
+    /// found already gone, and when a finalizer holds it (there still, at the same revision,
+    /// until it goes); the name's next revision supersedes that, and the start's check against
+    /// the copy covers a name left in doubt, as its mark is written first.
+    async fn delete_noted<S: Spec>(
+        &self,
+        api: &Api<Object<S>>,
+        name: &str,
+        revision: u64,
+        params: &DeleteParams,
+    ) -> Result<(), kube::Error> {
+        self.guard.delete_in_doubt::<S>(name, revision);
+        match api.delete(name, params).await {
+            Ok(held) if held.is_left() => {
+                tracing::warn!(
+                    "{} {name}: a finalizer holds its delete; in doubt until it goes",
+                    S::KIND
+                );
+                Ok(())
+            }
+            Ok(_) => {
+                #[cfg(test)]
+                tokio::time::sleep(self.delete_answer_delay).await;
+                self.guard.wrote::<S>(name, revision, Noted::Deleted);
+                Ok(())
+            }
+            Err(e) => {
+                if is_refusal(&e) {
+                    self.guard.delete_refused::<S>(name, revision);
+                } else if is_not_found(&e) {
+                    // Read at `revision` just before, and gone before this controller deleted
+                    // it: something else deleted it, or the store lost it.
+                    tracing::warn!(
+                        "{} {name}: found already gone when deleting it at revision {revision},                          not deleted by this controller",
+                        S::KIND
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// What the API server stored, checked against what was sent, and noted as seen.
@@ -542,9 +738,11 @@ impl KubernetesStore {
         Ok(())
     }
 
-    /// The controller's check at start, in place of the Postgres store's migrations: every
-    /// kind is installed and readable in the records' namespace.
-    pub(crate) async fn migration_run(&self) -> DatabaseResult<()> {
+    pub(crate) async fn check_kinds(&self) -> DatabaseResult<()> {
+        self.kinds_readable().await
+    }
+
+    async fn kinds_readable(&self) -> DatabaseResult<()> {
         async fn readable<S: Spec>(store: &KubernetesStore) -> DatabaseResult<()> {
             match store.api::<S>().list(&ListParams::default().limit(1)).await {
                 Ok(_) => Ok(()),
@@ -562,12 +760,369 @@ impl KubernetesStore {
         readable::<TimelineSpec>(self).await?;
         readable::<PageserverSpec>(self).await?;
         readable::<SafekeeperSpec>(self).await?;
-        readable::<LeaderSpec>(self).await?;
+        readable::<LeaderSpec>(self).await
+    }
+
+    /// Every object's revision, by record key, read straight from the API server.
+    async fn object_revisions(&self) -> DatabaseResult<BTreeMap<String, u64>> {
+        async fn of<S: Spec>(
+            store: &KubernetesStore,
+            out: &mut BTreeMap<String, u64>,
+        ) -> DatabaseResult<()> {
+            let api = store.api::<S>();
+            let mut params = ListParams::default().limit(LIST_PAGE);
+            loop {
+                let page = api.list(&params).await?;
+                for o in &page.items {
+                    out.insert(copy::record_key(S::KIND, o.name()), o.revision()?);
+                }
+                match page.metadata.continue_ {
+                    Some(t) if !t.is_empty() => params = params.continue_token(&t),
+                    _ => return Ok(()),
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        of::<TenantSpec>(self, &mut out).await?;
+        of::<MetadataHealthSpec>(self, &mut out).await?;
+        of::<TimelineSpec>(self, &mut out).await?;
+        of::<PageserverSpec>(self, &mut out).await?;
+        of::<SafekeeperSpec>(self, &mut out).await?;
+        of::<LeaderSpec>(self, &mut out).await?;
+        Ok(out)
+    }
+
+    /// The checks at start (`storage_controller/kubernetes/README.md`, "At start"), run before
+    /// a controller started as a candidate asks the leader to step down. They only read: what
+    /// they find to do is done by [`Self::migration_run`], once this controller leads.
+    pub(crate) async fn start_checks(&self) -> DatabaseResult<()> {
+        self.kinds_readable().await?;
+        let Some(bucket) = self.settings.copy.clone() else {
+            // --dev with no copy: nothing to compare with.
+            self.copy_state
+                .read
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        };
+        match self.read_and_judge(&bucket).await {
+            Ok(()) => Ok(()),
+            Err(Unread(e)) if self.settings.start_without_copy => {
+                tracing::warn!(
+                    "starting without the copy (--records-start-without-copy): {e:#}; a store \
+                     taken back goes unseen until it is read, and no create is made until then"
+                );
+                let store_copy = bucket.clone();
+                let guard = self.guard.clone();
+                let state = self.copy_state.clone();
+                let client = self.client.clone();
+                let namespace = self.namespace.clone();
+                let settings = self.settings.clone();
+                tokio::spawn(async move {
+                    let later = KubernetesStore {
+                        client,
+                        namespace,
+                        settings,
+                        copy_state: state,
+                        copy_cancel: CancellationToken::new(),
+                        writer: Default::default(),
+                        pending: Default::default(),
+                        guard,
+                        list_page: LIST_PAGE,
+                        locks: Default::default(),
+                        #[cfg(test)]
+                        delete_answer_delay: Default::default(),
+                    };
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        match later.read_and_judge(&store_copy).await {
+                            Ok(()) => {
+                                tracing::info!("the copy is read; its checks passed");
+                                return;
+                            }
+                            Err(Unread(e)) => tracing::warn!("the copy cannot be read yet: {e:#}"),
+                            Err(Refused(e)) => {
+                                let _ = later.guard.went_back_now(e.to_string());
+                                return;
+                            }
+                        }
+                    }
+                });
+                Ok(())
+            }
+            Err(Unread(e)) => Err(DatabaseError::Logical(format!(
+                "the copy of the records cannot be read, so whether they went back cannot be \
+                 told; starting refused (--records-start-without-copy overrides, at a risk): {e:#}"
+            ))),
+            Err(Refused(e)) => Err(e),
+        }
+    }
+
+    /// Read the copy, then the objects, then the marks, and judge every record; on success note
+    /// what was seen and what is to be done.
+    async fn read_and_judge(&self, bucket: &copy::BucketCopy) -> Result<(), StartError> {
+        if let Some(w) = bucket.read_went_back().await.map_err(Unread)? {
+            return Err(Refused(DatabaseError::Logical(format!(
+                "a controller found the records went back at {} ({}), and recorded it in the \
+                 bucket: restore them with `storcon_records restore` before starting",
+                w.at, w.what
+            ))));
+        }
+        let doc = bucket.read().await.map_err(Unread)?;
+        let objects = self.object_revisions().await.map_err(Refused)?;
+        let marks = bucket.read_marks().await.map_err(Unread)?;
+
+        let copy_revisions = doc
+            .as_ref()
+            .map(|d| d.revisions.clone())
+            .unwrap_or_default();
+        let objects_hold_any = objects.keys().any(|k| {
+            k.starts_with("Tenant/") || k.starts_with("Pageserver/") || k.starts_with("Safekeeper/")
+        });
+        if let Some(d) = &doc {
+            if !objects_hold_any && !d.records.is_empty() {
+                return Err(Refused(DatabaseError::Logical(format!(
+                    "the records in namespace {} are empty but the copy in the bucket (written \
+                     {}) holds {:?}: restore them with `storcon_records restore` before starting",
+                    self.namespace,
+                    d.written_at,
+                    d.records.counts()
+                ))));
+            }
+        }
+        let verdict = checks::classify(
+            &objects,
+            &copy_revisions,
+            &marks,
+            &self.settings.accept_deleted,
+        );
+        if verdict.refuses() {
+            return Err(Refused(DatabaseError::Logical(format!(
+                "records went back or went missing, compared with the copy in the bucket{}: \
+                 went back {:?}; missing {:?}; named by --records-accept-deleted but not \
+                 missing {:?}. Restore them with `storcon_records restore`, or, for records \
+                 deleted without a mark, name them in --records-accept-deleted",
+                doc.as_ref()
+                    .map(|d| format!(" (written {})", d.written_at))
+                    .unwrap_or_default(),
+                verdict.went_back,
+                verdict.missing,
+                verdict.wrongly_accepted
+            ))));
+        }
+
+        // What was seen: the marks (deleted at their revision), the copy's revisions, then the
+        // objects (a delete to finish stays live until it is done).
+        for (key, m) in &marks {
+            if let Some((kind, name)) = split_key(key) {
+                self.guard.saw_kind(kind, name, m.revision, Noted::Deleted);
+            }
+        }
+        for (key, &c) in &copy_revisions {
+            if let Some((kind, name)) = split_key(key) {
+                self.guard.saw_kind(kind, name, c, Noted::Live);
+            }
+        }
+        for (key, &r) in &objects {
+            if let Some((kind, name)) = split_key(key) {
+                self.guard.saw_live(kind, name, r);
+            }
+        }
+        {
+            let mut held = self.copy_state.marks.lock().unwrap();
+            for (k, m) in marks {
+                let e = held.entry(k).or_insert(m);
+                if m.revision > e.revision {
+                    *e = m;
+                }
+            }
+        }
+        {
+            let mut last = self.copy_state.last.lock().unwrap();
+            let newer = match (&*last, &doc) {
+                (Some(l), Some(d)) => d.written_at >= l.written_at,
+                _ => true,
+            };
+            if newer {
+                if let Some(d) = doc {
+                    let mut d = d;
+                    d.merge_highest(last.as_ref());
+                    *last = Some(d);
+                }
+            }
+        }
+        *self.pending.lock().unwrap() = verdict;
+        self.copy_state
+            .read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Once this controller leads (after the leader stepped down, before the records are
+    /// loaded): read the copy and the marks again (another controller may have written them
+    /// since the start's checks), do what the checks found to do, and start writing the copy.
+    pub(crate) async fn migration_run(&self) -> DatabaseResult<()> {
+        self.kinds_readable().await?;
+        if let Some(bucket) = self.settings.copy.clone() {
+            if self
+                .copy_state
+                .read
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                match self.read_and_judge(&bucket).await {
+                    Ok(()) => {}
+                    Err(Unread(e)) => {
+                        return Err(DatabaseError::Logical(format!(
+                            "reading the copy again on taking over failed: {e:#}"
+                        )));
+                    }
+                    Err(Refused(e)) => return Err(e),
+                }
+            }
+            let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+            for key in &pending.unfinished {
+                self.finish_delete(key).await?;
+            }
+            for key in &pending.accepted {
+                let revision = self
+                    .copy_state
+                    .last
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|d| d.revisions.get(key).copied())
+                    .unwrap_or(0);
+                let mark = copy::Mark {
+                    revision,
+                    accepted: true,
+                };
+                bucket
+                    .write_mark(key, mark)
+                    .await
+                    .map_err(|e| DatabaseError::Logical(format!("writing a mark: {e:#}")))?;
+                self.copy_state
+                    .marks
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), mark);
+                if let Some((kind, name)) = split_key(key) {
+                    self.guard.saw_kind(kind, name, revision, Noted::Deleted);
+                }
+                tracing::info!("{key} accepted as deleted (--records-accept-deleted)");
+            }
+        }
         self.sweep_orphaned_health().await?;
         tracing::info!(
             "Records are kept in Kubernetes objects in namespace {}",
             self.namespace
         );
+        if let Some(bucket) = self.settings.copy.clone() {
+            let handle = copy::spawn(
+                copy::Writer {
+                    client: self.client.clone(),
+                    namespace: self.namespace.clone(),
+                    copy: bucket,
+                    state: self.copy_state.clone(),
+                    guard: self.guard.clone(),
+                    own_address: self.settings.own_address.clone(),
+                },
+                self.copy_cancel.child_token(),
+            );
+            *self.writer.lock().unwrap() = Some(handle);
+            tracing::info!("Records are copied to the bucket within a second of each change");
+        }
+        Ok(())
+    }
+
+    /// Finish a delete decided and not done (an object exactly at its mark's revision).
+    async fn finish_delete(&self, key: &str) -> DatabaseResult<()> {
+        let Some((kind, name)) = split_key(key) else {
+            return Ok(());
+        };
+        let Some(mark) = self.copy_state.mark(kind, name) else {
+            return Ok(());
+        };
+        macro_rules! finish {
+            ($spec:ty) => {{
+                let api = self.api::<$spec>();
+                if let Some(o) = api.get_opt(name).await? {
+                    if o.revision()? == mark.revision {
+                        let params = DeleteParams {
+                            preconditions: Some(Preconditions {
+                                resource_version: o.metadata.resource_version.clone(),
+                                uid: o.metadata.uid.clone(),
+                            }),
+                            ..Default::default()
+                        };
+                        match self.delete_noted(&api, name, mark.revision, &params).await {
+                            Ok(()) => {}
+                            Err(e) if is_not_found(&e) => {
+                                self.guard.saw::<$spec>(name, mark.revision, Noted::Deleted)
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                        tracing::info!("{key}: finished a delete decided before a restart");
+                    }
+                }
+            }};
+        }
+        match kind {
+            k if k == TenantSpec::KIND => finish!(TenantSpec),
+            k if k == MetadataHealthSpec::KIND => finish!(MetadataHealthSpec),
+            k if k == TimelineSpec::KIND => finish!(TimelineSpec),
+            k if k == PageserverSpec::KIND => finish!(PageserverSpec),
+            k if k == SafekeeperSpec::KIND => finish!(SafekeeperSpec),
+            k if k == LeaderSpec::KIND => finish!(LeaderSpec),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Write the deletion mark of an object about to be deleted, at the revision read.
+    async fn write_mark<S: Spec>(&self, name: &str, revision: u64) -> DatabaseResult<()> {
+        let Some(bucket) = &self.settings.copy else {
+            return Ok(());
+        };
+        let key = copy::record_key(S::KIND, name);
+        let mark = copy::Mark {
+            revision,
+            accepted: false,
+        };
+        bucket.write_mark(&key, mark).await.map_err(|e| {
+            DatabaseError::Logical(format!(
+                "the deletion mark of {key} cannot be written to the bucket, so it is not \
+                 deleted yet: {e:#}"
+            ))
+        })?;
+        let mut marks = self.copy_state.marks.lock().unwrap();
+        let e = marks.entry(key).or_insert(mark);
+        if mark.revision > e.revision {
+            *e = mark;
+        }
+        Ok(())
+    }
+
+    /// An object exactly at its mark is a delete under way (or one the start finished): never
+    /// listed into a re-attach or a validation.
+    fn pending_delete<S: Spec>(&self, obj: &Object<S>) -> bool {
+        self.copy_state
+            .mark(S::KIND, obj.name())
+            .is_some_and(|m| obj.revision().is_ok_and(|r| r == m.revision))
+    }
+
+    /// No generation is raised while the copy is further behind than `--records-copy-max-lag`:
+    /// a generation the copy does not hold, lost with the objects, could be issued again.
+    fn copy_current_enough(&self) -> DatabaseResult<()> {
+        if let (Some(_), Some(max)) = (&self.settings.copy, self.settings.copy_max_lag) {
+            let behind = self.copy_state.behind();
+            if behind > max {
+                return Err(DatabaseError::Logical(format!(
+                    "the copy of the records in the bucket is {}s behind (more than \
+                     --records-copy-max-lag, {}s): no generation is raised until it catches up",
+                    behind.as_secs(),
+                    max.as_secs()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -840,9 +1395,13 @@ impl KubernetesStore {
             // One compare-and-swap per tenant with a shard on this node. Each is safe to repeat:
             // a controller that stops halfway is finished by the pageserver's retry, and a
             // generation may then skip a number, never repeat one.
-            let tenants = self
+            self.copy_current_enough()?;
+            let tenants: Vec<_> = self
                 .list::<TenantSpec>(Some(&generation_label(node)))
-                .await?;
+                .await?
+                .into_iter()
+                .filter(|t| !self.pending_delete(t))
+                .collect();
             let incremented: Vec<Vec<TenantShardPersistence>> =
                 futures::stream::iter(tenants.into_iter().map(|t| {
                     let name = t.metadata.name.clone().unwrap_or_default();
@@ -936,6 +1495,7 @@ impl KubernetesStore {
         node_id: NodeId,
     ) -> anyhow::Result<Generation> {
         let key = shard_key(&tenant_shard_id);
+        self.copy_current_enough()?;
         let generation = self
             .measured(
                 DatabaseOperation::IncrementGeneration,
@@ -1050,6 +1610,7 @@ impl KubernetesStore {
                 .list::<TenantSpec>(Some(&generation_label(node_id.0 as i64)))
                 .await?
                 .into_iter()
+                .filter(|o| !self.pending_delete(o))
                 .map(|o| (o.spec.tenant_id.clone(), o.spec))
                 .collect();
             let mut out = Vec::new();
@@ -2119,6 +2680,184 @@ impl KubernetesStore {
     }
 }
 
+/// Every record at once, for the copy tool.
+impl KubernetesStore {
+    async fn all<S: Spec>(&self) -> DatabaseResult<BTreeMap<String, (S, u64)>> {
+        let mut out = BTreeMap::new();
+        for o in self.list::<S>(None).await? {
+            let rev = o.revision()?;
+            out.insert(o.name().to_string(), (o.spec, rev));
+        }
+        Ok(out)
+    }
+
+    /// Every record, and each one's revision by record key.
+    pub(crate) async fn read_all_with_revisions(
+        &self,
+    ) -> DatabaseResult<(super::records::Records, BTreeMap<String, u64>)> {
+        fn take<S: Spec>(
+            m: BTreeMap<String, (S, u64)>,
+            revisions: &mut BTreeMap<String, u64>,
+        ) -> BTreeMap<String, S> {
+            m.into_iter()
+                .map(|(name, (spec, rev))| {
+                    revisions.insert(copy::record_key(S::KIND, &name), rev);
+                    (name, spec)
+                })
+                .collect()
+        }
+        let mut revisions = BTreeMap::new();
+        let mut r = super::records::Records::empty();
+        r.tenants = take(self.all::<TenantSpec>().await?, &mut revisions);
+        r.metadata_health = take(self.all::<MetadataHealthSpec>().await?, &mut revisions);
+        r.timelines = take(self.all::<TimelineSpec>().await?, &mut revisions);
+        r.pageservers = take(self.all::<PageserverSpec>().await?, &mut revisions);
+        r.safekeepers = take(self.all::<SafekeeperSpec>().await?, &mut revisions);
+        r.leader = take(self.all::<LeaderSpec>().await?, &mut revisions).remove(LEADER_OBJECT_NAME);
+        r.drop_orphaned_health();
+        r.sort();
+        Ok((r, revisions))
+    }
+
+    pub(crate) async fn read_all(&self) -> DatabaseResult<super::records::Records> {
+        Ok(self.read_all_with_revisions().await?.0)
+    }
+
+    /// Write every record, each at a revision above `floors` (by record key: the copy's and the
+    /// marks' revisions) and above any this store has seen, replacing an object already there.
+    /// With `replace`, an object that is not among the records is removed, its mark written
+    /// first. The revisions written, by record key.
+    pub(crate) async fn write_all(
+        &self,
+        records: &super::records::Records,
+        replace: bool,
+        floors: &BTreeMap<String, u64>,
+    ) -> DatabaseResult<BTreeMap<String, u64>> {
+        async fn put<S: Spec>(
+            store: &KubernetesStore,
+            objects: BTreeMap<String, S>,
+            replace: bool,
+            floors: &BTreeMap<String, u64>,
+        ) -> DatabaseResult<BTreeMap<String, u64>> {
+            let api = store.api::<S>();
+            let held = store.all::<S>().await?;
+            if replace {
+                for (name, (_, rev)) in &held {
+                    if objects.contains_key(name) {
+                        continue;
+                    }
+                    store.write_mark::<S>(name, *rev).await?;
+                    match store
+                        .delete_noted(&api, name, *rev, &DeleteParams::default())
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(e) if is_not_found(&e) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            let written = futures::stream::iter(objects.into_iter().map(|(name, spec)| {
+                let floor = floors
+                    .get(&copy::record_key(S::KIND, &name))
+                    .copied()
+                    .unwrap_or(0);
+                let current = held.get(&name).map(|(_, rev)| *rev);
+                let api = api.clone();
+                async move {
+                    let revision = floor
+                        .max(current.unwrap_or(0))
+                        .max(store.guard.next_revision::<S>(&name).saturating_sub(1))
+                        + 1;
+                    let mut obj = Object::new(&name, spec, revision);
+                    let stored = match current {
+                        None => store.write_strict(None, &obj).await?,
+                        Some(_) => {
+                            let now = api.get(&name).await?;
+                            obj.metadata.resource_version = now.metadata.resource_version;
+                            store.write_strict(Some(&name), &obj).await?
+                        }
+                    };
+                    store.stored(&name, &obj, &stored)?;
+                    Ok::<_, DatabaseError>((copy::record_key(S::KIND, &name), revision))
+                }
+            }))
+            .buffer_unordered(RE_ATTACH_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+            Ok(written.into_iter().collect())
+        }
+        let mut revisions = BTreeMap::new();
+        revisions.extend(put(self, records.tenants.clone(), replace, floors).await?);
+        revisions.extend(put(self, records.metadata_health.clone(), replace, floors).await?);
+        revisions.extend(put(self, records.timelines.clone(), replace, floors).await?);
+        revisions.extend(put(self, records.pageservers.clone(), replace, floors).await?);
+        revisions.extend(put(self, records.safekeepers.clone(), replace, floors).await?);
+        let leader: BTreeMap<String, LeaderSpec> = records
+            .leader
+            .clone()
+            .map(|l| (LEADER_OBJECT_NAME.to_string(), l))
+            .into_iter()
+            .collect();
+        revisions.extend(put(self, leader, replace, floors).await?);
+        Ok(revisions)
+    }
+}
+
+/// A proxy from the environment (`HTTPS_PROXY`) is not used for an API server on this machine
+/// or one that `NO_PROXY` names, as other clients treat it; this client has no proxy support, so
+/// it would otherwise refuse to start.
+pub(crate) fn skip_proxy_where_excluded(config: &mut kube::Config) {
+    if config.proxy_url.is_none() {
+        return;
+    }
+    let host = config.cluster_url.host().unwrap_or_default().to_string();
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let excluded = ["NO_PROXY", "no_proxy"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .flat_map(|list| {
+            list.split(',')
+                .map(|s| s.trim().trim_start_matches('.').to_string())
+                .collect::<Vec<_>>()
+        })
+        .any(|entry| {
+            !entry.is_empty()
+                && (entry == "*" || host == entry || host.ends_with(&format!(".{entry}")))
+        });
+    if loopback || excluded {
+        config.proxy_url = None;
+    }
+}
+
+/// Why a start's checks did not pass: the copy or its marks could not be read, or a record
+/// went back or went missing.
+enum StartError {
+    Unread(anyhow::Error),
+    Refused(DatabaseError),
+}
+use StartError::{Refused, Unread};
+
+/// A record key's kind (as the kinds' own constant) and name.
+fn split_key(key: &str) -> Option<(&'static str, &str)> {
+    let (kind, name) = key.split_once('/')?;
+    let kind = [
+        TenantSpec::KIND,
+        MetadataHealthSpec::KIND,
+        TimelineSpec::KIND,
+        PageserverSpec::KIND,
+        SafekeeperSpec::KIND,
+        LeaderSpec::KIND,
+    ]
+    .into_iter()
+    .find(|k| *k == kind)?;
+    Some((kind, name))
+}
+
 /// Neon's upsert of a pending operation: keep at most one per safekeeper, and replace it only
 /// with one of a higher generation. Whether anything was written.
 fn upsert_pending_op(spec: &mut TimelineSpec, entry: &TimelinePendingOpPersistence) -> bool {
@@ -2170,6 +2909,11 @@ fn is_not_found(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(s) if s.code == 404)
 }
 
+/// The API server refused the request outright: nothing it asked for was done.
+fn is_refusal(e: &kube::Error) -> bool {
+    matches!(e, kube::Error::Api(s) if matches!(s.code, 400 | 403 | 422 | 429))
+}
+
 #[cfg(test)]
 mod guard_tests {
     use super::*;
@@ -2201,7 +2945,7 @@ mod guard_tests {
     fn a_read_is_refused_only_when_the_store_went_back() {
         // Seen at 5; a read sent now, a write of 6 finished while it was in flight: its answer
         // at 5 is older than the write, not the store going back, and lowers nothing
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         let sent = g.before_read();
         g.wrote::<LeaderSpec>(L, 6, Noted::Live);
@@ -2211,21 +2955,21 @@ mod guard_tests {
         read(&g, 5, g.before_read()).unwrap_err();
 
         // Seen at 5 and never deleted, answered absent: went back
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         absent(&g, g.before_read()).unwrap_err();
 
         // Deleted by this controller at 5, then answered at 5: went back; at 6 (made again): fine
-        let g = Guard::new();
+        let g = Guard::new(None);
         g.wrote::<LeaderSpec>(L, 5, Noted::Deleted);
         read(&g, 5, g.before_read()).unwrap_err();
-        let g = Guard::new();
+        let g = Guard::new(None);
         g.wrote::<LeaderSpec>(L, 5, Noted::Deleted);
         read(&g, 6, g.before_read()).unwrap();
 
         // A read sent before a delete, answered present at the deleted revision: fine, and the
         // delete stays noted
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         let sent = g.before_read();
         g.wrote::<LeaderSpec>(L, 5, Noted::Deleted);
@@ -2236,20 +2980,20 @@ mod guard_tests {
     #[test]
     fn an_absence_is_accepted_after_any_delete_since_the_read_was_sent() {
         // A name first seen after the read was sent (made while a list was in flight)
-        let g = Guard::new();
+        let g = Guard::new(None);
         let sent = g.before_read();
         g.wrote::<LeaderSpec>(L, 1, Noted::Live);
         absent(&g, sent).unwrap();
 
         // Deleted while the read was in flight
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         let sent = g.before_read();
         g.wrote::<LeaderSpec>(L, 5, Noted::Deleted);
         absent(&g, sent).unwrap();
 
         // Deleted and made again while a list was in flight, the list's snapshot between the two
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         let sent = g.before_read();
         g.wrote::<LeaderSpec>(L, 5, Noted::Deleted);
@@ -2259,7 +3003,7 @@ mod guard_tests {
         absent(&g, g.before_read()).unwrap_err();
 
         // A delete whose answer was lost, then a get, then the remake, the get answered absent
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         g.delete_in_doubt::<LeaderSpec>(L, 5);
         let sent = g.before_read();
@@ -2268,7 +3012,7 @@ mod guard_tests {
 
         // A get sent before a delete whose answer was lost, answered present from before the
         // delete; the delete did happen, and a later get finds it gone: not the store going back
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         let sent = g.before_read();
         g.delete_in_doubt::<LeaderSpec>(L, 5);
@@ -2277,7 +3021,7 @@ mod guard_tests {
 
         // A delete in doubt that did not happen: the object read at its revision is fine; only a
         // new revision shows it live again, after which its absence is the store going back
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         g.delete_in_doubt::<LeaderSpec>(L, 5);
         read(&g, 5, g.before_read()).unwrap();
@@ -2291,7 +3035,7 @@ mod guard_tests {
     /// between the API server committing it and its answer arriving finds the name gone.
     #[test]
     fn a_delete_is_in_doubt_from_before_it_is_sent() {
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         let before = g.before_read();
         g.delete_in_doubt::<LeaderSpec>(L, 5);
@@ -2303,18 +3047,36 @@ mod guard_tests {
         g.wrote::<LeaderSpec>(L, 5, Noted::Deleted);
         absent(&g, g.before_read()).unwrap();
         read(&g, 5, g.before_read()).unwrap_err();
-        // Refused: the note stays until the name's next revision
-        let g = Guard::new();
+        // Unanswered: in doubt until the name's next revision
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         g.delete_in_doubt::<LeaderSpec>(L, 5);
         absent(&g, g.before_read()).unwrap();
         read(&g, 6, g.before_read()).unwrap();
         absent(&g, g.before_read()).unwrap_err();
+        // Refused: live again at the same revision, for a read sent after the refusal; one sent
+        // while the delete was in flight may still find it gone
+        let g = Guard::new(None);
+        read(&g, 5, g.before_read()).unwrap();
+        g.delete_in_doubt::<LeaderSpec>(L, 5);
+        let in_flight = g.before_read();
+        g.delete_refused::<LeaderSpec>(L, 5);
+        absent(&g, in_flight).unwrap();
+        read(&g, 5, g.before_read()).unwrap();
+        absent(&g, g.before_read()).unwrap_err();
+    }
+
+    /// The README names how many changes of each name are kept.
+    #[test]
+    fn the_readme_names_the_history_kept() {
+        let readme = include_str!("../../kubernetes/README.md");
+        let named = format!("last {SEEN_HISTORY} changes");
+        assert!(readme.contains(&named), "the README says \"{named}\"");
     }
 
     #[test]
     fn reads_at_an_unchanged_revision_do_not_fill_the_history() {
-        let g = Guard::new();
+        let g = Guard::new(None);
         read(&g, 5, g.before_read()).unwrap();
         let slow = g.before_read();
         for _ in 0..100 {

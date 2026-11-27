@@ -1,5 +1,6 @@
 # Peat's storage image: the four storage programs (storage broker, storage controller,
-# safekeeper, pageserver), built with the default features (no test-only HTTP API), and
+# safekeeper, pageserver) and the storage controller's copy tool (storcon_records), built
+# with the default features (no test-only HTTP API), and
 # the part of Postgres 18 and of Postgres 19 the pageserver runs itself (initdb for new
 # timelines, postgres for WAL redo, with their libraries and data files) at /usr/local/v18
 # and /usr/local/v19, where pg_distrib_dir '/usr/local/' finds them, as in Neon's own image. Also sh and curl, which the lab's scripts
@@ -19,7 +20,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && userdel --remove ubuntu \
  && useradd --uid 1000 --home-dir /data --create-home peat
-COPY bin/storage_broker bin/storage_controller bin/safekeeper bin/pageserver /usr/local/bin/
+COPY bin/storage_broker bin/storage_controller bin/storcon_records bin/safekeeper bin/pageserver /usr/local/bin/
 COPY pg/v18/bin/initdb pg/v18/bin/postgres /usr/local/v18/bin/
 COPY pg/v18/lib /usr/local/v18/lib
 COPY pg/v18/share /usr/local/v18/share

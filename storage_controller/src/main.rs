@@ -108,6 +108,30 @@ struct Cli {
     #[arg(long)]
     records_namespace: Option<String>,
 
+    /// With `--records kubernetes`: where the copy of the records goes, in the syntax of the
+    /// pageserver's `remote_storage` setting, like
+    /// `{ bucket_name = "records", bucket_region = "auto", endpoint = "https://store.example.com" }`.
+    /// Credentials as for the pageserver (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+    /// Required outside `--dev`.
+    #[arg(long)]
+    records_copy_storage: Option<String>,
+
+    /// With `--records kubernetes`, a last resort chosen by a person: start without reading the
+    /// copy, until the time given (RFC 3339, at most 24 hours ahead; refused after it). Until the
+    /// copy is read, records taken back go unseen and nothing is made.
+    #[arg(long)]
+    records_start_without_copy: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// With `--records kubernetes`: start although these records (`<Kind>/<name>`, comma
+    /// separated), in the copy, have no object and no deletion mark, taking them as deleted.
+    #[arg(long, value_delimiter = ',')]
+    records_accept_deleted: Vec<String>,
+
+    /// With `--records kubernetes`: no generation is raised while the copy in the bucket is
+    /// further behind than this ("0s" for no limit).
+    #[arg(long, default_value = "30s")]
+    records_copy_max_lag: humantime::Duration,
+
     /// Flag to enable dev mode, which permits running without auth
     #[arg(long, default_value = "false")]
     dev: bool,
@@ -399,9 +423,35 @@ async fn async_main() -> anyhow::Result<()> {
 
     let secrets = Secrets::load(&args).await?;
 
-    if args.records_namespace.is_some() && args.records == Records::Postgres {
-        anyhow::bail!("`--records-namespace` is only meaningful with `--records kubernetes`");
+    if args.records == Records::Postgres
+        && (args.records_namespace.is_some()
+            || args.records_copy_storage.is_some()
+            || args.records_start_without_copy.is_some()
+            || !args.records_accept_deleted.is_empty())
+    {
+        anyhow::bail!("the `--records-*` settings are only meaningful with `--records kubernetes`");
     }
+    let start_without_copy = match args.records_start_without_copy {
+        None => false,
+        Some(until) => {
+            let now = chrono::Utc::now();
+            if until <= now {
+                anyhow::bail!(
+                    "`--records-start-without-copy {until}` has passed: remove it (a flag left in a manifest stops a start rather than staying)"
+                );
+            }
+            if until > now + chrono::Duration::hours(24) {
+                anyhow::bail!("`--records-start-without-copy {until}` is more than 24 hours ahead");
+            }
+            true
+        }
+    };
+    let records_copy = args
+        .records_copy_storage
+        .as_deref()
+        .map(remote_storage::RemoteStorageConfig::from_toml_str)
+        .transpose()
+        .context("reading `--records-copy-storage`")?;
 
     // Validate required secrets and arguments are provided in strict mode
     match strict_mode {
@@ -427,10 +477,13 @@ async fn async_main() -> anyhow::Result<()> {
         StrictMode::Strict if args.use_local_compute_notifications => {
             anyhow::bail!("`--use-local-compute-notifications` is only permitted in `--dev` mode");
         }
-        // The Kubernetes store's copy in a bucket, its way back from a lost cluster, is not
-        // built yet (storage_controller/kubernetes/README.md); until it is, it is for testing.
-        StrictMode::Strict if args.records == Records::Kubernetes => {
-            anyhow::bail!("`--records kubernetes` is only permitted in `--dev` mode for now");
+        // The copy in the bucket is the Kubernetes store's way back from a lost cluster.
+        StrictMode::Strict
+            if args.records == Records::Kubernetes && args.records_copy_storage.is_none() =>
+        {
+            anyhow::bail!(
+                "`--records kubernetes` without `--records-copy-storage` is only permitted in `--dev` mode"
+            );
         }
         StrictMode::Strict if args.timeline_safekeeper_count < 3 => {
             anyhow::bail!(
@@ -466,6 +519,7 @@ async fn async_main() -> anyhow::Result<()> {
         None
     };
 
+    let own_address = args.address_for_peers.as_ref().map(|a| a.to_string());
     let config = Config {
         pageserver_jwt_token: secrets.pageserver_jwt_token,
         safekeeper_jwt_token: secrets.safekeeper_jwt_token,
@@ -527,10 +581,26 @@ async fn async_main() -> anyhow::Result<()> {
             Persistence::await_connection(&database_url, args.db_connect_timeout.into()).await?;
             Persistence::new(database_url).await
         }
-        RecordsStore::Kubernetes => Persistence::new_kubernetes(args.records_namespace)
+        RecordsStore::Kubernetes => {
+            let max_lag: Duration = args.records_copy_max_lag.into();
+            Persistence::new_kubernetes(
+                None,
+                args.records_namespace,
+                storage_controller::persistence::KubernetesRecords {
+                    copy_storage: records_copy,
+                    own_address,
+                    copy_max_lag: (!max_lag.is_zero()).then_some(max_lag),
+                    accept_deleted: args.records_accept_deleted.clone(),
+                    start_without_copy,
+                },
+            )
             .await
-            .context("connect to the Kubernetes API server")?,
+            .context("connect to the Kubernetes API server")?
+        }
     };
+    // Before a candidate asks the current leader to step down (in Service::spawn), so one that
+    // would refuse never takes the leader down first.
+    persistence.start_checks().await?;
     let persistence = Arc::new(persistence);
 
     let service = Service::spawn(config, persistence.clone()).await?;

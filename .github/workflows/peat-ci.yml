@@ -155,7 +155,8 @@ jobs:
 
       # The storage controller's records on both of its stores: every operation, run the same way
       # against a real Kubernetes API server (the envtest build of 1.31) and against a Postgres
-      # from this build, the two required to agree (storage_controller/src/persistence/tests.rs).
+      # from this build, the two required to agree (storage_controller/src/persistence/tests.rs);
+      # and the copy in the bucket, the copy tool and the restore (records_tool.rs).
       # The step above runs the same tests with neither store set, where they do nothing.
       - name: The storage controller's records, on Kubernetes and on Postgres
         run: |
@@ -165,7 +166,17 @@ jobs:
           export LD_LIBRARY_PATH="$PWD/pg_install/v19/lib"
           storage_controller/kubernetes/test-stores.sh \
             cargo nextest run "${flags[@]}" --release --no-fail-fast \
-            -E 'package(storage_controller) & test(/^persistence::/)'
+            -E 'package(storage_controller) & (test(/^persistence::/) | test(/^records_tool::/))'
+
+      # An etcd restore under a running storage controller, for real (a snapshot saved, a later
+      # write, etcd restored with and without --bump-revision, the API server restarted on it):
+      # the controller must record that its records went back and exit, and the next start
+      # refuse (storage_controller/kubernetes/test-etcd-restore.sh).
+      - name: The storage controller under an etcd restore
+        run: |
+          .github/peat/etcd-tools.sh "$RUNNER_TEMP/etcd-tools"
+          KUBE_ASSETS="$RUNNER_TEMP/envtest" ETCD_TOOLS="$RUNNER_TEMP/etcd-tools" \
+            storage_controller/kubernetes/test-etcd-restore.sh target/release/storage_controller
 
       - name: Pack the binaries for the regression suite
         if: github.event_name != 'pull_request'
@@ -187,7 +198,7 @@ jobs:
       # After the pack above, since this overwrites target/release's copies of these programs.
       - name: Build the images' programs (default features)
         if: github.event_name != 'pull_request'
-        run: mold -run cargo build --locked --release --bin storage_broker --bin storage_controller --bin safekeeper --bin pageserver --bin compute_ctl
+        run: mold -run cargo build --locked --release --bin storage_broker --bin storage_controller --bin storcon_records --bin safekeeper --bin pageserver --bin compute_ctl
 
       - name: Pack the images' build context
         if: github.event_name != 'pull_request'

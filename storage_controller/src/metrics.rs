@@ -79,6 +79,10 @@ pub(crate) struct StorageControllerMetricGroup {
     /// How many shards are stuck and will be ignored when considering to run optimizations
     pub(crate) storage_controller_stuck_reconciles: measured::Gauge,
 
+    /// With the records in Kubernetes objects: the age, in whole seconds rounded up, of the
+    /// oldest change not yet in the copy in the bucket (0 when the copy is current)
+    pub(crate) storage_controller_records_copy_behind_seconds: measured::Gauge,
+
     /// HTTP request status counters for handled requests
     pub(crate) storage_controller_http_request_status:
         measured::CounterVec<HttpRequestStatusLabelGroupSet>,

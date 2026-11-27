@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # CI: pack the build context of Peat's images from a release build made with the default
 # features (not the regression suite's `--features testing`, which turns on the pageserver's
-# test-only HTTP API and other test-only code): the four storage programs, compute_ctl, and the
+# test-only HTTP API and other test-only code): the four storage programs and the storage controller's copy tool, compute_ctl, and the
 # installs of Postgres 18 and 19 without their headers and static libraries, with debug
 # information stripped (symbol names stay, so a backtrace still names its functions). Usage: package-images.sh <out.tar.zst>
 set -euo pipefail
 out=$1
 stage=$(mktemp -d)
 mkdir -p "$stage/bin" "$stage/pg"
-for bin in storage_broker storage_controller safekeeper pageserver compute_ctl; do
+for bin in storage_broker storage_controller storcon_records safekeeper pageserver compute_ctl; do
   cp "target/release/$bin" "$stage/bin/$bin"
 done
 for v in v18 v19; do

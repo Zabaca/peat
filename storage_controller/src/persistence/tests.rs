@@ -35,28 +35,15 @@ const KUBECONFIG_ENV: &str = "STORCON_TEST_KUBECONFIG";
 const DATABASE_URL_ENV: &str = "STORCON_TEST_DATABASE_URL";
 const REQUIRED_ENV: &str = "STORCON_TEST_STORES_REQUIRED";
 
-async fn kubernetes_store() -> Option<Persistence> {
-    Some(kubernetes_store_and_client().await?.0)
-}
-
-/// The Kubernetes store, with a client and namespace of its own for a test to change the objects
-/// behind the store's back (as an etcd restore would).
-async fn kubernetes_store_and_client() -> Option<(Persistence, kube::Client, String)> {
-    let (client, namespace) = kubernetes_client_and_namespace().await?;
-    let p = Persistence::kubernetes_with_client(client.clone(), namespace.clone());
-    p.migration_run().await.expect("the kinds are installed");
-    Some((p, client, namespace))
-}
-
-/// A client of the test API server, and a namespace of its own.
-async fn kubernetes_client_and_namespace() -> Option<(kube::Client, String)> {
-    let path = std::env::var(KUBECONFIG_ENV).ok()?;
+/// A namespace of its own on the test API server, the kubeconfig to reach it, and a client.
+pub(crate) async fn test_namespace_and_client() -> Option<(std::path::PathBuf, String, kube::Client)>
+{
+    let path = std::path::PathBuf::from(std::env::var(KUBECONFIG_ENV).ok()?);
     let kubeconfig = kube::config::Kubeconfig::read_from(&path).expect("read the test kubeconfig");
     let mut config = kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
         .await
         .expect("a client config from the test kubeconfig");
-    // The test API server is on this machine: never through a proxy the environment names.
-    config.proxy_url = None;
+    kubernetes::skip_proxy_where_excluded(&mut config);
     let client =
         kube::Client::try_from(kubernetes::client_config(config)).expect("a Kubernetes client");
     let namespace = format!("records-test-{}", uuid::Uuid::new_v4().simple());
@@ -71,10 +58,36 @@ async fn kubernetes_client_and_namespace() -> Option<(kube::Client, String)> {
         .create(&PostParams::default(), &ns)
         .await
         .expect("make the test's namespace");
+    Some((path, namespace, client))
+}
+
+async fn kubernetes_store() -> Option<Persistence> {
+    Some(kubernetes_store_and_client().await?.0)
+}
+
+/// A client of the test API server, and a namespace of its own.
+async fn kubernetes_client_and_namespace() -> Option<(kube::Client, String)> {
+    let (_, namespace, client) = test_namespace_and_client().await?;
     Some((client, namespace))
 }
 
-async fn postgres_store() -> Option<Persistence> {
+/// The Kubernetes store, with a client and namespace of its own for a test to change the objects
+/// behind the store's back (as an etcd restore would).
+async fn kubernetes_store_and_client() -> Option<(Persistence, kube::Client, String)> {
+    let (kubeconfig, namespace, client) = test_namespace_and_client().await?;
+    let p = Persistence::new_kubernetes(
+        Some(&kubeconfig),
+        Some(namespace.clone()),
+        KubernetesRecords::default(),
+    )
+    .await
+    .expect("a Kubernetes store");
+    p.migration_run().await.expect("the kinds are installed");
+    Some((p, client, namespace))
+}
+
+/// A new, empty database on the test Postgres server, by its address.
+pub(crate) async fn test_database() -> Option<String> {
     let url = std::env::var(DATABASE_URL_ENV).ok()?;
     let name = format!("storcon_test_{}", uuid::Uuid::new_v4().simple());
     let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -85,9 +98,8 @@ async fn postgres_store() -> Option<Persistence> {
         .batch_execute(&format!("CREATE DATABASE {name}"))
         .await
         .expect("make the test's database");
-    let mut config: tokio_postgres::Config = url.parse().unwrap();
-    config.dbname(&name);
-    let url = format!(
+    let config: tokio_postgres::Config = url.parse().unwrap();
+    Some(format!(
         "postgresql://{}@{}:{}/{name}",
         config.get_user().unwrap_or("postgres"),
         match &config.get_hosts()[0] {
@@ -96,14 +108,17 @@ async fn postgres_store() -> Option<Persistence> {
             tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().to_string(),
         },
         config.get_ports().first().copied().unwrap_or(5432),
-    );
-    let p = Persistence::new(url).await;
+    ))
+}
+
+async fn postgres_store() -> Option<Persistence> {
+    let p = Persistence::new(test_database().await?).await;
     p.migration_run().await.expect("run the migrations");
     Some(p)
 }
 
 /// Every store this environment provides, each empty.
-async fn stores() -> Vec<(&'static str, Arc<Persistence>)> {
+pub(crate) async fn stores() -> Vec<(&'static str, Arc<Persistence>)> {
     let mut out = Vec::new();
     if let Some(p) = postgres_store().await {
         out.push(("postgres", Arc::new(p)));
@@ -140,19 +155,19 @@ where
     }
 }
 
-const TENANT: &str = "1f359dd625e519a1a4e8d7509690f6fc";
-const TENANT_B: &str = "2c4f2a6b8f1e4d0c9a7b6e5d4c3b2a19";
-const TIMELINE: &str = "de200bd42b49cc1814412c7e592dd6e9";
+pub(crate) const TENANT: &str = "1f359dd625e519a1a4e8d7509690f6fc";
+pub(crate) const TENANT_B: &str = "2c4f2a6b8f1e4d0c9a7b6e5d4c3b2a19";
+pub(crate) const TIMELINE: &str = "de200bd42b49cc1814412c7e592dd6e9";
 
-fn tenant(s: &str) -> TenantId {
+pub(crate) fn tenant(s: &str) -> TenantId {
     TenantId::from_str(s).unwrap()
 }
 
-fn timeline(s: &str) -> TimelineId {
+pub(crate) fn timeline(s: &str) -> TimelineId {
     TimelineId::from_str(s).unwrap()
 }
 
-fn shard_id(t: &str, number: u8, count: u8) -> TenantShardId {
+pub(crate) fn shard_id(t: &str, number: u8, count: u8) -> TenantShardId {
     TenantShardId {
         tenant_id: tenant(t),
         shard_number: ShardNumber(number),
@@ -160,7 +175,7 @@ fn shard_id(t: &str, number: u8, count: u8) -> TenantShardId {
     }
 }
 
-fn shard_row(t: &str, number: i32, count: i32) -> TenantShardPersistence {
+pub(crate) fn shard_row(t: &str, number: i32, count: i32) -> TenantShardPersistence {
     TenantShardPersistence {
         tenant_id: t.to_string(),
         shard_number: number,
@@ -176,7 +191,7 @@ fn shard_row(t: &str, number: i32, count: i32) -> TenantShardPersistence {
     }
 }
 
-fn node_row(id: i64) -> NodePersistence {
+pub(crate) fn node_row(id: i64) -> NodePersistence {
     NodePersistence {
         node_id: id,
         scheduling_policy: String::from(NodeSchedulingPolicy::Active),
@@ -192,7 +207,7 @@ fn node_row(id: i64) -> NodePersistence {
     }
 }
 
-fn node(id: i64) -> crate::node::Node {
+pub(crate) fn node(id: i64) -> crate::node::Node {
     crate::node::Node::from_persistent(node_row(id), false).unwrap()
 }
 
@@ -605,7 +620,7 @@ async fn leader() {
     .await;
 }
 
-fn safekeeper_upsert(id: i64, version: i64) -> SafekeeperUpsert {
+pub(crate) fn safekeeper_upsert(id: i64, version: i64) -> SafekeeperUpsert {
     SafekeeperUpsert {
         id,
         region_id: "region-1".to_string(),
@@ -663,7 +678,7 @@ async fn safekeepers() {
     .await;
 }
 
-fn timeline_row(t: &str, tl: &str) -> TimelinePersistence {
+pub(crate) fn timeline_row(t: &str, tl: &str) -> TimelinePersistence {
     TimelinePersistence {
         tenant_id: t.to_string(),
         timeline_id: tl.to_string(),
@@ -677,7 +692,7 @@ fn timeline_row(t: &str, tl: &str) -> TimelinePersistence {
     }
 }
 
-fn op(
+pub(crate) fn op(
     t: &str,
     tl: &str,
     sk: i64,
@@ -1098,7 +1113,7 @@ async fn put_back<S: kubernetes::objects::Spec>(
 /// would exit), and nothing is written; so is a plain read, and a list that misses an object.
 #[tokio::test]
 async fn a_read_of_records_that_went_back_writes_nothing() {
-    use kubernetes::objects::{PageserverSpec, TenantSpec};
+    use kubernetes::objects::TenantSpec;
     let Some((p, client, ns)) = kubernetes_store_and_client().await else {
         return;
     };
@@ -1134,7 +1149,22 @@ async fn a_read_of_records_that_went_back_writes_nothing() {
             .is_err()
     );
 
-    // An object gone that this controller saw and did not delete
+    // From then on it answers nothing
+    let Err(err) = p.list_nodes().await else {
+        panic!("a halted store answers nothing");
+    };
+    assert!(err.to_string().contains("answers nothing"), "{err}");
+}
+
+/// An object gone that this controller saw and did not delete: the store went back under it.
+#[tokio::test]
+async fn a_list_missing_a_seen_object_writes_nothing() {
+    use kubernetes::objects::PageserverSpec;
+    let Some((p, client, ns)) = kubernetes_store_and_client().await else {
+        return;
+    };
+    p.insert_node(&node(1)).await.unwrap();
+    p.insert_node(&node(2)).await.unwrap();
     raw::<PageserverSpec>(&client, &ns)
         .delete("pageserver-2", &Default::default())
         .await
@@ -1143,6 +1173,10 @@ async fn a_read_of_records_that_went_back_writes_nothing() {
         panic!("a list that misses a seen object is refused");
     };
     assert!(err.to_string().contains("pageserver-2 is gone"), "{err}");
+    assert!(
+        p.insert_node(&node(3)).await.is_err(),
+        "and nothing is written after"
+    );
 }
 
 /// A tenant whose generation label went back (lost while its revision did not move) is left out

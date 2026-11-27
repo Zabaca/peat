@@ -9,7 +9,7 @@
 set -euo pipefail
 storage=$1; compute=$2; compute19=$3
 run() { docker run --rm --network none "$@"; }
-for bin in storage_broker storage_controller safekeeper pageserver; do
+for bin in storage_broker storage_controller storcon_records safekeeper pageserver; do
   run --entrypoint "/usr/local/bin/$bin" "$storage" --help > /dev/null
   echo "storage: $bin starts"
 done
