@@ -17,6 +17,8 @@ nix.workspace = true
 once_cell.workspace = true
 pem.workspace = true
 humantime-serde.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
 hyper0.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json"] }
