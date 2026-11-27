@@ -1,13 +1,22 @@
 // One pass of an upgrade's current step: the work its phase does to the cluster and what it waits for, bounded by the Platform's
-// upgrades.checkSeconds (past it the upgrade halts there, with why). The check before and after each step is the whole platform's: every
+// upgrades.checkTimeout (past it the upgrade halts there, with why). The check before and after each step is the whole platform's: every
 // piece ready and the storage settled (storage.ts).
 import { durationMs } from '../api/schema'
 import { ok, type Kube } from '../kube'
 import type { Resolved } from './platform'
 import type { Storage } from './storage'
-import { nextPhase, overdue, type Phase, type UpgradeState } from './upgrade'
+import { RELEASE_ANNOTATION } from './render'
+import { nextPhase, overdue, pageserverOf, type Phase, type UpgradeState } from './upgrade'
 
 export interface StepWork { state: UpgradeState; message: string }
+
+/** The pieces (as the status names them) a step moves. */
+export function piecesOf(step: string): string[] {
+  if (step === 'controller') return ['storage-controller', 'storage-broker']
+  if (step === 'gateways') return ['peat-gateway']
+  if (step === 'control') return ['peat-control']
+  return [step]
+}
 
 const imageOf = (o: any): string => String(o?.spec?.template?.spec?.containers?.[0]?.image ?? o?.spec?.containers?.[0]?.image ?? '')
 const deploymentDone = (o: any, image: string) => o && imageOf(o) === image && (o.status?.observedGeneration ?? 0) >= (o.metadata?.generation ?? 0) && (o.status?.updatedReplicas ?? 0) >= (o.spec?.replicas ?? 1) && (o.status?.readyReplicas ?? 0) >= (o.spec?.replicas ?? 1) && (o.status?.replicas ?? 0) <= (o.spec?.replicas ?? 1)
@@ -35,18 +44,39 @@ export async function runStep(k: Kube, r: Resolved, storage: Storage, u: Upgrade
     if (overdue(u, now, bound)) return { state: { ...u, ...extra, halted: { at, step, reason: `${phase}: ${why} (for more than ${r.spec.upgrades.checkTimeout})` } }, message: `halted at ${step}: ${why}` }
     return { state: { ...u, ...extra }, message: `${step}, ${phase}: ${why}` }
   }
-  const pageserverId = step.startsWith('pageserver-w') ? Number(step.slice('pageserver-w'.length)) : 0
+  const pageserverId = pageserverOf(step)
+  const ownNode = new RegExp(`\\bnode ${pageserverId}\\b`)
 
   if (phase === 'precheck' || phase === 'postcheck') {
-    const problems = [...notReady.map((x) => `${x} is not ready`), ...(await storage.problems(psIds).catch((e) => [String(e)]))]
+    // the step's own piece is left out of the check before it: on the way back it is the broken piece the way back mends (so it can never
+    // be ready first), and its node may still read Draining or PauseForRestart from an earlier attempt at this step
+    const own = (name: string) => piecesOf(step).includes(name)
+    const back = phase === 'precheck' && u.direction === 'back'
+    const storageProblems = (await storage.problems(back && pageserverId ? psIds.filter((x) => x !== pageserverId) : psIds).catch((e) => [String(e)]))
+      .filter((x) => !(phase === 'precheck' && pageserverId && (back ? ownNode.test(x) : /^node \d+ scheduling is/.test(x) && ownNode.test(x))))
+    const problems = [...notReady.filter((x) => !(back && own(x))).map((x) => `${x} is not ready`), ...storageProblems]
+    // a keeper is restarted only with the others answering (a write needs two of three) and no keeper replacement open (the control layer
+    // is moving a member)
+    if (step.startsWith('safekeeper-w') && phase === 'precheck') {
+      const open = await k.request('GET', `/api/v1/namespaces/${ns}/configmaps?labelSelector=peat-sk-open%3Dtrue`)
+      if (open.status !== 200) problems.push(`the keeper replacements could not be read: ${open.status}`)
+      else if ((open.json.items as any[]).length) problems.push(`a keeper replacement is open: ${(open.json.items as any[]).map((x) => x.metadata.name).join(', ')}`)
+    }
     const lastCheck = { at, passed: problems.length === 0, message: problems.length ? problems.slice(0, 5).join('; ') : 'every piece ready, the storage settled' }
     if (problems.length) return wait(`the platform is not settled: ${lastCheck.message}`, { lastCheck })
-    if (phase === 'precheck' && step.startsWith('pageserver-w') && count > 1) await storage.drain(pageserverId)
+    // the drain is asked in the draining phase, once the status says the step is there (a pass that dies between leaves nothing unrecorded)
     return advance(`${step}: the check passed`, { lastCheck })
   }
   if (phase === 'draining') {
+    const n = await storage.node(pageserverId)
+    // a pageserver that is not available has nothing attached to drain (the controller moved its shards when it went): on the way back the
+    // broken one is restarted at once
+    if (n && n.availability !== 'Active' && u.direction === 'back') return advance(`pageserver ${pageserverId} is not available: nothing to drain`)
     const d = await storage.drained(pageserverId)
-    return d.done ? advance(`pageserver ${pageserverId} drained`) : wait(`draining: ${d.why}`)
+    if (d.done) return advance(`pageserver ${pageserverId} drained`)
+    // asked again whenever the node reads Active: a drain the controller ended (its own restart, a cancel) is started again
+    if (n && n.scheduling === 'Active') await storage.drain(pageserverId)
+    return wait(`draining: ${d.why}`)
   }
   if (phase === 'applying') {
     // the operator's own pieces were rendered at the step's images in this pass; a safekeeper is the control layer's StatefulSet, changed here
@@ -58,10 +88,16 @@ export async function runStep(k: Kube, r: Resolved, storage: Storage, u: Upgrade
         ...((live.spec.template.spec.initContainers ?? []) as any[]).map((_: unknown, i: number) => ({ op: 'replace', path: `/spec/template/spec/initContainers/${i}/image`, value: target.storage })),
       ]
       ok(await k.request('PATCH', path, ops, 'application/json-patch+json'), `move ${step}`)
+      // its release stamp too, so the status reads the release it now runs
+      ok(await k.request('PATCH', path, { metadata: { annotations: { [RELEASE_ANNOTATION]: target.release } } }, 'application/merge-patch+json'), `mark ${step}'s release`)
     }
     return advance(`${step}: its new image applied`)
   }
   if (phase === 'restarting') {
+    // the pod is deleted only once its StatefulSet's template carries the new image: a pod made again from an older template comes back on
+    // the old image (a template held back, for example as an adopted object's pending change)
+    const sts = await k.request('GET', `/apis/apps/v1/namespaces/${ns}/statefulsets/${step}`)
+    if (sts.status !== 200 || imageOf(sts.json) !== target.storage) return wait(`its StatefulSet's template does not carry ${target.storage}${sts.status === 200 ? ` (it has ${imageOf(sts.json)}: a pending change? requests.applyPending applies it)` : ''}`)
     const podPath = `/api/v1/namespaces/${ns}/pods/${step}-0`
     const pod = await k.request('GET', podPath)
     if (pod.status === 200 && imageOf(pod.json) !== target.storage && !pod.json.metadata?.deletionTimestamp) {

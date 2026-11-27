@@ -178,15 +178,42 @@ export const ADOPTED = `${GROUP}/adopted`
  * labels are not either: taking an object over is what adds them.
  */
 export function differences(want: unknown, live: unknown, path = ''): string[] {
-  if (path === '.metadata.labels' || path === '.metadata.annotations' || path === '.stringData') return []
+  if (path === '.metadata.labels') return []
+  // the annotations the operator sets, less its release stamp (which an upgrade moves on its own); another tool's are not its business
+  if (path === '.metadata.annotations') return differences(Object.fromEntries(Object.entries((want ?? {}) as Record<string, unknown>).filter(([a]) => a !== RELEASE_ANNOTATION)), live ?? {}, '.metadata.annotations.')
+  if (path === '.stringData') return []
   if (want === null || typeof want !== 'object') return JSON.stringify(want) === JSON.stringify(live) ? [] : [`${path || '.'}: ${JSON.stringify(live) ?? 'none'} would be ${JSON.stringify(want)}`.slice(0, 240)]
   if (Array.isArray(want)) {
     if (!Array.isArray(live) || live.length !== want.length) return [`${path}: ${Array.isArray(live) ? `${live.length} items` : JSON.stringify(live) ?? 'none'} would be ${want.length} items`]
     return want.flatMap((w, i) => differences(w, live[i], `${path}[${i}]`))
   }
   if (!live || typeof live !== 'object' || Array.isArray(live)) return [`${path}: none would be set`]
-  return Object.entries(want as Record<string, unknown>).flatMap(([k2, v]) => differences(v, (live as Record<string, unknown>)[k2], `${path}.${k2}`))
+  const out = Object.entries(want as Record<string, unknown>).flatMap(([k2, v]) => differences(v, (live as Record<string, unknown>)[k2], path.endsWith('.') ? `${path}${k2}` : `${path}.${k2}`))
+  // a Secret's stringData is written as its data: each value compared, base64, with the live data's (never printed: a key's name only)
+  if (path === '' && (want as any)?.stringData && typeof (want as any).stringData === 'object') {
+    const data = ((live as any).data ?? {}) as Record<string, string>
+    for (const [key2, v] of Object.entries((want as any).stringData as Record<string, string>)) if (Buffer.from(String(v)).toString('base64') !== data[key2]) out.push(`.data.${key2}: its value would change`)
+  }
+  return out
 }
+
+/**
+ * The images the platform runs, read from its live objects: for a status an earlier operator wrote without them, where a guess from the
+ * release's name would miss an install that pins its images. Null when the pieces are not all there to read.
+ */
+async function liveImages(k: Kube, r: Resolved, release: string): Promise<Images | null> {
+  const dep = async (ns: string, name: string) => { const a = await k.request('GET', `/apis/apps/v1/namespaces/${ns}/deployments/${name}`); return a.status === 200 ? a.json : null }
+  const [controller, control] = await Promise.all([dep(r.names.namespace, 'storage-controller'), dep(r.names.namespace, 'peat-control')])
+  const image = (o: any) => String(o?.spec?.template?.spec?.containers?.[0]?.image ?? '')
+  const env = (name: string) => ((control?.spec?.template?.spec?.containers?.[0]?.env ?? []) as any[]).find((e) => e.name === name)?.value as string | undefined
+  const c18 = env('COMPUTE_IMAGE'), c19 = env('COMPUTE_IMAGE_PG19')
+  if (!image(controller) || !image(control) || !c18 || !c19) return null
+  return { release, storage: image(controller), control: image(control), compute: { 18: c18, 19: c19 } }
+}
+
+/** Fields an object cannot change in place: a difference there is one an apply would be refused (422). */
+const IMMUTABLE = [/^\.spec\.selector\b/, /^\.spec\.volumeClaimTemplates\b/, /^\.spec\.serviceName\b/, /^\.spec\.template\b/]
+const immutableFor = (kind: string) => (path: string) => IMMUTABLE.some((re, i) => re.test(path) && (i < 3 ? kind === 'StatefulSet' || (i === 0 && kind === 'Deployment') : kind === 'Job'))
 
 /** One pass. Returns what it did, for the log and the tests. */
 export interface Deps { storage?: (r: Resolved, keys: Record<string, string>) => Storage; now?: () => Date }
@@ -237,18 +264,21 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
     const live = await k.request('GET', pathOf(m))
     if (live.status === 200) {
       const ours = m.kind === 'Namespace' || (await owned.ours(key(m), live.json))
-      // an object listed in adopt: one the record does not hold is taken into it (an install made another way, or a record lost or
-      // restored with new UIDs); either way, a difference between it and what the operator would make is listed as a pending change and
-      // not applied until requests.applyPending asks
-      // an adopted object stays as it was taken over (marked adopted) until requests.applyPending asks, whether or not it is still listed
-      if (adoptList.has(key(m)) || (ours && live.json.metadata?.labels?.[ADOPTED] === 'true')) {
+      // an object listed in adopt that the record does not hold is taken into it (an install made another way, or a record lost or restored
+      // with new UIDs), and stays as it was taken over (marked adopted, listed or not): a difference between it and what the operator would
+      // make is listed as a pending change and applied only when requests.applyPending asks
+      // once in the record with nothing left pending (the adopted mark gone), it is the operator's like any other, listed or not: a later change,
+      // an upgrade's included, is applied, never held as pending
+      if ((adoptList.has(key(m)) && !ours) || (ours && live.json.metadata?.labels?.[ADOPTED] === 'true')) {
         if (!ours) {
           await owned.made(key(m), String(live.json.metadata.uid))
           ok(await k.request('PATCH', pathOf(m), { metadata: { labels: { [MANAGED_BY]: OPERATOR, [PLATFORM_LABEL]: r.name, [ADOPTED]: 'true' } } }, 'application/merge-patch+json'), `adopt ${key(m)}`)
         }
         const diff = differences(m, live.json)
-        if (diff.length && !applyPending) {
-          pending.push({ kind: m.kind, ...(m.metadata.namespace ? { namespace: m.metadata.namespace } : {}), name: m.metadata.name, change: diff.slice(0, 8).join('; ') + (diff.length > 8 ? `; and ${diff.length - 8} more` : '') })
+        // a difference in a field that cannot change in place is never applied (it would be refused on every pass): said as such
+        const fixed = diff.filter((d) => immutableFor(m.kind)(d))
+        if (diff.length && (!applyPending || fixed.length)) {
+          pending.push({ kind: m.kind, ...(m.metadata.namespace ? { namespace: m.metadata.namespace } : {}), name: m.metadata.name, change: (fixed.length ? `cannot be applied in place (${fixed.slice(0, 3).join('; ')}): make the object again by hand, or leave it; ` : '') + diff.slice(0, 8).join('; ') + (diff.length > 8 ? `; and ${diff.length - 8} more` : '') })
           return
         }
         ok(await serverApply(k, m, FIELD_MANAGER), `apply ${key(m)}`)
@@ -261,6 +291,12 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
       if (!ours) {
         refused.push(`${key(m)} exists and was not made by the operator: left alone (adopt takes an object into the record${owned.fresh ? "; the operator's record was made new on this pass: if the operator made it before, list it under adopt to take it back" : ''})`)
         return
+      }
+      // a Job's template cannot change (the API server answers 422): a Job the operator made whose template differs is deleted and made again
+      if (m.kind === 'Job' && differences((m as any).spec?.template, live.json.spec?.template).length) {
+        ok(await k.request('DELETE', pathOf(m), { apiVersion: 'v1', kind: 'DeleteOptions', propagationPolicy: 'Background', preconditions: { uid: String(live.json.metadata.uid) } }), `remove ${key(m)} to make it again`, [404])
+        await owned.forget(key(m))
+        return applyOne(m)
       }
       ok(await serverApply(k, m, FIELD_MANAGER), `apply ${key(m)}`)
     } else {
@@ -303,7 +339,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
 
   // the upgrade: decided before anything is applied, so each piece is rendered at the release its step has reached
   const status = (p.status ?? {}) as any
-  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? imagesOf(spec, String(status.release)) } : undefined
+  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? (await liveImages(k, r, String(status.release))) ?? imagesOf(spec, String(status.release)) } : undefined
   const sks = await k.request('GET', `/apis/apps/v1/namespaces/${r.names.namespace}/statefulsets?labelSelector=${sel({ 'peat-sk': 'true' })}`)
   const skNames = sks.status === 200 ? (sks.json.items as any[]).map((x) => String(x.metadata.name)) : []
   const decision = decide({ release: spec.release, images: r.images, running, state: status.upgrade as UpgradeState | undefined, steps: stepsOf(r.placements.pageservers.map((x) => x.id), skNames), retry: spec.requests?.retry, quietHours: spec.upgrades.quietHours, now })
@@ -365,9 +401,13 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   if (live?.halted) return done('Halted', `the upgrade to ${live.direction === 'forward' ? live.to : live.from} halted at ${live.halted.step}: ${live.halted.reason}. peat retry goes on from there; setting ${live.direction === 'forward' ? live.from : live.to} takes back what moved`, { ...more, ...midway }, counts)
   if (decision.kind === 'pause') return done('Paused', `the upgrade to ${live!.direction === 'forward' ? live!.to : live!.from} waits for the quiet hours (${decision.window}) to end: ${live!.moved.length} of ${live!.steps.length} steps moved`, { ...more, ...midway }, counts)
   if (live) return done('Upgrading', `${live.direction === 'forward' ? `${live.from} to ${live.to}` : `back from ${live.to} to ${live.from}`}: ${stepMessage}`, { ...more, ...midway }, counts)
-  if (decision.kind === 'finish') return done(notReady.length ? 'Installing' : 'Ready', `the upgrade ${decision.state.direction === 'forward' ? 'to' : 'back to'} ${decision.release} is done: every piece runs it`, { ...more, release: decision.release, images: decision.images }, counts)
-  const phase = notReady.length || refused.length ? 'Installing' : 'Ready'
-  const message = refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`
+  if (decision.kind === 'finish') return done(notReady.length || pending.length ? 'Installing' : 'Ready', `the upgrade ${decision.state.direction === 'forward' ? 'to' : 'back to'} ${decision.release} is done: every piece runs it`, { ...more, release: decision.release, images: decision.images }, counts)
+  // an adopt entry naming nothing the operator makes is said, not silently ignored
+  const unmatched = [...adoptList].filter((a) => !rendered.some((m) => key(m) === a))
+  const note = unmatched.length ? `; adopt names ${unmatched.join(', ')}, which the platform does not make: nothing is taken over for ${unmatched.length === 1 ? 'it' : 'them'}` : ''
+  // a pending change keeps the platform from Ready: what runs is not yet what is declared
+  const phase = notReady.length || refused.length || pending.length ? 'Installing' : 'Ready'
+  const message = (refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : pending.length ? `${pending.length} pending change${pending.length === 1 ? '' : 's'} wait for requests.applyPending (status.pendingChanges)` : `every piece is ready on ${spec.release}`) + note
   // the release every piece runs, recorded once all are ready on it: what the next upgrade starts from
   return done(phase, message, { ...more, namespaces: spec.namespaces, ...(phase === 'Ready' && !running ? { release: spec.release, images: r.images } : {}) }, counts)
 }
