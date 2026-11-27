@@ -576,6 +576,8 @@ t0=$(date +%s); until ss_pod=$(ready_pod peat-compute compute=ss18) && [ -n "$ss
 k -n peat-compute port-forward "pod/$ss_pod" 25432:5432 >>"$work/tunnel-ss.log" 2>&1 &
 pids+=($!); ss_tunnel=$!
 tunnel_up 25432
+( i=0; while :; do i=$((i+1)); printf 'insert into w values (%d);\n\\echo ok %d\n' "$i" "$i"; sleep 0.3; done ) | psql "host=127.0.0.1 port=25432 user=app dbname=app sslmode=disable connect_timeout=10" -XAtq -v ON_ERROR_STOP=1 >"$work/ss-written" 2>"$work/ss-writer.err" &
+pids+=($!); ss_writer=$!
 # during the move: its grant names exactly its two pods, its source and its target; a pod of another database named in its ask (as a
 # control layer that misbehaves would) is not granted
 t0=$(date +%s); until grant=$(k -n peat-compute get role peat-move-ss18 -o jsonpath='{.rules[0].resourceNames}' 2>/dev/null) && case "$grant" in *'","'*) true;; *) false;; esac; do [ "$(since "$t0")" -lt 300 ] || fail 'the move ran with no exec grant of its two pods'; sleep 0.5; done
@@ -589,8 +591,6 @@ case "$(k -n peat-compute get role peat-move-ss18 -o jsonpath='{.rules[0].resour
 [ "$(k "${as[@]}" auth can-i create pods/"$other_pod" --subresource=exec -n peat-compute 2>/dev/null)" = no ] || fail "the control layer may exec into another database's pod $other_pod"
 echo "  the move's grant is its two pods; $other_pod, another database's, named in its ask, is not granted"
 pkill -P "$first_held" 2>/dev/null || true; kill "$first_held" 2>/dev/null || true
-( i=0; while :; do i=$((i+1)); printf 'insert into w values (%d);\n\\echo ok %d\n' "$i" "$i"; sleep 0.3; done ) | psql "host=127.0.0.1 port=25432 user=app dbname=app sslmode=disable connect_timeout=10" -XAtq -v ON_ERROR_STOP=1 >"$work/ss-written" 2>"$work/ss-writer.err" &
-pids+=($!); ss_writer=$!
 t0=$(date +%s); until state=$(k -n shop get database ss18 -o jsonpath='{.status.move.state}') && case "$state" in done|failed|refused) true;; *) false;; esac; do
   [ "$(since "$t0")" -lt 900 ] || fail "ss18's move did not end in 900 s: $state"
   sleep 2
