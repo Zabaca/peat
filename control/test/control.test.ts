@@ -313,6 +313,12 @@ describe('the program\'s settings for the pieces it makes', () => {
     expect(script).toContain('exec /usr/local/bin/safekeeper -D $d --id')
     expect(script).not.toContain('/data')
     expect(t.initContainers[0].command[2]).toContain(`mkdir -p /vol/sk-${baseOptions.id}; chown 1000:1000 /vol/sk-${baseOptions.id}`)
+    // its folder wiped under it: the liveness probe fails; the restart makes the folder again and finds it empty, which for a registered member
+    // the may-start-empty guard refuses (lost, replaced), never a quiet rejoin
+    expect(t.initContainers[0].command[2]).toStartWith('set -eu; chown 1000:1000 /vol; ')
+    expect(t.containers[0].livenessProbe).toEqual({ exec: { command: ['/bin/sh', '-c', `test -d /vol/sk-${baseOptions.id}`] }, periodSeconds: 10, failureThreshold: 2 })
+    expect(script).toContain('d=/vol/sk-$id\nmkdir -p $d\nif [ ! -s $d/identity ]; then')
+    expect(script.indexOf('mkdir -p $d')).toBeLessThan(script.indexOf('/sk/$id/may-start-empty'))
   })
 
   test('nothing the program writes turns on rel_size_v2 (under which a drop_dbdir change of the storage reaches Postgres 18)', () => {

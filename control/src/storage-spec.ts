@@ -59,6 +59,7 @@ export function safekeeperScript(o: Pick<SafekeeperOptions, 'id' | 'namespace' |
   return `set -eu
 id=${o.id}
 d=/vol/sk-$id
+mkdir -p $d
 if [ ! -s $d/identity ]; then
   i=0
   while :; do
@@ -114,7 +115,7 @@ export function safekeeperStatefulSet(o: SafekeeperOptions): Record<string, any>
               image: o.image,
               securityContext: { runAsUser: 0 },
               // the directory of this safekeeper in the machine's volume: made and owned for uid 1000 (the safekeeper's), and only its own (never the volume's other directories)
-              command: ['/bin/sh', '-c', `set -eu; mkdir -p /vol/${dir}; chown 1000:1000 /vol/${dir}`],
+              command: ['/bin/sh', '-c', `set -eu; chown 1000:1000 /vol; mkdir -p /vol/${dir}; chown 1000:1000 /vol/${dir}`],
               volumeMounts: [{ name: 'volume', mountPath: '/vol' }],
             },
           ],
@@ -131,6 +132,9 @@ export function safekeeperStatefulSet(o: SafekeeperOptions): Record<string, any>
               ports: [{ containerPort: 5454 }, { containerPort: 7676 }],
               resources: o.resources,
               readinessProbe: { httpGet: { path: '/v1/status', port: 7676 }, periodSeconds: 5 },
+              // its folder gone under it (a volume wiped): the kubelet restarts it, and its start finds the folder empty, which for a registered
+              // member is refused (the control layer's may-start-empty): it is treated as lost and replaced, never back as a healthy member
+              livenessProbe: { exec: { command: ['/bin/sh', '-c', `test -d /vol/${dir}`] }, periodSeconds: 10, failureThreshold: 2 },
               volumeMounts: [
                 { name: 'volume', mountPath: '/vol' },
                 { name: 'auth', mountPath: '/auth' },
