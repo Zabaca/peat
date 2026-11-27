@@ -153,7 +153,7 @@ describe('the control layer\'s account', () => {
     ],
     'peat-compute': [
       { group: '', resource: 'pods', verbs: ['get', 'list', 'delete'] },
-      { group: '', resource: 'pods/exec', verbs: ['create'] },
+      { group: '', resource: 'pods/exec', verbs: ['create', 'get'] },
       { group: '', resource: 'secrets', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },
       { group: 'apps', resource: 'deployments', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },
       { group: 'cert-manager.io', resource: 'certificates', verbs: ['get', 'list', 'create', 'update', 'patch', 'delete'] },

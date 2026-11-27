@@ -105,6 +105,52 @@ platform.spec` and `kubectl explain database.spec` print the same text. In short
   `requests.rehearseMove`. Its `status` says where to connect (`host`, `serviceHost`, `port`), the login Secret and the authority's
   certificate in the database's own namespace.
 
+## Moving a database to a newer Postgres version
+
+Raising a Database's `spec.pgVersion` (or `peat move <db> --pg 19`) moves it to the newer version under its own name, address, port and
+login. Neon has no in-place major upgrade, so a move is a copy, in the control layer's background, with its state in `status.move`:
+
+- A new timeline of the newer version is made in the database's own tenant, and a compute of its own (an internal name, `mv-...`) is
+  started on it.
+- The door is shut (`phase: Moving`: new connections are refused, open sessions ended) for the copy's length.
+- A temporary superuser, `peat_move_<hex>`, is made on the old compute. The new compute reads the old one over TLS as that role,
+  verified against the platform's authority:
+  - every role (its password's verifier, its attributes, its memberships), then every database (each object made by its own owner);
+  - and loads it all locally.
+- Both sides are compared: the database list, the roles, and every database's tables (rows hashed), views, sequences, functions,
+  triggers, types, indexes, constraints, privileges and default privileges. A database holding what the comparison cannot read (a
+  foreign table) fails the move, and the message names it.
+- Equal, the database's record is pointed at the new timeline and version, and the door opens. The old timeline is kept as a stopped
+  database `<name>-pg<old>` for `keepOldFor` (30 days by default), then deleted, its data then held as any deleted database's.
+
+A failed move switches nothing, opens the door and waits for `requests.retryMove` (`peat move <db> --retry`). A rehearsal
+(`requests.rehearseMove: 19@<anything>`, `peat move <db> --pg 19 --rehearse`) copies and compares with the door open and switches
+nothing; `status.move.seconds` is how long the copy took. While the old copy is kept, `requests.moveBack` (`peat move <db> --back`) goes
+back: the door is shut and the database compared with its old copy, and only if they are the same (nothing written since the move) is
+the record pointed back at the old timeline. A database written since is refused; copying it down to the older version is by hand. A
+restore of a moved database to a moment before its move is refused, and names the old copy, which holds that history. A replica does
+not move, nor a database that has replicas (delete them, move, make them again); branches stay on the old version.
+
+What a move leaves out of the copy and the comparison, matched by exact name, never a prefix:
+- the compute's own roles (`cloud_admin`, `neon_superuser`, the platform's login `app`, which each side's compute makes, and the move's
+  own `peat_move_*`);
+- the compute's own schemas `neon` and `neon_migration`, its extension `neon`, and its table `public.health_check` in the database
+  `postgres`.
+
+A person's role granted to `app`, and a person's role's membership in `neon_superuser`, are copied.
+
+What guards it:
+- The control layer may exec only into the two pods a move lists in the ConfigMap `peat-move-execs`, only `psql` or
+  `bash /move/copy.sh` (the script the operator renders into the compute namespace, which the control layer cannot write). An admission
+  rule enforces it; with no list, no exec passes.
+- The rule does not bound `psql`'s arguments, so within a listed pod the control layer may run any SQL as its local superuser while the
+  move lasts.
+- The temporary role is reachable through the gateways like any login (the front door passes TLS through and never sees a user's name).
+  Its protection is its 256-bit random password, a validity of 10 minutes renewed every 3, a limit of four connections, and its drop on
+  every exit: success, failure, and a control layer that restarted (the next attempt drops every `peat_move_` role it finds).
+- The copy's password and the roles' verifiers are held in memory only, never logged or stored.
+- Only a move's target compute may reach another compute's port.
+
 ## The command
 
 `peat` (`src/cli/peat.ts`: `bun src/cli/peat.ts`, or the one-file program for Linux and macOS that CI builds on main and attaches,

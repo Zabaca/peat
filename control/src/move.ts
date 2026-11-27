@@ -77,7 +77,9 @@ export function filterGlobals(sql: string): { sql: string; roles: string[] } {
     const grant = new RegExp(`^GRANT ${ROLE_NAME} TO ${ROLE_NAME}[ ;]`).exec(line)
     if (create) { const r = unquote(create[1]!); if (isPlatformRole(r)) continue; roles.push(r); out.push(line); continue }
     if (alter) { if (isPlatformRole(unquote(alter[1]!))) continue; out.push(line); continue }
-    if (grant) { if (isPlatformRole(unquote(grant[2]!))) continue; out.push(line); continue }
+    // a membership of one of the platform's roles is the compute's own (the target's compute makes it again), except a person's role granted
+    // to the platform's login (GRANT reporter TO app); a membership of a person's role is the person's, in whatever role (neon_superuser too)
+    if (grant) { const [granted, grantee] = [unquote(grant[1]!), unquote(grant[2]!)]; if (isPlatformRole(grantee) && (grantee !== 'app' || isPlatformRole(granted))) continue; out.push(line); continue }
     if (/^(CREATE|ALTER|GRANT|REVOKE|DROP|COMMENT|SECURITY) /i.test(line) && !/^(SET|SELECT) /.test(line)) throw new Error(`the source's globals hold a statement the move does not read: ${line.split(' ').slice(0, 3).join(' ')}`)
     out.push(line)
   }
@@ -91,7 +93,7 @@ const SYSTEM = `('pg_catalog', 'information_schema', 'pg_toast', ${PLATFORM_SCHE
 export const DATABASES_SQL = `select datname from pg_database where not datistemplate order by 1;\n`
 /** Every role but the platform's and the moves', with its attributes, the md5 of its password's verifier (never the verifier) and its memberships. */
 export const ROLES_SQL = `select 'role ' || rolname || ' super=' || rolsuper || ' inherit=' || rolinherit || ' createrole=' || rolcreaterole || ' createdb=' || rolcreatedb || ' login=' || rolcanlogin || ' replication=' || rolreplication || ' bypassrls=' || rolbypassrls || ' limit=' || rolconnlimit || ' verifier=' || coalesce(md5(rolpassword), '-') || ' until=' || coalesce(rolvaliduntil::text, '-') from pg_authid where rolname !~ '^pg_' and rolname not like '${MOVE_ROLE_PREFIX}%' and rolname not in (${PLATFORM_ROLES.map(lit).join(', ')}) order by rolname;
-select 'member ' || m.rolname || ' in ' || g.rolname || ' admin=' || a.admin_option || ' inherit=' || a.inherit_option || ' set=' || a.set_option from pg_auth_members a join pg_roles m on m.oid = a.member join pg_roles g on g.oid = a.roleid where m.rolname !~ '^pg_' and m.rolname not like '${MOVE_ROLE_PREFIX}%' and m.rolname not in (${PLATFORM_ROLES.map(lit).join(', ')}) order by 1;
+select 'member ' || m.rolname || ' in ' || g.rolname || ' admin=' || a.admin_option || ' inherit=' || a.inherit_option || ' set=' || a.set_option from pg_auth_members a join pg_roles m on m.oid = a.member join pg_roles g on g.oid = a.roleid where m.rolname !~ '^pg_' and m.rolname not like '${MOVE_ROLE_PREFIX}%' and m.rolname not in ('cloud_admin', 'neon_superuser') and not (m.rolname = 'app' and (g.rolname ~ '^pg_' or g.rolname in (${PLATFORM_ROLES.map(lit).join(', ')}))) order by 1;
 `
 
 /**

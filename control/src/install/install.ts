@@ -43,6 +43,8 @@ export function installManifests(image: string): Record<string, unknown>[] {
         // pods: read, and deleted (an upgrade restarts a pageserver by deleting its pod); the operator makes none. patch on nodes: the control layer's grant, held so it can be given
         { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'watch', 'delete'] },
         { apiGroups: [''], resources: ['nodes'], verbs: ['get', 'list', 'watch', 'patch'] },
+        // exec: the control layer's grant in the compute namespace (a major-version move's copy), held so it can be given; the operator runs none
+        { apiGroups: [''], resources: ['pods/exec'], verbs: ['create', 'get'] },
         { apiGroups: ['apps'], resources: ['deployments', 'statefulsets'], verbs: ALL },
         { apiGroups: ['batch'], resources: ['jobs'], verbs: ALL },
         { apiGroups: ['networking.k8s.io'], resources: ['networkpolicies'], verbs: ALL },

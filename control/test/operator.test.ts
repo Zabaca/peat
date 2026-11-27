@@ -415,6 +415,19 @@ describe('what a client of a database needs, in its own namespace', () => {
     expect(r.pruned).toBe(0)
     expect(k.get('v1', 'secrets', 'peat-db', 'orders-login')).toBeDefined()
   })
+  test('a database whose status is wiped for a pass keeps its published login the operator\'s', async () => {
+    k.put(platform())
+    await reconcile(k)
+    k.put({ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'db-orders-login', namespace: 'peat' }, data: { password: Buffer.from('pw').toString('base64') } })
+    const rec = { tenant: 'a'.repeat(32), timeline: 'b'.repeat(32), pgVersion: 19, phase: 'Ready', record: { mode: 'primary', root: true, parent: '', port: 15010 } }
+    k.put({ apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Database', metadata: { name: 'orders', namespace: 'shop' }, spec: {}, status: rec })
+    await reconcile(k)
+    k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status = {}
+    await reconcile(k)
+    k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status = rec
+    const r = await reconcile(k)
+    expect(r.refused).toEqual([])
+  })
   test('a person\'s own Secret of the login\'s name is left alone, and the status does not name it as the login', async () => {
     k.put(platform())
     await reconcile(k)
@@ -445,6 +458,15 @@ describe('a one-machine trial', () => {
 })
 
 describe('the install file', () => {
+  test('the operator holds every right it grants the control layer (the API server refuses to grant one it does not hold)', async () => {
+    const op = (installManifests('img') as any[]).find((m) => m.kind === 'ClusterRole')
+    const holds = (group: string, resource: string, verb: string) => op.rules.some((r: any) => r.apiGroups.includes(group) && (r.resources.includes(resource) || r.resources.includes('*')) && (r.verbs.includes(verb) || r.verbs.includes('*')))
+    k.put(platform())
+    await reconcile(k)
+    const granted = [...k.all('roles'), ...k.all('clusterroles')].filter((x) => x.metadata.name !== 'peat-operator').flatMap((x) => x.rules ?? [])
+    const missing = granted.flatMap((r: any) => r.apiGroups.flatMap((g: string) => r.resources.flatMap((res: string) => r.verbs.filter((v: string) => !holds(g, res, v)).map((v: string) => `${g}/${res} ${v}`))))
+    expect(missing).toEqual([])
+  })
   test('the kinds, the operator\'s namespace, its account and its Deployment of the image given', () => {
     const m = installManifests('ghcr.io/zabaca/peat/control:release-2026-12-01') as any[]
     expect(m.filter((x) => x.kind === 'CustomResourceDefinition').map((x) => x.metadata.name)).toContain('platforms.peat.zabaca.com')

@@ -29,7 +29,7 @@ since() { echo "$(( $(date +%s) - $1 ))"; }
 pids=()
 finish() {
   rc=$?
-  for p in "${pids[@]}"; do pkill -P "$p" 2>/dev/null || true; kill "$p" 2>/dev/null || true; done
+  for p in ${pids[@]+"${pids[@]}"}; do pkill -P "$p" 2>/dev/null || true; kill "$p" 2>/dev/null || true; done
   if [ "$rc" != 0 ]; then
     echo "::group::the cluster as the test left it"
     k get platform -o yaml 2>/dev/null | sed -n '/^  status:/,$p' || true
@@ -365,6 +365,74 @@ peatc status | grep -q '^peat: Ready' || fail 'peat status does not say Ready'
 echo "  the compiled command: make, list, url, ca, branch (30 rows), restore to a moment (10 rows), stop, close, open, delete and status, each through the kubeconfig"
 
 upgrade_s=''; max_gap=''
+step "the exec guard, judged by the API server, as the control layer's account"
+as_control=(--as=system:serviceaccount:peat:peat-control)
+# a compute awake to try against (first, woken now: the computes sleep after a minute)
+curl -fsS -X POST localhost:18080/db/first/start >/dev/null || fail 'first was not woken for the guard checks'
+t0=$(date +%s); until guard_pod=$(k -n peat-compute get pods -l compute=first --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) && [ -n "$guard_pod" ]; do [ "$(since "$t0")" -lt 120 ] || fail 'no compute to try the exec guard on'; sleep 2; done
+k -n peat-compute wait --for=condition=Ready "pod/$guard_pod" --timeout=120s >/dev/null
+refused_exec() { # refused_exec <what> <expected message part> <exec args...>
+  local what=$1 want=$2; shift 2
+  local out; out=$(k "${as_control[@]}" -n peat-compute exec "$@" 2>&1) && fail "the exec guard let through: $what"
+  grep -qF "$want" <<< "$out" || fail "the exec guard refused $what, but not as expected: $out"
+  echo "  refused: $what"
+}
+refused_exec 'an exec with no move under way (the list not there)' 'no params found' "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1'
+k -n peat create configmap peat-move-execs --from-literal="probe=some-other-pod" >/dev/null
+sleep 3
+refused_exec 'an exec into a compute no move lists' 'is not one' "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1'
+k -n peat patch configmap peat-move-execs --type merge -p "{\"data\":{\"probe\":\"$guard_pod\"}}" >/dev/null
+sleep 3
+refused_exec 'a command other than psql or the move script, in a listed pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- ls /
+refused_exec 'bash with a script of its own, in a listed pod' 'may run psql or bash /move/copy.sh only' "$guard_pod" -c compute -- bash -c id
+[ "$(k "${as_control[@]}" -n peat-compute exec "$guard_pod" -c compute -- psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc 'select 1')" = 1 ] || fail 'the exec guard refused psql in a listed pod'
+echo "  allowed: psql in a listed pod"
+k -n peat delete configmap peat-move-execs >/dev/null
+
+step "a database moved from Postgres 18 to 19 under its own name (P2), with a second database and a second role of its own"
+dbobj mv18 'pgVersion: 18'
+phase_is mv18 Ready 120
+t0=$(date +%s); until k -n shop get secret mv18-login >/dev/null 2>&1; do [ "$(since "$t0")" -lt 60 ] || fail 'mv18 has no login'; sleep 2; done
+mv_password=$(k -n shop get secret mv18-login -o jsonpath='{.data.password}' | base64 -d)
+mvsql() { PGPASSWORD="${3:-$mv_password}" psql "host=mv18.peat-db.svc hostaddr=127.0.0.1 port=15432 user=${4:-app} dbname=${2:-app} sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'mv18 did not answer'; sleep 3; done
+case "$(mvsql 'show server_version_num')" in 18*) ;; *) fail 'mv18 is not on Postgres 18';; esac
+mvsql 'create table items (id int primary key, note text)'
+mvsql "insert into items select g, md5(g::text) from generate_series(1, 500) g"
+mvsql "create role reporter login password 'reporter-pw'"
+mvsql 'grant reporter to app'
+mvsql 'create database reports owner reporter'
+mvsql 'create table r (i int)' reports reporter-pw reporter
+mvsql 'insert into r select generate_series(1, 42)' reports reporter-pw reporter
+mvsql 'create view r_view as select i from r where i > 40' reports reporter-pw reporter
+move_done() { # move_done <seconds>: the move's state once it ends
+  local t0 state; t0=$(date +%s)
+  until state=$(k -n shop get database mv18 -o jsonpath='{.status.move.state}') && case "$state" in done|failed|refused) true;; *) false;; esac; do
+    [ "$(since "$t0")" -lt "$1" ] || fail "mv18's move did not end in $1 s: $(k -n shop get database mv18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
+    sleep 3
+  done
+  echo "$state"
+}
+k -n shop patch database mv18 --type merge -p '{"spec":{"requests":{"rehearseMove":"19@r1"}}}' >/dev/null
+t0=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.request}')" = '19@r1' ]; do [ "$(since "$t0")" -lt 60 ] || fail 'the rehearsal was not taken up'; sleep 2; done
+[ "$(move_done 600)" = 'done' ] || fail "the rehearsal failed: $(k -n shop get database mv18 -o jsonpath='{.status.move.message}')"
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.move.equal}/{.status.pgVersion}')" = 'true/18' ] || fail 'the rehearsal did not compare equal, or switched'
+echo "  the rehearsal: $(k -n shop get database mv18 -o jsonpath='{.status.move.message}')"
+t0=$(date +%s)
+k -n shop patch database mv18 --type merge -p '{"spec":{"pgVersion":19}}' >/dev/null
+t1=$(date +%s); until [ "$(k -n shop get database mv18 -o jsonpath='{.status.move.rehearsal}')" != true ]; do [ "$(since "$t1")" -lt 60 ] || fail 'the move was not taken up'; sleep 2; done
+[ "$(move_done 900)" = 'done' ] || fail "the move failed: $(k -n shop get database mv18 -o jsonpath='{.status.move.message}')"
+move_s=$(since "$t0")
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}')" = '19/Ready' ] || fail "mv18 is not Ready on 19: $(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}: {.status.message}')"
+[ "$(k -n shop get secret mv18-login -o jsonpath='{.data.password}' | base64 -d)" = "$mv_password" ] || fail 'the move changed the login'
+t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'mv18 did not answer after the move'; sleep 3; done
+case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but not on Postgres 19';; esac
+[ "$(mvsql 'select count(*) from items')" = 500 ] || fail 'the rows of app are not all on 19'
+[ "$(mvsql 'select count(*) from r_view' reports reporter-pw reporter)" = 2 ] || fail 'the second role, its password or its database did not come with the move'
+[ "$(k -n shop get database mv18-pg18 -o jsonpath='{.status.pgVersion}')" = 18 ] || fail 'the old copy mv18-pg18 was not kept'
+if k -n peat get configmap peat-move-execs -o jsonpath='{.data}' 2>/dev/null | grep -q shop; then fail 'the move left pods listed for exec'; fi
+echo "  moved in $move_s s, under its own name, address and login: 500 rows in app, reporter's database and view, its old copy mv18-pg18 kept on 18"
+
 if [ -n "${UPGRADE_FROM:-}" ]; then
   step "the upgrade from $UPGRADE_FROM to this run's images, a writer and a reader running throughout"
   curl -fsS -X POST localhost:18080/db -H 'content-type: application/json' -d '{"name":"upg"}' >/dev/null || fail 'the upgrade test database was not made'

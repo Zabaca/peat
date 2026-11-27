@@ -152,7 +152,10 @@ async function published(k: Kube, r: Resolved, keys: Record<string, string>, caP
   if (caPublished) for (const ns of [...new Set(dbs.map((d) => d.metadata.namespace as string))].filter((x) => x !== r.names.dbNamespace).sort()) out.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(CA_CONFIG_MAP, ns, dbs.filter((d) => d.metadata.namespace === ns && d.metadata.uid)), data: { 'ca.crt': keys['ca.crt'] ?? '' } })
   for (const d of dbs) {
     const rec = d.status?.record
-    if (!d.status?.tenant || !rec || d.metadata.deletionTimestamp) continue
+    if (d.metadata.deletionTimestamp) continue
+    // a database whose status has no record (being made, or its status lost and about to be written again from the platform's record):
+    // its published login is left as it is, neither written nor forgotten, so the next pass still knows it as the operator's
+    if (!d.status?.tenant || !rec) { keep.add(`Secret/${d.metadata.namespace}/${d.metadata.name}-login`); continue }
     const root = rec.root ? d.metadata.name : rec.parent
     const login = ok(await k.request('GET', `/api/v1/namespaces/${r.names.namespace}/secrets/db-${root}-login`), `read the login of ${root}`, [404])
     // a login not there (a make that has not written it yet): the copy is left as it is, neither written nor pruned

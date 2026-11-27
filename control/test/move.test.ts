@@ -48,6 +48,8 @@ describe('the globals', () => {
     expect(f.roles).toEqual(['lake_reader', 'Lake Writer'])
     for (const kept of ["ALTER ROLE lake_reader WITH NOSUPERUSER", 'CREATE ROLE "Lake Writer";', "ALTER ROLE lake_reader SET statement_timeout TO '30s';", 'GRANT lake_reader TO "Lake Writer"', 'GRANT neon_superuser TO lake_reader', 'SET client_encoding', '\\restrict abc']) expect(f.sql).toContain(kept)
     for (const left of ['CREATE ROLE app;', 'CREATE ROLE cloud_admin;', 'CREATE ROLE neon_superuser;', 'peat_move_1a2b', 'GRANT neon_superuser TO app', 'GRANT pg_monitor TO neon_superuser']) expect(f.sql).not.toContain(left)
+    // a person's role granted to the platform's login is the person's, and kept
+    expect(filterGlobals('GRANT reporter TO app WITH INHERIT TRUE GRANTED BY cloud_admin;').sql).toContain('GRANT reporter TO app')
   })
   test('a statement it does not read stops the move rather than pass unread', () => {
     expect(() => filterGlobals("CREATE TABLESPACE x LOCATION '/x';")).toThrow('a statement the move does not read: CREATE TABLESPACE x')

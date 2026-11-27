@@ -11,7 +11,8 @@
 //   peat replica <of> <db>                                 a read replica of <of>
 //   peat stop <db>                                         put it to sleep now (the next connection wakes it)
 //   peat close <db> | peat open <db>                       refuse every connection until it is opened
-//   peat move <db> --pg <version> [--rehearse]             not in this release: refused (the release that moves a database to a newer version turns it on)
+//   peat move <db> --pg <version> [--rehearse]             move it to a newer Postgres version under its own name, address and login (a rehearsal copies and compares only)
+//   peat move <db> --retry | --back                        try a failed move again; go back to the last move's version while its old copy is kept
 //   peat delete <db> --yes                                 delete it: its compute at once, its data after the platform's hold
 //   peat url <db>                                          its connection URL (from its login Secret)
 //   peat ca [<db>]                                         the authority's certificate, for sslmode=verify-full (the one <db>'s status names)
@@ -54,7 +55,7 @@ export function parsePg(v: string | undefined): 18 | 19 {
 export function parseArgs(argv: string[]): { words: string[]; opts: Record<string, string | true> } {
   const words: string[] = [], opts: Record<string, string | true> = {}
   const takes = new Set(['n', 'namespace', 'kubeconfig', 'context', 'timeout', 'pg', 'at'])
-  const flags = new Set(['A', 'all-namespaces', 'no-wait', 'yes', 'rehearse', 'help', 'h'])
+  const flags = new Set(['A', 'all-namespaces', 'no-wait', 'yes', 'rehearse', 'retry', 'back', 'help', 'h'])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
     // -n<value> run together, as kubectl takes it
@@ -116,6 +117,7 @@ const describe = (o: any): string => {
     ...(o.spec?.parent ? [`  made from ${o.spec.parent}${o.spec.at ? ` at ${o.spec.at}` : ''}`] : []),
     ...(o.spec?.replicaOf ? [`  a replica of ${o.spec.replicaOf}`] : []),
     ...(s.message ? [`  ${s.message}`] : []),
+    ...(s.move?.state ? [`  ${s.move.rehearsal ? 'rehearsal' : 'move'} to Postgres ${s.move.to}: ${s.move.state}${s.move.seconds ? ` (copied in ${s.move.seconds} s)` : ''}${s.move.oldDatabase && s.move.state === 'done' ? `; the old copy ${s.move.oldDatabase} is kept until ${s.move.deleteOldAfter}` : ''}`] : []),
   ].join('\n')
 }
 
@@ -190,8 +192,35 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
         out.line(`${o.metadata.namespace}/${o.metadata.name}${where}: ${verb === 'close' ? 'closed: every connection is refused until it is opened' : 'open'}`)
         return 0
       }
-      // not in this release: a version raised now would be moved, unasked, by the release that carries moves out
-      case 'move': throw new Refused('the move to a newer Postgres version is not in this release: nothing was changed')
+      case 'move': {
+        const o = await find(checkName(a))
+        const at = new Date((deps.now ?? Date.now)()).toISOString()
+        const moveDone = (x: any) => ['done', 'failed', 'refused', 'back'].includes(String(x.status?.move?.state))
+        const said = (x: any) => { const mv = x.status?.move ?? {}; return `${o.metadata.namespace}/${o.metadata.name}${where}: ${mv.state ?? 'asked'}: ${mv.message ?? x.status?.message ?? ''}` }
+        const follow = async (asked: (x: any) => boolean, what: string) => {
+          if (!wait) { out.line(`${o.metadata.namespace}/${o.metadata.name}${where}: ${what} asked; peat show ${a} follows it`); return 0 }
+          const x = await waitFor(k, o.metadata.namespace, o.metadata.name, (y) => asked(y) && moveDone(y), { ...w, timeoutS: Math.max(w.timeoutS, 1800), what: `${what} finished` })
+          out.line(said(x))
+          return ['done', 'back'].includes(String(x.status?.move?.state)) ? 0 : 1
+        }
+        if (opts['back']) {
+          await patch(o, { spec: { requests: { moveBack: at } } })
+          return await follow((y) => y.status?.answered?.moveBack === at && y.status?.phase !== 'Moving', 'the way back')
+        }
+        if (opts['retry']) {
+          await patch(o, { spec: { requests: { retryMove: at } } })
+          return await follow((y) => y.status?.move?.request === at, 'a retry of the move')
+        }
+        const pg = parsePg(typeof opts['pg'] === 'string' ? opts['pg'] : undefined)
+        if (opts['rehearse']) {
+          const request = `${pg}@${at}`
+          await patch(o, { spec: { requests: { rehearseMove: request } } })
+          return await follow((y) => y.status?.move?.request === request, `a rehearsal of the move to Postgres ${pg}`)
+        }
+        if (Number(o.status?.pgVersion ?? 0) >= pg) throw new Refused(`${a} runs Postgres ${o.status?.pgVersion}: a move goes to a newer version`)
+        await patch(o, { spec: { pgVersion: pg } })
+        return await follow((y) => y.status?.move?.to === pg && !y.status?.move?.rehearsal, `the move to Postgres ${pg}`)
+      }
       case 'delete': {
         const o = await find(checkName(a))
         if (!opts['yes']) { out.line(`deleting ${o.metadata.namespace}/${a}${where} removes its compute now and its data after the platform's hold: add --yes`); return 1 }
@@ -252,7 +281,7 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
 const HELP = [
   'peat: a platform\'s databases, through your own Kubernetes login',
   '  peat list [-n <namespace> | -A]', '  peat show <db>', '  peat make <db> [--pg 18|19]', '  peat branch <from> <db>', '  peat restore <from> <db> --at <time | log position>',
-  '  peat replica <of> <db>', '  peat stop <db>', '  peat close <db> | peat open <db>', '  peat delete <db> --yes', '  peat url <db>', '  peat ca [<db>]', '  peat status', '  peat retry [<platform>]',
+  '  peat replica <of> <db>', '  peat stop <db>', '  peat close <db> | peat open <db>', '  peat move <db> --pg 19 [--rehearse] | --retry | --back', '  peat delete <db> --yes', '  peat url <db>', '  peat ca [<db>]', '  peat status', '  peat retry [<platform>]',
   'options: -n/--namespace (default: the kubeconfig context\'s), -A (look a database up in every namespace), --kubeconfig, --context, --no-wait, --timeout <seconds>',
 ]
 

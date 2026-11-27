@@ -372,8 +372,9 @@ export function controlAccount(r: Resolved): Manifest[] {
   return [
     { apiVersion: 'v1', kind: 'ServiceAccount', metadata: meta(r, CONTROL_ACCOUNT, n.namespace) },
     ...role(r, n.namespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['secrets', 'configmaps'], CRUD), rule(['apps'], ['statefulsets'], ['get', 'list', 'create', 'update', 'delete']), rule(['batch'], ['jobs'], ['get']), rule(['coordination.k8s.io'], ['leases'], ['get', 'list', 'create', 'update', 'patch'])]),
-    // pods/exec: the major-version move's copy runs psql and its fixed script in a move's two computes (the exec guard bounds it)
-    ...role(r, n.computeNamespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['pods/exec'], ['create']), rule([''], ['secrets'], CRUD), rule(['apps'], ['deployments'], CRUD), rule(['cert-manager.io'], ['certificates'], CRUD)]),
+    // pods/exec: the major-version move's copy runs psql and its fixed script in a move's two computes (the exec guard bounds it); an exec
+    // over a WebSocket is a GET, so it needs get as well as create
+    ...role(r, n.computeNamespace, [rule([''], ['pods'], ['get', 'list', 'delete']), rule([''], ['pods/exec'], ['create', 'get']), rule([''], ['secrets'], CRUD), rule(['apps'], ['deployments'], CRUD), rule(['cert-manager.io'], ['certificates'], CRUD)]),
     ...role(r, n.dbNamespace, [rule([''], ['services'], ['get', 'list', 'create', 'update', 'delete'])]),
     ...role(r, n.gatewayNamespace, [rule([''], ['pods'], ['get', 'list', 'delete'])]),
     { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: meta(r, `${CONTROL_ACCOUNT}-nodes`), rules: [rule([''], ['nodes'], ['get', 'list', 'patch'])] },
