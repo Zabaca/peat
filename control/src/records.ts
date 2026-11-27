@@ -158,8 +158,9 @@ export async function orphanedTenant(d: Deps, name: string, tenant: string): Pro
   const login = await loginOf(d, name)
   if (login.state !== 'marked' || login.tenant === tenant) return null
   const held = ok(await d.kube('GET', `${cms(d)}?labelSelector=${HELD_LABEL}%3Dtrue`), 'list held deletions').json.items as any[]
-  if (held.some((h) => h.data?.tenant === login.tenant)) return null
-  if ([...(await readRecords(d)).values()].some((r) => r.db.tenant === login.tenant)) return null
+  // only a root, recorded or held, names the tenant its login is for: a branch of it left alone means its root's record was lost too
+  if (held.some((h) => h.data?.tenant === login.tenant && h.data?.root === 'true')) return null
+  if ([...(await readRecords(d)).values()].some((r) => r.db.tenant === login.tenant && r.db.root)) return null
   const there = await d.storcon('GET', `/v1/tenant/${login.tenant}/timeline`)
   return there.status === 200 ? login.tenant : null
 }
@@ -184,8 +185,24 @@ export async function claimPort(d: Deps, owner: string, timeline: string, base: 
 }
 
 // ---- deleting
-/** A deleted database's data is held: `held-<name>-<timeline>` records it until `after` (null: never; the epoch: at once), and its record goes. */
+/**
+ * A port kept for `name`: its claim made (owned by the name and `timeline`), or kept when it is already the name's (a record from before
+ * claims has none). False when another database claims it.
+ */
+async function reservePort(d: Deps, name: string, timeline: string, port: number): Promise<boolean> {
+  const made = await d.kube('POST', cms(d), { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: `port-${port}`, namespace: d.ns, labels: { [PORT_LABEL]: 'true' } }, data: { owner: name, timeline } })
+  if (made.status !== 409) { ok(made, `claim port ${port}`); return true }
+  const claim = ok(await d.kube('GET', `${cms(d)}/port-${port}`), `read the claim of port ${port}`).json
+  // the name's claim, whatever timeline it names (a recovery moves a database to a new timeline and keeps its port)
+  return claim.data?.owner === name
+}
+
+/**
+ * A deleted database's data is held: `held-<name>-<timeline>` records it until `after` (null: never; the epoch: at once), its port stays
+ * claimed (so no database made during the hold is given it), and its record goes.
+ */
 export async function hold(d: Deps, r: Db, after: Date | null, now: Date = new Date()): Promise<void> {
+  if (r.port > 0 && !(await reservePort(d, r.name, r.timeline, r.port))) d.log?.(`hold: ${r.name}: port ${r.port} is claimed by another database: its held record keeps the number, and bringing it back is refused while the claim stands`)
   await apply(d, cms(d), heldName(r.name, r.timeline), {
     apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: heldName(r.name, r.timeline), namespace: d.ns, labels: { [HELD_LABEL]: 'true' } },
     data: { ...recordData(r), name: r.name, deletedAt: now.toISOString(), deleteAfter: after ? after.toISOString() : 'never' },
@@ -272,7 +289,8 @@ async function directParent(d: Deps, r: Db, all: Db[], recoveredTo: Map<string, 
  * superseded); an object a copy left half made is finished; then each record is compared with its object (ids, kind, port, version, when
  * made), with the storage (its timeline is there) and with its login (the root's login names its tenant). `dry` reads and compares only,
  * listing what would be copied as missing. `held` names deleted databases to bring back from their held data, refused when the name is in
- * use now, the data is gone, its namespace is gone, or (a branch or a replica) its root's login is now another database's. A record that
+ * use now (or by another brought back in the same call), its hold ended and its data was removed, its timeline is not in the store, its
+ * namespace is gone, its port is another database's, or (a branch or a replica) its root's login is now another database's. A record that
  * cannot be copied is listed as refused and the rest go on. Nothing is deleted or changed in the old records but their label, and the tenant
  * marked on a login from before logins carried one.
  */
@@ -282,34 +300,54 @@ export async function copyRecords(d: Deps, opts: { dry: boolean; held?: string[]
   let objs = await objects()
   let recs = await readRecords(d)
   // held databases asked back: the record is written again from the held data and the copy below makes the object
-  const liveOf = () => [...recs.values()].map((x) => x.db).concat(objs.map(fromStatus).filter((x): x is Db => x !== null))
+  const restored: Db[] = []
+  const liveOf = () => [...recs.values()].map((x) => x.db).concat(objs.map(fromStatus).filter((x): x is Db => x !== null), restored)
   for (const selector of opts.held ?? []) {
     const [name, timeline] = selector.split('@') as [string, string | undefined]
     const refuse = (why: string) => { out.refused.push({ name: selector, why }) }
-    const held = (ok(await d.kube('GET', `${cms(d)}?labelSelector=${HELD_LABEL}%3Dtrue`), 'list held deletions').json.items as any[]).filter((h) => h.data?.name === name && (!timeline || h.data?.timeline === timeline))
-    const h = held.sort((a, b) => String(b.data.deletedAt).localeCompare(String(a.data.deletedAt)))[0]
-    if (!h) { refuse('no held data of that name (its hold is over and it was removed, or it was never deleted)'); continue }
-    if (recs.has(name) || objs.some((o) => o.metadata.name === name)) { refuse('the name is in use now: delete that database first'); continue }
-    const r = fromConfigMap({ metadata: { name: `db-${name}`, creationTimestamp: h.metadata.creationTimestamp }, data: h.data }, d.dbNs)
-    const root = r.root ? r.name : r.parent
-    const login = await loginOf(d, root)
-    if (r.root ? login.state === 'marked' && login.tenant !== r.tenant && liveOf().some((x) => x.root && x.name === root) : !loginIsTenants(login, root, r.tenant, liveOf())) {
-      refuse(`its root's login db-${root}-login is now another database's: bring ${root} back first`)
-      continue
+    let made: Answer | null = null, recorded = false
+    try {
+      const held = (ok(await d.kube('GET', `${cms(d)}?labelSelector=${HELD_LABEL}%3Dtrue`), 'list held deletions').json.items as any[]).filter((h) => h.data?.name === name && (!timeline || h.data?.timeline === timeline))
+      const h = held.sort((a, b) => String(b.data.deletedAt).localeCompare(String(a.data.deletedAt)))[0]
+      if (!h) { refuse('no held data of that name (its hold ended and its data was removed, or it was never deleted)'); continue }
+      if (recs.has(name) || objs.some((o) => o.metadata.name === name) || restored.some((x) => x.name === name)) { refuse('the name is in use now: delete that database first'); continue }
+      const r = fromConfigMap({ metadata: { name: `db-${name}`, creationTimestamp: h.metadata.creationTimestamp }, data: h.data }, d.dbNs)
+      const root = r.root ? r.name : r.parent
+      const login = await loginOf(d, root)
+      if (r.root ? login.state === 'marked' && login.tenant !== r.tenant && liveOf().some((x) => x.root && x.name === root) : !loginIsTenants(login, root, r.tenant, liveOf())) {
+        refuse(`its root's login db-${root}-login is now another database's: bring ${root} back first`)
+        continue
+      }
+      const stored = await d.storcon('GET', `/v1/tenant/${r.tenant}/timeline`)
+      if (stored.status === 404 || (stored.status === 200 && !(stored.json as any[]).some((x) => x.timeline_id === r.timeline))) { refuse('its timeline is no longer in the store'); continue }
+      ok(stored, `list the timelines of ${r.tenant}`)
+      if (r.port > 0 && liveOf().some((x) => x.port === r.port)) { refuse(`its port ${r.port} is another database's now`); continue }
+      if (timeline === undefined && held.length > 1) d.log?.(`records copy: ${name}: the newest of ${held.length} held deletions (${r.timeline}); name another with ${name}@<timeline>`)
+      if (opts.dry) { out.restored.push(`${name}@${r.timeline}`); continue }
+      if (r.port > 0 && !(await reservePort(d, name, r.timeline, r.port))) { refuse(`its port ${r.port} is claimed by another database`); continue }
+      // its object first, marked as being copied (the loops leave it alone): the namespace must be there, and nothing is released before it is
+      const from = await directParent(d, r, liveOf(), new Map())
+      if (from.guessed) out.parentGuessed.push(name)
+      made = await d.kube('POST', `${DB_API}/namespaces/${r.namespace}/databases`, { apiVersion: `${GROUP}/v1alpha1`, kind: 'Database', metadata: { name, namespace: r.namespace, finalizers: [FINALIZER], annotations: { [COPYING]: 'true' } }, spec: { pgVersion: r.pg, ...(r.root ? {} : r.mode === 'replica' ? { replicaOf: from.name } : { parent: from.name }) } })
+      if (made.status === 404) { made = null; refuse(`its namespace ${r.namespace} is gone: make it again first`); continue }
+      ok(made, `bring back ${name}`)
+      r.from = from.name
+      if (r.root) await ensureLogin(d, name, r.tenant, () => randomBytes(12).toString('hex'), true)
+      await writeRecord(d, r)
+      recorded = true
+      ok(await d.kube('DELETE', `${cms(d)}/${h.metadata.name}`), `release ${h.metadata.name}`, [404])
+      restored.push(r)
+      out.restored.push(`${name}@${r.timeline}`)
+    } catch (e) {
+      // a restore that failed after its object was made takes back what it wrote: the record (its held data is still held) and the object
+      if (made) {
+        if (recorded) await d.kube('DELETE', `${cms(d)}/db-${name}`).catch(() => {})
+        const uid = made.json?.metadata?.uid
+        await d.kube('PATCH', dbObjectPath(made.json?.metadata?.namespace ?? d.dbNs, name), { metadata: { finalizers: null } }, 'application/merge-patch+json').catch(() => {})
+        await d.kube('DELETE', dbObjectPath(made.json?.metadata?.namespace ?? d.dbNs, name), uid ? { preconditions: { uid } } : undefined).catch(() => {})
+      }
+      refuse(String(e).slice(0, 300))
     }
-    if (timeline === undefined && held.length > 1) d.log?.(`records copy: ${name}: the newest of ${held.length} held deletions (${r.timeline}); name another with ${name}@<timeline>`)
-    if (opts.dry) { out.restored.push(`${name}@${r.timeline}`); continue }
-    // its object first, marked as being copied (the loops leave it alone): the namespace must be there, and nothing is released before it is
-    const from = await directParent(d, r, liveOf(), new Map())
-    if (from.guessed) out.parentGuessed.push(name)
-    const made = await d.kube('POST', `${DB_API}/namespaces/${r.namespace}/databases`, { apiVersion: `${GROUP}/v1alpha1`, kind: 'Database', metadata: { name, namespace: r.namespace, finalizers: [FINALIZER], annotations: { [COPYING]: 'true' } }, spec: { pgVersion: r.pg, ...(r.root ? {} : r.mode === 'replica' ? { replicaOf: from.name } : { parent: from.name }) } })
-    if (made.status === 404) { refuse(`its namespace ${r.namespace} is gone: make it again first`); continue }
-    ok(made, `bring back ${name}`)
-    r.from = from.name
-    if (r.root) await ensureLogin(d, name, r.tenant, () => randomBytes(12).toString('hex'), true)
-    await writeRecord(d, r)
-    ok(await d.kube('DELETE', `${cms(d)}/${h.metadata.name}`), `release ${h.metadata.name}`, [404])
-    out.restored.push(`${name}@${r.timeline}`)
   }
   if (!opts.dry && out.restored.length) objs = await objects()
   if (!opts.dry && out.restored.length) recs = await readRecords(d)

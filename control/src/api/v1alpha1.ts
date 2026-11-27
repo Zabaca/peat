@@ -78,7 +78,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
     databases: str("Each database's name inside the cluster (an ExternalName Service per database), and the ConfigMap peat-ca: the authority's public certificate (ca.crt), which every namespace that holds a Database also gets.", { default: 'peat-db' }),
   }, { default: { platform: 'peat', computes: 'peat-compute', gateways: 'peat-gateway', databases: 'peat-db' }, ...rules(
     ['self == oldSelf', 'the namespaces cannot change: the platform\'s pieces and its data live in them'],
-    ["[self.platform, self.computes, self.gateways, self.databases].all(n, n != 'default' && !n.startsWith('kube-'))", 'a namespace of the platform may not be default or one of the kube- namespaces'],
+    ["[self.platform, self.computes, self.gateways, self.databases].all(n, n != 'default' && n != 'peat-system' && !n.startsWith('kube-'))", "a namespace of the platform may not be default, the operator's peat-system or one of the kube- namespaces"],
   ) }),
   machines: obj('The machines the platform runs on.', {
     label: label('The label that marks them: the operator places every piece on these and the control layer probes and taints these and no other.', { key: `${GROUP}/machine`, value: 'true' }),
@@ -150,7 +150,7 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
   }, { default: {} }),
   keys: obj('The keys the platform signs with. None given: the operator makes them once and keeps them.', {
     authSecret: str("A Secret in the platform namespace holding the Ed25519 pair the storage's tokens are signed with (auth_private_key.pem, auth_public_key.pem)."),
-    caSecret: str("A Secret in the platform namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key): the platform namespace holds every key; clients get only its certificate (the ConfigMap peat-ca). With certificates.issuer, name the issuer's authority here, so peat-ca carries the certificate that signs the databases'."),
+    caSecret: str("A Secret in the platform namespace holding the certificate authority that signs the databases' certificates (tls.crt, tls.key): the platform namespace holds every key; clients get only its certificate (the ConfigMap peat-ca). With certificates.issuer, a Secret holding the issuer's certificate alone (tls.crt or ca.crt), so peat-ca carries the certificate that signs the databases': its key is never read, needed or kept."),
   }, { default: {} }),
   control: obj('The control layer.', {
     replicas: int('How many pods; one acts at a time.', { minimum: 1, maximum: 5, default: 2 }),

@@ -87,7 +87,7 @@ jobs:
       - name: Install build dependencies
         run: .github/peat/install-deps.sh
 
-      # Peat builds and tests Postgres 18 (James, 2026-11-18) and, since the port, 19. The
+      # Peat builds and tests Postgres 18 (the maintainer's decision of 2026-11-18) and, since the port, 19. The
       # walproposer library the safekeeper's simulation tests link is built against 18
       # (Makefile, libs/walproposer/build.rs; Neon builds it against 17). What else the tree
       # needs to compile: the headers of 14 to 17, from which postgres_ffi generates its
