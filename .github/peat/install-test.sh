@@ -263,19 +263,39 @@ then_count=$(shop 'select count(*) from items' orders-then.peat-db.svc)
 [ "$(shop 'select count(*) from items' "$shop_host")" = 3000 ] || fail 'the parent changed'
 echo "  the branch reads 3000 rows; the restore to $moment reads 1000; orders still 3000"
 
-echo "== closed, then opened"
+echo "== its status wiped, then written again from the platform's record"
+before=$(k -n shop get database orders -o jsonpath='{.status.tenant}/{.status.timeline}/{.status.record.port}')
+k -n shop patch database orders --subresource=status --type merge -p '{"status":null}'
+phase_is orders Ready 60
+after=$(k -n shop get database orders -o jsonpath='{.status.tenant}/{.status.timeline}/{.status.record.port}')
+[ "$after" = "$before" ] || fail "the status was not written again from the record: $before became $after"
+# while its status had no record the gateways had no route for it: a client is refused until the next pass writes it again
+t0=$(date +%s); until [ "$(shop 'select count(*) from items' "$shop_host" 2>/dev/null)" = 3000 ]; do [ "$(since "$t0")" -lt 60 ] || fail 'after the status was written again, orders does not read its rows'; sleep 2; done
+echo "  the same tenant, timeline and port, and the 3000 rows, $(since "$t0") s later"
+
+echo "== closed with a client reconnecting, then opened"
+# a pooled client: a connection every 100 ms, so one arrives the moment the close ends the sessions
+( while :; do shop 'select 1' "$shop_host" >/dev/null 2>&1 || true; sleep 0.1; done ) &
+pool=$!
+sleep 3
 k -n shop patch database orders --type merge -p '{"spec":{"closed":true}}'
 phase_is orders Closed 60
+sleep 10
+kill "$pool" 2>/dev/null || true; wait "$pool" 2>/dev/null || true
+[ "$(k -n peat-compute get deployment compute-orders -o jsonpath='{.spec.replicas}')" = 0 ] || fail 'a client reconnecting as the database closed woke it'
+if k -n peat-compute get pods -l compute=orders -o name 2>/dev/null | grep -q .; then fail 'a closed database still runs a compute'; fi
+[ "$(k -n shop get database orders -o jsonpath='{.status.awake}')" = false ] || fail 'a closed database reads awake'
 if shop 'select 1' "$shop_host" >/dev/null 2>&1; then fail 'a closed database admitted a connection'; fi
 k -n shop patch database orders --type merge -p '{"spec":{"closed":false}}'
 phase_is orders Ready 60
 t0=$(date +%s); until shop 'select count(*) from items' "$shop_host" >/dev/null 2>&1; do [ "$(since "$t0")" -lt 120 ] || fail 'an opened database did not admit a connection'; sleep 3; done
-echo "  a connection refused while closed, admitted once opened"
+echo "  the compute stopped and stayed stopped with a client reconnecting; a connection refused while closed, admitted once opened"
 
 echo "== deleted: the compute at once, the data held"
 k -n shop delete database orders-then --timeout=120s
 if k -n peat-compute get deployment compute-orders-then >/dev/null 2>&1; then fail 'the compute of a deleted database is still there'; fi
-held=$(k -n peat get configmap held-orders-then -o jsonpath='{.data.deleteAfter}') || fail 'no hold was recorded for the deleted data'
+held=$(k -n peat get configmap -l peat-held=true -o jsonpath='{range .items[?(@.data.name=="orders-then")]}{.data.deleteAfter}{end}')
+[ -n "$held" ] || fail 'no hold was recorded for the deleted data'
 echo "  orders-then deleted: its compute gone, its data held until $held"
 
 echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s"
