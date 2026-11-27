@@ -46,8 +46,8 @@ Bun.serve({
 })
 console.log(`peat operator ${ME} in ${NS}: one pass every ${EVERY_S} s while it holds the lease`)
 
-// A pass as soon as a Database asks for the exec a move needs, or takes it back (its status.move.pods), not at the next pass: a watch of the
-// Databases wakes the loop. Each one's ask is remembered, so only a change wakes it.
+// A pass as soon as a Database asks for the exec a move needs, or takes it back (its status.move.pods), or is made and has no login
+// published yet, not at the next pass: a watch of the Databases wakes the loop. Each one's ask is remembered, so only a change wakes it.
 let wake: (() => void) | undefined
 let pending = false
 const wakeUp = () => { if (wake) wake(); else pending = true }
@@ -58,11 +58,13 @@ async function watchMoves(): Promise<never> {
       await k.watch!(`/apis/${GROUP}/v1alpha1/databases?watch=1&timeoutSeconds=300`, (e) => {
         const o = e.object ?? {}
         const id = `${o.metadata?.namespace}/${o.metadata?.name}`
-        const ask = e.type === 'DELETED' ? '' : JSON.stringify([o.status?.move?.pods ?? null, o.status?.move?.state ?? null, o.status?.phase ?? null, Boolean(o.metadata?.deletionTimestamp)])
+        // a database made (its record written) whose login the operator has not published yet asks too: a client reads it the moment it is Ready
+        const needsLogin = Boolean(o.status?.record) && !o.status?.loginSecret && !o.metadata?.deletionTimestamp
+        const ask = e.type === 'DELETED' ? '' : JSON.stringify([o.status?.move?.pods ?? null, o.status?.move?.state ?? null, o.status?.phase ?? null, Boolean(o.metadata?.deletionTimestamp), needsLogin])
         const before = asks.get(id) ?? ''
         if (ask === before) return
         if (e.type === 'DELETED') asks.delete(id); else asks.set(id, ask)
-        const asked = (a: string) => a !== '' && JSON.parse(a)[0] !== null
+        const asked = (a: string) => a !== '' && (JSON.parse(a)[0] !== null || JSON.parse(a)[4] === true)
         if (asked(ask) || asked(before)) wakeUp()
       })
     } catch (e) { console.log(`watch of the Databases: ${String(e).slice(0, 200)}`) }
