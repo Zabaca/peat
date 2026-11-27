@@ -153,6 +153,20 @@ jobs:
           cargo nextest run "${flags[@]}" --release --no-fail-fast -E "package(pageserver) & !($old_pg)"
           cargo test --doc "${flags[@]}" --release
 
+      # The storage controller's records on both of its stores: every operation, run the same way
+      # against a real Kubernetes API server (the envtest build of 1.31) and against a Postgres
+      # from this build, the two required to agree (storage_controller/src/persistence/tests.rs).
+      # The step above runs the same tests with neither store set, where they do nothing.
+      - name: The storage controller's records, on Kubernetes and on Postgres
+        run: |
+          .github/peat/envtest.sh "$RUNNER_TEMP/envtest"
+          read -ra flags <<< "$CARGO_FLAGS"
+          export KUBE_ASSETS="$RUNNER_TEMP/envtest" PG_BIN="$PWD/pg_install/v19/bin"
+          export LD_LIBRARY_PATH="$PWD/pg_install/v19/lib"
+          storage_controller/kubernetes/test-stores.sh \
+            cargo nextest run "${flags[@]}" --release --no-fail-fast \
+            -E 'package(storage_controller) & test(/^persistence::/)'
+
       - name: Pack the binaries for the regression suite
         if: github.event_name != 'pull_request'
         run: .github/peat/package-binaries.sh "$RUNNER_TEMP/peat-release-${{ matrix.arch }}.tar.zst"

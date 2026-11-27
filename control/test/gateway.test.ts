@@ -45,6 +45,8 @@ const names: Names = {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+/** Waits until `ok()` holds, at most `ms`: a test of something that happens on a timer asserts the result, not how fast a loaded machine ran it. */
+const until = async (ok: () => boolean, ms = 2000) => { const end = Date.now() + ms; while (!ok() && Date.now() < end) await sleep(5) }
 
 /** Ports handed out in this file: the operating system may give a port it has just been given back, and a route on the stand-in database's own port is a gateway dialing itself. */
 const handedOut = new Set<number>()
@@ -2124,7 +2126,9 @@ describe('a wake dials the woken server by its own address once it takes logins'
     comes(made, 20, 20)
     const c = client()
     c.write('x')
-    await sleep(150)
+    // the asking runs on a 20 ms timer: it has asked more than twice by 150 ms on an idle machine, and later on a loaded one (seen once in
+    // ten full runs, 2026-11-26), so the test waits for the third question instead of a fixed time
+    await until(() => pg.asked > 2)
     expect(pg.asked).toBeGreaterThan(2)
     c.destroy()
     await sleep(60)
