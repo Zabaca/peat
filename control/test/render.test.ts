@@ -109,7 +109,7 @@ describe('volumes', () => {
     expect(main.command[0]).toBe('/bin/sh')
     expect(main.command[2]).toBe(`${podOf(ps).initContainers[1].args[0]}exec /usr/local/bin/pageserver -D /vol/neon\n`)
     expect(main.command[2]).toStartWith('set -eu\nid=1\nmkdir -p /vol/neon\n')
-    expect(main.livenessProbe).toEqual({ exec: { command: ['/bin/sh', '-c', 'test -f /vol/neon/identity.toml'] }, periodSeconds: 10, failureThreshold: 2 })
+    expect(main.livenessProbe).toEqual({ exec: { command: ['/bin/sh', '-c', 'test -f /vol/neon/identity.toml'] }, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3 })
     expect(main.volumeMounts).toContainEqual({ name: 'tok', mountPath: '/tok' })
     expect(main.env).toContainEqual({ name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } })
     expect(podOf(ps).initContainers[0].command[2]).toBe('set -eu; chown 1000:1000 /vol; mkdir -p /vol/neon; chown 1000:1000 /vol/neon')

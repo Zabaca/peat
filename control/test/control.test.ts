@@ -316,7 +316,8 @@ describe('the program\'s settings for the pieces it makes', () => {
     // its folder wiped under it: the liveness probe fails; the restart makes the folder again and finds it empty, which for a registered member
     // the may-start-empty guard refuses (lost, replaced), never a quiet rejoin
     expect(t.initContainers[0].command[2]).toStartWith('set -eu; chown 1000:1000 /vol; ')
-    expect(t.containers[0].livenessProbe).toEqual({ exec: { command: ['/bin/sh', '-c', `test -d /vol/sk-${baseOptions.id}`] }, periodSeconds: 10, failureThreshold: 2 })
+    // its identity, not only its folder: a wipe of the contents with the folder kept is seen too; the first look after the start's own wait
+    expect(t.containers[0].livenessProbe).toEqual({ exec: { command: ['/bin/sh', '-c', `test -s /vol/sk-${baseOptions.id}/identity`] }, initialDelaySeconds: 90, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3 })
     expect(script).toContain('d=/vol/sk-$id\nmkdir -p $d\nif [ ! -s $d/identity ]; then')
     expect(script.indexOf('mkdir -p $d')).toBeLessThan(script.indexOf('/sk/$id/may-start-empty'))
   })

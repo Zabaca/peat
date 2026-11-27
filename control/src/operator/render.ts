@@ -256,7 +256,8 @@ printf '{"host":"%s","http_host":"%s","http_port":${PORTS.pageserverHttp},"port"
           resources: { requests: { cpu: '500m', memory: r.spec.pageservers.memory.request }, limits: { memory: r.spec.pageservers.memory.limit } },
           readinessProbe: { httpGet: { path: '/v1/status', port: PORTS.pageserverHttp }, periodSeconds: 5 },
           // its folder or its identity gone under it (a volume wiped, a disk replaced): the kubelet restarts it, and the command above makes them again
-          livenessProbe: { exec: { command: ['/bin/sh', '-c', 'test -f /vol/neon/identity.toml'] }, periodSeconds: 10, failureThreshold: 2 },
+          // 5 s for each look, three missed in a row (30 to 35 s): a stall of the disk is not taken for a wipe
+          livenessProbe: { exec: { command: ['/bin/sh', '-c', 'test -f /vol/neon/identity.toml'] }, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3 },
           volumeMounts: [{ name: 'volume', mountPath: '/vol' }, { name: 'auth', mountPath: '/auth' }, { name: 'tok', mountPath: '/tok' }],
         }],
         volumes: [

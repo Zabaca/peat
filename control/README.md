@@ -91,6 +91,13 @@ directory is mounted unchecked, so the container runtime makes a missing one on 
 `/var/lib/peat` and paths under `/var/mnt` (a disk Talos mounts there) then work with `create: true`, and an existing directory with
 `create: false`.
 
+A pageserver or a safekeeper whose folder is wiped while it runs is restarted by its liveness probe: a look every 10 s, 5 s for each,
+three missed in a row, so 30 to 35 s (a stall of the disk shorter than that is not taken for a wipe). A pageserver then makes its folder
+again and re-attaches its tenants from the controller; a safekeeper finds its folder empty, and as a registered member is refused by
+the empty-disk guard, treated as lost and replaced. The first start's own probe of a safekeeper waits 90 s (its start may wait up to
+60 s for the control layer's answer). A pageserver's and a safekeeper's start make the volume's root theirs (uid 1000), so a restart
+can make the folder again.
+
 The storage controller names itself to its peers by its pod's address (`http://$(POD_IP):1234`, from the downward API). On a cluster
 whose pods have only IPv6 addresses that is not a valid URL (it needs brackets, which the downward API cannot add, and the controller
 takes no address but a URL); such a cluster is not supported yet: it needs a wrapper that writes the address before the controller
