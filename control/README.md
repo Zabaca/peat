@@ -181,8 +181,8 @@ What guards it:
   fix), a policy left without a binding freezes the API server's copy of every ConfigMap used as a policy parameter, for every policy in
   the cluster, until the API server restarts. Affected: another policy of the cluster whose `paramKind` is a ConfigMap (or another
   built-in kind) and that reads a parameter changed after the upgrade. To tell: such a policy goes on judging by an older value of its
-  ConfigMap, or answers "no params found" for one that exists; `kubectl get validatingadmissionpolicies -o
-  jsonpath='{range .items[?(@.spec.paramKind)]}{.metadata.name} {.spec.paramKind.kind}{"\n"}{end}'` lists the policies it can touch.
+  ConfigMap, or answers "no params found" for one that exists. The policies it can touch are those with a `paramKind` (in
+  `kubectl get validatingadmissionpolicies -o yaml`).
   Restarting the API server clears it. Peat itself reads no parameter, so it is not affected.
 - The rule does not bound `psql`'s arguments, so in a granted pod the control layer may run any SQL as the local superuser, and so any
   shell command in that container (`\!`, `-o '|command'`, `COPY ... TO PROGRAM`).
