@@ -57,7 +57,9 @@ pub(crate) fn classify(
         if covered {
             continue;
         }
-        if accept_deleted.contains(key) {
+        // A name accepted before and written again since (its accepted mark below the copy's
+        // revision) is not accepted again: lost again, it is missing.
+        if accept_deleted.contains(key) && !marks.get(key).is_some_and(|m| m.accepted) {
             v.accepted.push(key.clone());
         } else {
             v.missing.push(key.clone());
@@ -214,6 +216,35 @@ mod tests {
         // A plain mark (a delete of this controller's) is no acceptance
         let v = classify_(&[], &[], &[("Safekeeper/s", 5)], &["Safekeeper/s"]);
         assert_eq!(v.wrongly_accepted, vec!["Safekeeper/s"]);
+    }
+
+    #[test]
+    fn a_name_accepted_then_made_again_and_lost_again_is_missing() {
+        for key in [
+            "Tenant/t",
+            "Pageserver/pageserver-3",
+            "Safekeeper/safekeeper-3",
+            "Timeline/t.l",
+            "MetadataHealth/t",
+            "Leader/leader",
+        ] {
+            let accepted = BTreeMap::from([(
+                key.to_string(),
+                Mark {
+                    revision: 5,
+                    accepted: true,
+                },
+            )]);
+            let accept = BTreeSet::from([key.to_string()]);
+            // Made again above the accepted mark, then lost with the store: the copy has it at 7
+            let v = classify(&map(&[]), &map(&[(key, 7)]), &accepted, &accept);
+            assert_eq!(v.missing, vec![key], "{key}");
+            assert!(v.accepted.is_empty(), "{key}");
+            assert!(v.refuses(), "{key}");
+            // Still there: fine
+            let v = classify(&map(&[(key, 7)]), &map(&[(key, 7)]), &accepted, &accept);
+            assert!(!v.refuses(), "{key}: {v:?}");
+        }
     }
 
     #[test]
