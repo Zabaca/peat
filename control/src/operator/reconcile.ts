@@ -73,7 +73,8 @@ async function labelledMachines(k: Kube, r: { key: string; value: string }): Pro
  * control layer probes (the labelled ones and the outside keepers').
  */
 async function clusterRead(k: Kube, spec: PlatformSpec, labelled: any[]): Promise<ClusterRead> {
-  const slice = await k.request('GET', '/apis/discovery.k8s.io/v1/namespaces/default/endpointslices/kubernetes')
+  // a read that fails (the API server busy: a 429, a 5xx) stops the pass, so the rules stay as they are; only a cluster with no such slice gets the any-address rule
+  const slice = ok(await k.request('GET', '/apis/discovery.k8s.io/v1/namespaces/default/endpointslices/kubernetes'), "read the API server's endpoint", [404])
   const host = (a: string) => (a.includes(':') ? `${a}/128` : `${a}/32`)
   const apiServer = slice.status === 200 ? {
     // every address it lists, ready or not: one that is not ready for a moment (an API server restarting) is not dropped and added back
@@ -479,7 +480,9 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   // an image map the operator was handed that is not of this Platform's release or registry (the install file of another release): said
   const map = deps.releaseImages
   const mapNote = map && (map.release !== spec.release || map.registry !== spec.images.registry.replace(/\/$/, '')) ? `; the operator's image map is of release ${map.release} on ${map.registry}, not ${spec.release} on ${spec.images.registry.replace(/\/$/, '')}: the images it does not pin are the registry's tags` : ''
-  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + mapNote + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
+  // the pieces' way out to the API server when neither the Platform nor the cluster's endpoint names it: said, as it is the broad rule
+  const apiNote = r.network.apiServerFrom === 'any' ? '; the pieces reach the API server at any address on 443 and 6443 (no EndpointSlice kubernetes in default to read, and no network.apiServer)' : ''
+  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + mapNote + apiNote + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
   // the release every piece runs, recorded once all are ready on it, whatever is refused: what the next upgrade starts from; never a
   // release no record names, nor images the pieces do not agree on (the images recorded under the release recorded)
   const record = !notReady.length && !status.release && (decision.kind === 'none' || startHeld) && !unstartable && running?.release !== UNRECORDED

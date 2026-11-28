@@ -26,6 +26,8 @@ beforeEach(() => {
   for (const n of ['machine-1', 'machine-2', 'machine-3']) k.put(node(n))
   k.put(node('other-work', false))
   k.put(storeSecret())
+  // the API server's own endpoint, as every cluster has it
+  k.put({ apiVersion: 'discovery.k8s.io/v1', kind: 'EndpointSlice', metadata: { name: 'kubernetes', namespace: 'default' }, addressType: 'IPv4', endpoints: [{ addresses: ['192.0.2.1'] }], ports: [{ name: 'https', port: 6443, protocol: 'TCP' }] })
 })
 const statusOf = (name = 'peat') => k.get('peat.zabaca.com/v1alpha1', 'platforms', null, name).status
 
@@ -797,10 +799,24 @@ describe('the network rules read from the cluster', () => {
     // the operator's own way out to the store, in its namespace
     expect(pol('peat-system', 'peat-operator-store').spec.podSelector).toEqual({ matchLabels: { app: 'peat-operator' } })
   })
-  test('no EndpointSlice to read: any address on 443 and 6443, as before', async () => {
+  test('no EndpointSlice to read: any address on 443 and 6443, as before, and the status says so', async () => {
+    k.objects.delete([...k.objects.keys()].find((x) => x.includes('|endpointslices|kubernetes'))!)
     k.put(platform())
     await reconcile(k)
     expect(egressOn('peat', 'peat-control', 6443)).toEqual([{ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: [{ protocol: 'TCP', port: 443 }, { protocol: 'TCP', port: 6443 }] }])
+    expect(statusOf().message).toContain('the pieces reach the API server at any address on 443 and 6443 (no EndpointSlice kubernetes in default to read, and no network.apiServer)')
+  })
+  test('a read of the endpoint that fails (the API server busy) stops the pass: the rules stay as they were, never the broad one', async () => {
+    k.put(platform())
+    await reconcile(k)
+    const before = JSON.stringify(egressOn('peat', 'peat-control', 6443))
+    expect(before).toContain('192.0.2.1/32')
+    k.forced.set('GET /apis/discovery.k8s.io/v1/namespaces/default/endpointslices/kubernetes', { status: 429, json: { message: 'storage is (re)initializing' } })
+    await expect(reconcile(k)).rejects.toThrow("read the API server's endpoint: 429")
+    expect(JSON.stringify(egressOn('peat', 'peat-control', 6443))).toBe(before)
+    k.forced.clear()
+    await reconcile(k)
+    expect(JSON.stringify(egressOn('peat', 'peat-control', 6443))).toBe(before)
   })
   test('the install file: a default-deny in the operator\'s namespace and the operator\'s own rules; --api-server narrows its way to the API server; the endpoint read by name only', () => {
     const m = installManifests('img') as any[]

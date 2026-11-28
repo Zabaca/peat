@@ -212,7 +212,9 @@ node_ip=$(k get node "$node" -o jsonpath='{.status.addresses[?(@.type=="Internal
 rule_to() {  # rule_to <namespace> <policy> <port> <cidr>: the policy's way out on that port names that range
   k -n "$1" get networkpolicy "$2" -o json | jq -e --argjson p "$3" --arg c "$4" '[.spec.egress[] | select(any(.ports[]?; .port == $p)) | .to[]?.ipBlock.cidr] | index($c) != null' >/dev/null
 }
-for pol in peat-control storage-controller; do
+# the storage controller reaches the API server only with records kubernetes (with records postgres it reaches its database instead)
+api_pieces=peat-control; [ "$records" = kubernetes ] && api_pieces="peat-control storage-controller"
+for pol in $api_pieces; do
   rule_to peat "$pol" "$api_port" "$api_ip/32" || fail "$pol's way out to the API server does not name its endpoint $api_ip:$api_port: $(k -n peat get networkpolicy "$pol" -o json | jq -c '.spec.egress')"
   if rule_to peat "$pol" "$api_port" 0.0.0.0/0; then fail "$pol may still reach any address on $api_port"; fi
 done
@@ -225,7 +227,7 @@ k patch platform peat --type merge -p '{"spec":{"gateways":{"allowFrom":["192.0.
 t0=$(date +%s); until [ "$(door_from)" = '["pods","192.0.2.0/24"]' ]; do [ "$(since "$t0")" -lt 60 ] || fail "gateways.allowFrom did not narrow the front door: $(door_from)"; sleep 2; done
 k patch platform peat --type json -p '[{"op":"remove","path":"/spec/gateways/allowFrom"}]' >/dev/null
 t0=$(date +%s); until [ "$(door_from)" = '["pods","0.0.0.0/0"]' ]; do [ "$(since "$t0")" -lt 60 ] || fail "the front door did not open to all again: $(door_from)"; sleep 2; done
-echo "  the control layer and the controller reach the API server at $api_ip:$api_port only, the kubelet port at $node_ip only; peat-system closed; the front door narrowed by allowFrom and open again"
+echo "  $api_pieces reach the API server at $api_ip:$api_port only, the kubelet port at $node_ip only; peat-system closed; the front door narrowed by allowFrom and open again"
 
 echo "== steady: the operator writes nothing to a settled platform"
 # the spec of every object it made (a generation where the kind has one, else the resourceVersion), read twice, three passes apart
