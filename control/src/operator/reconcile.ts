@@ -16,7 +16,7 @@ import { storageOf, type Storage } from './storage'
 import { UNRECORDED, decide, identicalImages, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
 import { piecesOf, runStep } from './upgrade-run'
 import { differences } from './differences'
-import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR_STORE_POLICY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, moveExecGrant, render, type Manifest } from './render'
+import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR_NAMESPACE, OPERATOR_STORE_POLICY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, moveExecGrant, render, type Manifest } from './render'
 import { moveExecPods, moveExecRole } from '../move'
 
 export const FIELD_MANAGER = OPERATOR
@@ -65,6 +65,19 @@ async function writeStatus(k: Kube, p: Platform, status: Record<string, unknown>
 async function labelledMachines(k: Kube, r: { key: string; value: string }): Promise<{ names: string[]; nodes: any[] }> {
   const nodes = ok(await k.request('GET', `/api/v1/nodes?labelSelector=${sel({ [r.key]: r.value })}`), 'list the machines').json.items as any[]
   return { names: nodes.map((n) => n.metadata.name as string), nodes }
+}
+
+/** With no Platform: the operator's own rule to the store in its namespace removed, when the operator's record says it made it. */
+async function forgetOwnStoreRule(k: Kube): Promise<number> {
+  const path = `/apis/networking.k8s.io/v1/namespaces/${OPERATOR_NAMESPACE}/networkpolicies/${OPERATOR_STORE_POLICY}`
+  const live = ok(await k.request('GET', path), `read ${OPERATOR_STORE_POLICY}`, [404])
+  if (live.status === 404) return 0
+  const owned = await Owned.load(k, k.namespace)
+  const keyOf = `NetworkPolicy/${OPERATOR_NAMESPACE}/${OPERATOR_STORE_POLICY}`
+  if (!(await owned.ours(keyOf, live.json))) return 0
+  ok(await k.request('DELETE', path, { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: String(live.json.metadata.uid) } }), `remove ${OPERATOR_STORE_POLICY}`, [404])
+  await owned.forget(keyOf)
+  return 1
 }
 
 /**
@@ -273,7 +286,12 @@ async function pruneMoveGrants(k: Kube, computeNs: string | undefined, platform:
 export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const now = (deps.now ?? (() => new Date()))()
   const all = (ok(await k.request('GET', platformsPath), 'list the Platforms').json.items ?? []) as Platform[]
-  if (all.length === 0) return { phase: 'none', message: 'no Platform object: nothing to do', applied: 0, pruned: 0, refused: [] }
+  if (all.length === 0) {
+    // the Platform deleted: the platform itself is left running as it is (README, "Deleting a Platform"); what the operator made for its
+    // own use outside the platform's namespaces, its way out to the store, goes (only the very object it made, by its record)
+    const pruned = await forgetOwnStoreRule(k)
+    return { phase: 'none', message: 'no Platform object: nothing to do', applied: 0, pruned, refused: [] }
+  }
   const ordered = [...all].sort((a, b) => String(a.metadata.creationTimestamp).localeCompare(String(b.metadata.creationTimestamp)) || a.metadata.name.localeCompare(b.metadata.name))
   const p = ordered[0]!
   for (const other of ordered.slice(1)) await writeStatus(k, other, { phase: 'Failed', message: `a cluster holds one platform: ${p.metadata.name} is the one acted on` })

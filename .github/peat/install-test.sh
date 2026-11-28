@@ -942,4 +942,13 @@ if [ -n "${UPGRADE_FROM:-}" ]; then
   echo "  the upgrade took $upgrade_s s; $acked inserts acknowledged, none missing ($stored stored); the longest gaps: a reader's $max_gap s, a writer's $max_write_gap s; upg woke on the new compute image"
 fi
 
+echo "== the Platform deleted: the platform keeps running as it is; only the operator's own way out to the store goes"
+k delete platform peat --wait=true >/dev/null
+t0=$(date +%s); while k -n peat-system get networkpolicy peat-operator-store >/dev/null 2>&1; do [ "$(since "$t0")" -lt 60 ] || fail "the operator's rule to the store stayed after the Platform was deleted"; sleep 2; done
+k -n peat rollout status deployment/storage-controller --timeout=60s >/dev/null || fail 'the storage controller is not running after the Platform was deleted'
+k -n peat-gateway rollout status deployment/peat-gateway --timeout=60s >/dev/null || fail 'the gateways are not running after the Platform was deleted'
+retunnel front 15432
+t0=$(date +%s); until sql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 120 ] || fail 'first does not answer after the Platform was deleted'; sleep 3; done
+echo "  peat-operator-store removed; the pieces still run and first still answers"
+
 echo "== passed in $(since "$started") s: Ready in $ready_s s, a database's first answer in $first_s s, a wake in $wake_s s${upgrade_s:+, an upgrade in $upgrade_s s (the longest gaps: $max_gap s reading, $max_write_gap s writing)}"

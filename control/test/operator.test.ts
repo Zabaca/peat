@@ -836,3 +836,30 @@ describe('the network rules read from the cluster', () => {
     expect(role.rules).toEqual([{ apiGroups: ['discovery.k8s.io'], resources: ['endpointslices'], resourceNames: ['kubernetes'], verbs: ['get'] }])
   })
 })
+
+describe('a Platform deleted', () => {
+  test('the platform is left running as it is; only the operator\'s own way out to the store goes, and a Platform applied again takes the rest up', async () => {
+    k.put(platform())
+    await reconcile(k)
+    const pol = () => k.get('networking.k8s.io/v1', 'networkpolicies', 'peat-system', 'peat-operator-store')
+    expect(pol()).toBeDefined()
+    const kept = () => [...k.all('statefulsets'), ...k.all('deployments'), ...k.all('namespaces'), ...k.all('validatingadmissionpolicies')].map((o) => `${o.kind}/${o.metadata.namespace ?? ''}/${o.metadata.name}`).sort()
+    const before = kept()
+    expect(before.length).toBeGreaterThan(10)
+    k.objects.delete([...k.objects.keys()].find((x) => x.includes('|platforms|peat'))!)
+    const r = await reconcile(k)
+    expect(r).toMatchObject({ phase: 'none', pruned: 1 })
+    expect(pol()).toBeUndefined()
+    expect(kept()).toEqual(before)
+    // a person's own policy of that name is never the operator's to remove
+    k.put({ apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy', metadata: { name: 'peat-operator-store', namespace: 'peat-system' }, spec: {} })
+    expect((await reconcile(k)).pruned).toBe(0)
+    expect(pol()).toBeDefined()
+    k.objects.delete([...k.objects.keys()].find((x) => x.includes('|networkpolicies|peat-operator-store'))!)
+    // applied again: the same objects, taken up as the operator's (its record still holds them), and its rule to the store made again
+    k.put(platform())
+    expect((await reconcile(k)).refused).toEqual([])
+    expect(kept()).toEqual(before)
+    expect(pol()).toBeDefined()
+  })
+})

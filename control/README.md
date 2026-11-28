@@ -37,6 +37,23 @@ restarts one a person cancelled, until `upgrades.checkTimeout` halts it.
 No step starts inside `upgrades.quietHours`: an upgrade under way waits at the next step boundary. A compute takes the new image at its
 next start, or, awake, inside `upgrades.restartHours`, one at a time. The state is in `status.upgrade`, so a restarted operator goes on.
 
+## Deleting a Platform
+
+Deleting the Platform object stops the operator acting; it does not take the platform apart. Everything it made stays as it is and keeps
+running: the four namespaces and all in them (the storage controller and its records, the pageservers, the safekeepers and their data on
+the machines, the control layer, the gateways, the computes), the databases and their data in the store, the logins and `peat-ca` copies
+in the databases' namespaces, the admission policies and the cluster-wide roles. This is on purpose: a `kubectl delete platform` by
+mistake costs nothing, and a Platform applied again (the same name and namespaces) is taken up where it was, by the operator's record of
+what it made (`peat-owned` in its own namespace). The one thing that goes is the operator's own rule in its namespace for reaching the
+store (`peat-operator-store`), which only the operator's checks of a Platform used.
+
+To take a platform apart, by hand and in this order: delete every Database object while the control layer still runs (each one's
+compute goes at once and its data after `databases.deleteHold`, while the control layer runs to remove it; a Database deleted once the
+control layer is gone keeps its finalizer and waits); then delete the four namespaces (the pieces stop; the safekeepers' and
+pageservers' folders stay on the machines, under the Platform's `hostPath`s, to be removed there); then the store's bucket or folders
+if the data is to go. Removing Peat altogether is then `kubectl delete -f peat.yaml` (the install file's objects, the kinds included:
+removing the kinds removes every Platform and Database object left).
+
 ## What the operator does not take over
 
 Adoption, taking over a platform installed another way, is not in this release: a Platform that names `adopt` or `requests.applyPending`
