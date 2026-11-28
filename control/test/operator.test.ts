@@ -3,7 +3,7 @@ import { X509Certificate } from 'node:crypto'
 import { ENTRIES, verifiedScope } from '../src/operator/keys'
 import { PLACEMENTS_CONFIG_MAP, reconcile } from '../src/operator/reconcile'
 import { KEYS_SECRET, MANAGED_BY } from '../src/operator/render'
-import { OPERATOR_EXEC_POLICY, installManifests } from '../src/install/install'
+import { EXEC_ROLE, OPERATOR_EXEC_POLICY, OPERATOR_POLICIES, SECRETS_ROLE, installManifests } from '../src/install/install'
 import { FakeKube } from './fake-kube'
 
 // The operator as an installer meets it: a Platform declared on a cluster of labelled machines, one pass (or a few), and what the cluster
@@ -480,13 +480,34 @@ describe('a one-machine trial', () => {
 })
 
 describe('the install file', () => {
+  test('a Platform of namespaces the install did not bind the operator\'s rights in is refused with the flag to install with, and nothing is made', async () => {
+    k.noSecretsIn.add('shop-db')
+    k.put(platform({ namespaces: { databases: 'shop-db' } }))
+    const r = await reconcile(k)
+    expect(r.phase).toBe('Failed')
+    expect(statusOf()).toMatchObject({ phase: 'Failed', message: "the install's --namespaces do not cover shop-db: install with --namespaces peat,peat-compute,peat-gateway,shop-db" })
+    expect(k.all('statefulsets')).toEqual([])
+    expect(k.all('roles')).toEqual([])
+    // the same Platform once the install covers it
+    k.noSecretsIn.delete('shop-db')
+    expect((await reconcile(k)).phase).toBe('Installing')
+  })
   test('the operator holds every right it grants the control layer (the API server refuses to grant one it does not hold)', async () => {
-    const op = (installManifests('img') as any[]).find((m) => m.kind === 'ClusterRole')
-    const holds = (group: string, resource: string, verb: string) => op.rules.some((r: any) => r.apiGroups.includes(group) && (r.resources.includes(resource) || r.resources.includes('*')) && (r.verbs.includes(verb) || r.verbs.includes('*')))
+    const m = installManifests('img') as any[]
+    const clusterRole = (name: string) => m.find((x) => x.kind === 'ClusterRole' && x.metadata.name === name)
+    // what it holds everywhere (its ClusterRole, bound cluster-wide), and what it holds in a namespace besides (ClusterRoles bound there)
+    const everywhere = m.find((x) => x.kind === 'ClusterRole' && x.metadata.name === 'peat-operator').rules as any[]
+    const inNamespace = (ns: string) => m.filter((x) => x.kind === 'RoleBinding' && x.metadata.namespace === ns).flatMap((b) => clusterRole(b.roleRef.name).rules as any[])
+    const unnamed = (r: any) => !r.resourceNames
+    const holds = (rules: any[], group: string, resource: string, verb: string) => rules.filter(unnamed).some((r: any) => r.apiGroups.includes(group) && (r.resources.includes(resource) || r.resources.includes('*')) && (r.verbs.includes(verb) || r.verbs.includes('*')))
     k.put(platform())
     await reconcile(k)
-    const granted = [...k.all('roles'), ...k.all('clusterroles')].filter((x) => x.metadata.name !== 'peat-operator').flatMap((x) => x.rules ?? [])
-    const missing = granted.flatMap((r: any) => r.apiGroups.flatMap((g: string) => r.resources.flatMap((res: string) => r.verbs.filter((v: string) => !holds(g, res, v)).map((v: string) => `${g}/${res} ${v}`))))
+    const missing: string[] = []
+    // a Role's rules are held in its namespace; a ClusterRole's, everywhere
+    for (const x of [...k.all('roles'), ...k.all('clusterroles')].filter((y) => !String(y.metadata.name).startsWith('peat-operator'))) {
+      const rules = x.kind === 'Role' ? [...everywhere, ...inNamespace(x.metadata.namespace)] : everywhere
+      for (const r of (x.rules ?? []) as any[]) for (const g of r.apiGroups) for (const res of r.resources) for (const v of r.verbs) if (!holds(rules, g, res, v)) missing.push(`${x.kind} ${x.metadata.namespace ?? ''}/${x.metadata.name}: ${g}/${res} ${v}`)
+    }
     expect(missing).toEqual([])
   })
   test('the kinds, the operator\'s namespace, its account and its Deployment of the image given', () => {
@@ -499,6 +520,22 @@ describe('the install file', () => {
     // it grants nothing it does not hold: no bind, no escalate; and it makes no pod
     for (const r of role.rules as any[]) { expect(r.verbs).not.toContain('bind'); expect(r.verbs).not.toContain('escalate') }
     expect(role.rules.find((r: any) => r.resources.includes('pods')).verbs).not.toContain('create')
+    // narrowed: no namespace is deleted; Secrets anywhere only read, made and patched; exec held nowhere cluster-wide; policies only its own, by name
+    expect(role.rules.find((r: any) => r.resources.includes('namespaces')).verbs).not.toContain('delete')
+    expect(role.rules.find((r: any) => r.resources.includes('secrets')).verbs).toEqual(['get', 'create', 'patch'])
+    expect(JSON.stringify(role.rules)).not.toContain('pods/exec')
+    const policies = (role.rules as any[]).filter((r) => r.resources.includes('validatingadmissionpolicies'))
+    expect(policies).toEqual([
+      { apiGroups: ['admissionregistration.k8s.io'], resources: ['validatingadmissionpolicies', 'validatingadmissionpolicybindings'], verbs: ['create'] },
+      { apiGroups: ['admissionregistration.k8s.io'], resources: ['validatingadmissionpolicies', 'validatingadmissionpolicybindings'], resourceNames: OPERATOR_POLICIES, verbs: ['get', 'update', 'patch', 'delete'] },
+    ])
+    // every right on Secrets in the platform's four namespaces, exec in the compute namespace only, by RoleBindings; the namespaces made first
+    expect(m.filter((x) => x.kind === 'RoleBinding' && x.roleRef.name === SECRETS_ROLE).map((x) => x.metadata.namespace).sort()).toEqual(['peat', 'peat-compute', 'peat-db', 'peat-gateway'])
+    expect(m.filter((x) => x.kind === 'RoleBinding' && x.roleRef.name === EXEC_ROLE).map((x) => x.metadata.namespace)).toEqual(['peat-compute'])
+    for (const n of ['peat', 'peat-compute', 'peat-db', 'peat-gateway']) expect(m.some((x) => x.kind === 'Namespace' && x.metadata.name === n)).toBe(true)
+    // a Platform that names its own namespaces: the install names them too
+    const own = installManifests('img', { platform: 'db', computes: 'db-run', gateways: 'db-in', databases: 'db-names' }) as any[]
+    expect(own.filter((x) => x.kind === 'RoleBinding' && x.roleRef.name === EXEC_ROLE).map((x) => x.metadata.namespace)).toEqual(['db-run'])
     // the exec it holds to grant is refused it by an admission rule of its own, whatever its RBAC
     const noExec = m.find((x) => x.kind === 'ValidatingAdmissionPolicy' && x.metadata.name === OPERATOR_EXEC_POLICY)
     expect(noExec.spec.matchConstraints.resourceRules[0]).toMatchObject({ operations: ['CONNECT'], resources: ['pods/exec', 'pods/attach'] })

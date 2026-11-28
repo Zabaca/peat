@@ -119,7 +119,7 @@ k apply --server-side -f "$work/peat.yaml"
 k -n peat-system rollout status deployment/peat-operator --timeout=180s
 
 echo "== the platform: its namespace and the store's Secret first, then one Platform"
-k create namespace peat
+k get namespace peat >/dev/null 2>&1 || k create namespace peat  # the install file makes it
 k -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=peat-test --from-literal=AWS_SECRET_ACCESS_KEY=peat-test-secret
 k -n store rollout status deployment/minio --timeout=180s
 if [ "$records" = postgres ]; then
@@ -210,6 +210,22 @@ k "${as[@]}" -n peat-compute patch deployment guard-probe --type merge -p '{"spe
 echo "  allowed: a change that keeps a compute's image, one the guard does not list"
 refused "only of the platform's compute images" -n peat-compute patch deployment guard-probe --type json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"docker.io/library/busybox:1.36"}]'
 k -n peat-compute delete deployment guard-probe --wait=false >/dev/null
+
+echo "== the operator's own rights, as the API server grants them"
+op=(--as=system:serviceaccount:peat-system:peat-operator)
+can() { k "${op[@]}" auth can-i "$@" 2>/dev/null || true; }
+expect_can() { [ "$(can "${@:2}")" = "$1" ] || fail "the operator's account: can-i ${*:2} is not $1"; }
+expect_can no delete namespaces
+expect_can no list secrets -A
+expect_can yes get secrets -n shop
+expect_can no delete secrets -n shop
+expect_can yes delete secrets -n peat
+expect_can yes list secrets -n peat-compute
+expect_can no create pods/x --subresource=exec -n kube-system
+expect_can yes create pods/x --subresource=exec -n peat-compute
+expect_can yes delete validatingadmissionpolicies/peat-control-keeps-to-peat-nodes
+expect_can no delete validatingadmissionpolicies/someone-elses
+echo "  no namespace deleted; Secrets everywhere read, made and patched only, the rest in the platform's namespaces; exec in the compute namespace only; its own admission policies only"
 
 echo "== the kinds' rules, judged by the cluster's own API server"
 kind_refused() { # kind_refused <words the refusal must hold>, the object on standard input

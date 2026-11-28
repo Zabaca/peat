@@ -37,6 +37,8 @@ export class FakeKube implements Kube {
   /** Answers to force, by "METHOD path" (for a refusal or an outage); `forcedOnce` answers once and is gone. */
   readonly forced = new Map<string, Answer>()
   readonly forcedOnce = new Map<string, Answer>()
+  /** Namespaces where the operator's account may not list Secrets (an install whose --namespaces left them out); its access reviews say so. */
+  readonly noSecretsIn = new Set<string>()
 
   private keyOf(group: string, ns: string | null, plural: string, name: string) { return `${group}|${ns ?? ''}|${plural}|${name}` }
   put(o: any) {
@@ -70,6 +72,10 @@ export class FakeKube implements Kube {
     }
     const live = this.objects.get(k)
     if (method === 'GET') return live ? { status: 200, json: clone(live) } : { status: 404, json: { message: 'not found' } }
+    if (method === 'POST' && plural === 'selfsubjectaccessreviews') {
+      const a = (parsed as any).spec.resourceAttributes
+      return { status: 201, json: { ...(parsed as any), status: { allowed: !(a.resource === 'secrets' && this.noSecretsIn.has(a.namespace)) } } }
+    }
     if (method === 'POST') {
       const o = parsed as any
       const key = this.keyOf(group, ns, plural, o.metadata.name)
