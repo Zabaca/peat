@@ -10,7 +10,7 @@ import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
 import { ok, pathOf, serverApply, type Kube } from '../kube'
 import { NONCE_ANNOTATION, Owned } from './owned'
 import { issuerCaFindings, keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
-import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type Resolved } from './platform'
+import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type ReleaseImages, type Resolved } from './platform'
 import { storageOf, type Storage } from './storage'
 import { UNRECORDED, decide, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
 import { piecesOf, runStep } from './upgrade-run'
@@ -210,7 +210,12 @@ const imagesOfPod = (o: any): string[] => [...(o?.spec?.template?.spec?.containe
 
 
 /** One pass. Returns what it did, for the log and the tests. */
-export interface Deps { storage?: (r: Resolved, keys: Record<string, string>) => Storage; now?: () => Date }
+export interface Deps {
+  storage?: (r: Resolved, keys: Record<string, string>) => Storage
+  now?: () => Date
+  /** The image map of the operator's own release (from its install file): the digests of the pieces the Platform does not pin. */
+  releaseImages?: ReleaseImages
+}
 
 /**
  * Takes back each move grant (the Role and RoleBinding peat-move-<database> the operator made in the compute namespace) that no Database's
@@ -283,7 +288,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const zones = Object.fromEntries(machines.nodes.map((n) => [String(n.metadata.name), String(n.metadata?.labels?.[spec.safekeepers.zoneLabel] ?? n.metadata.name)]))
   const chosen = choosePlacements(spec, machines.names, kept, zones)
   if ('errors' in chosen) return failed(chosen.errors.join('; '), spec.namespaces.computes)
-  const r = resolve(p, spec, chosen.placements)
+  const r = resolve(p, spec, chosen.placements, deps.releaseImages)
 
   // the record of what the operator made, in its own namespace; a record that cannot be read stops the pass here
   const owned = await Owned.load(k, k.namespace)
@@ -348,7 +353,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   // pieces' images: once any piece runs, a changed release is only ever rendered through the ordered steps
   // (mid-upgrade the release is cleared and the pieces disagree by design: the upgrade's own state says what runs)
   const seeded = status.release || (status.upgrade && !status.upgrade.complete) ? null : await liveImages(k, r)
-  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? (await liveImages(k, r, String(status.release)))?.images ?? imagesOf(spec, String(status.release)) }
+  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? (await liveImages(k, r, String(status.release)))?.images ?? imagesOf(spec, String(status.release), deps.releaseImages) }
     : seeded ? { release: sameImages(seeded.images, r.images) ? spec.release : seeded.images.release, images: seeded.images } : undefined
   // why no upgrade may start from what runs: pieces on images that disagree, or images no release records (pin spec.images to them, and
   // the release is recorded under the spec's name)

@@ -4,11 +4,17 @@ import { randomBytes } from 'node:crypto'
 import { inCluster, ok, type Kube } from '../kube'
 import { reconcile } from './reconcile'
 import { GROUP } from '../names'
+import { RELEASE_IMAGES_ENV, parseReleaseImages, type ReleaseImages } from './platform'
 
 const k = inCluster()
 const NS = process.env['OPERATOR_NAMESPACE'] || k.namespace
 const ME = process.env['POD_NAME'] ?? `operator-${randomBytes(3).toString('hex')}`
 const EVERY_S = Number(process.env['RECONCILE_EVERY_S'] ?? '10')
+// the image map of this operator's release, from its install file: one that cannot be read stops the operator, never runs it on tags
+let releaseImages: ReleaseImages | undefined
+try { releaseImages = process.env[RELEASE_IMAGES_ENV] ? parseReleaseImages(process.env[RELEASE_IMAGES_ENV]!) : undefined }
+catch (e) { console.log(`${RELEASE_IMAGES_ENV}: ${String(e)}`); process.exit(1) }
+if (releaseImages) console.log(`image map of release ${releaseImages.release}: the pieces a Platform of that release does not pin run by digest`)
 const LEASE = 'peat-operator'
 const LEASE_S = 15
 
@@ -79,7 +85,7 @@ for (;;) {
     leading = await lease(k)
     if (leading !== was) console.log(`lease: ${ME} ${leading ? 'acts now' : 'no longer acts'}`)
     if (leading) {
-      const r = await reconcile(k)
+      const r = await reconcile(k, { releaseImages })
       passes++
       lastOk = Date.now()
       if (r.applied || r.pruned || r.phase !== 'Ready') console.log(`pass: ${r.platform ?? '(none)'} ${r.phase}: ${r.message}${r.pruned ? ` (${r.pruned} removed)` : ''}`)

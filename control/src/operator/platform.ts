@@ -7,15 +7,44 @@ import { DEFAULT_NAMES, type Names, type Taint } from '../names'
 /** A release and its images: what each piece is stamped with and runs. */
 export interface Images { release: string; storage: string; control: string; compute: { 18: string; 19: string } }
 
-/** The images of a release: the registry's own, unless the Platform names one. */
-export function imagesOf(spec: PlatformSpec, release: string = spec.release): Images {
+/**
+ * A release's images by digest, as the publish job writes them (images.json on the release, and in the release's install file, which
+ * hands it to the operator): a tag can be moved on the registry, a digest names one image. The publish job writes all four; a map may
+ * name fewer (the install test's names the images it pulls), and every image it names is a digest reference.
+ */
+export interface ReleaseImages { release: string; registry: string; storage?: string; control?: string; compute?: { '18'?: string; '19'?: string } }
+/** The operator's setting that holds its release's image map, as JSON. */
+export const RELEASE_IMAGES_ENV = 'PEAT_RELEASE_IMAGES'
+const DIGEST_REF = /^[a-z0-9][a-z0-9._\-/:]*@sha256:[0-9a-f]{64}$/
+
+/** An image map read and checked: what is not a map of digest references is refused, never read as no map. */
+export function parseReleaseImages(text: string): ReleaseImages {
+  let m: any
+  try { m = JSON.parse(text) } catch (e) { throw new Error(`the image map is not JSON: ${String(e).slice(0, 120)}`) }
+  if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Error('the image map is not an object')
+  for (const f of ['release', 'registry']) if (typeof m[f] !== 'string' || !m[f]) throw new Error(`the image map names no ${f}`)
+  const known = new Set(['release', 'registry', 'storage', 'control', 'compute'])
+  const unknown = Object.keys(m).filter((f) => !known.has(f))
+  if (unknown.length) throw new Error(`the image map has fields it should not: ${unknown.join(', ')}`)
+  if (m.compute !== undefined && (typeof m.compute !== 'object' || m.compute === null || Object.keys(m.compute).some((v) => v !== '18' && v !== '19'))) throw new Error('the image map\'s compute names versions other than 18 and 19')
+  const named: [string, unknown][] = [['storage', m.storage], ['control', m.control], ['compute 18', m.compute?.['18']], ['compute 19', m.compute?.['19']]]
+  for (const [what, ref] of named) if (ref !== undefined && (typeof ref !== 'string' || !DIGEST_REF.test(ref))) throw new Error(`the image map's ${what} image is not a reference by digest (name@sha256:...): ${String(ref).slice(0, 120)}`)
+  return { release: m.release, registry: m.registry.replace(/\/$/, ''), ...(m.storage ? { storage: m.storage } : {}), ...(m.control ? { control: m.control } : {}), ...(m.compute ? { compute: { ...(m.compute['18'] ? { '18': m.compute['18'] } : {}), ...(m.compute['19'] ? { '19': m.compute['19'] } : {}) } } : {}) }
+}
+
+/**
+ * The images of a release: the Platform's own where it names one, else the image map's digest where the map is of that release and that
+ * registry, else the registry's tag.
+ */
+export function imagesOf(spec: PlatformSpec, release: string = spec.release, map?: ReleaseImages): Images {
   const r = spec.images.registry.replace(/\/$/, '')
   const own = release === spec.release
+  const m = map && map.release === release && map.registry === r ? map : undefined
   return {
     release,
-    storage: (own && spec.images.storage) || `${r}/storage:${release}`,
-    control: (own && spec.images.control) || `${r}/control:${release}`,
-    compute: { 18: (own && spec.images.compute?.['18']) || `${r}/compute-pg18:${release}`, 19: (own && spec.images.compute?.['19']) || `${r}/compute-pg19:${release}` },
+    storage: (own && spec.images.storage) || m?.storage || `${r}/storage:${release}`,
+    control: (own && spec.images.control) || m?.control || `${r}/control:${release}`,
+    compute: { 18: (own && spec.images.compute?.['18']) || m?.compute?.['18'] || `${r}/compute-pg18:${release}`, 19: (own && spec.images.compute?.['19']) || m?.compute?.['19'] || `${r}/compute-pg19:${release}` },
   }
 }
 
@@ -145,12 +174,12 @@ export function storeEgressExcept(endpoint: string, set?: string[]): string[] {
   return PRIVATE_RANGES
 }
 
-export function resolve(p: Platform, spec: PlatformSpec, placements: Placements): Resolved {
+export function resolve(p: Platform, spec: PlatformSpec, placements: Placements, map?: ReleaseImages): Resolved {
   return {
     name: p.metadata.name,
     spec,
     names: namesOf(spec),
-    images: imagesOf(spec),
+    images: imagesOf(spec, spec.release, map),
     store: {
       endpoint: spec.objectStore.endpoint,
       region: spec.objectStore.region,

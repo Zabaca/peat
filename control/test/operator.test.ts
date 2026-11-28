@@ -4,6 +4,7 @@ import { ENTRIES, verifiedScope } from '../src/operator/keys'
 import { PLACEMENTS_CONFIG_MAP, reconcile } from '../src/operator/reconcile'
 import { KEYS_SECRET, MANAGED_BY } from '../src/operator/render'
 import { EXEC_ROLE, OPERATOR_EXEC_POLICY, OPERATOR_POLICIES, SECRETS_ROLE, installManifests } from '../src/install/install'
+import { RELEASE_IMAGES_ENV, imagesOf, parseReleaseImages, specOf, type ReleaseImages } from '../src/operator/platform'
 import { FakeKube } from './fake-kube'
 
 // The operator as an installer meets it: a Platform declared on a cluster of labelled machines, one pass (or a few), and what the cluster
@@ -542,5 +543,84 @@ describe('the install file', () => {
     expect(noExec.spec.matchConditions).toEqual([{ name: 'by-the-operator', expression: "request.userInfo.username == 'system:serviceaccount:peat-system:peat-operator'" }])
     expect(noExec.spec.validations[0].expression).toBe('false')
     expect(m.find((x) => x.kind === 'ValidatingAdmissionPolicyBinding' && x.metadata.name === OPERATOR_EXEC_POLICY).spec).toEqual({ policyName: OPERATOR_EXEC_POLICY, validationActions: ['Deny'] })
+  })
+})
+
+describe('the release\'s image map: every piece by digest', () => {
+  const D = (c: string) => `sha256:${c.repeat(64)}`
+  const R = 'ghcr.io/zabaca/peat'
+  const MAP: ReleaseImages = {
+    release: 'release-2026-12-01', registry: R,
+    storage: `${R}/storage:release-2026-12-01@${D('a')}`, control: `${R}/control:release-2026-12-01@${D('b')}`,
+    compute: { '18': `${R}/compute-pg18:release-2026-12-01@${D('c')}`, '19': `${R}/compute-pg19:release-2026-12-01@${D('d')}` },
+  }
+  const ready = () => {
+    for (const o of [...k.all('deployments'), ...k.all('statefulsets')]) o.status = { readyReplicas: o.spec.replicas, updatedReplicas: o.spec.replicas }
+    for (const [i] of ['machine-1', 'machine-2', 'machine-3'].entries()) {
+      const sk = k.get('apps/v1', 'statefulsets', 'peat', `safekeeper-w${i + 1}`)
+      if (!sk) k.put({ apiVersion: 'apps/v1', kind: 'StatefulSet', metadata: { name: `safekeeper-w${i + 1}`, namespace: 'peat', labels: { 'peat-sk': 'true' } }, spec: { replicas: 1, template: { spec: { containers: [{ name: 'safekeeper', image: env(k.get('apps/v1', 'deployments', 'peat', 'peat-control'))['STORAGE_IMAGE'] }] } } }, status: { readyReplicas: 1, updatedReplicas: 1 } })
+    }
+  }
+
+  test('a map is read only when every image it names is a reference by digest', () => {
+    expect(parseReleaseImages(JSON.stringify(MAP))).toEqual(MAP)
+    expect(parseReleaseImages(JSON.stringify({ release: 'ci', registry: `${R}/`, storage: MAP.storage }))).toEqual({ release: 'ci', registry: R, storage: MAP.storage })
+    expect(() => parseReleaseImages(JSON.stringify({ ...MAP, storage: `${R}/storage:release-2026-12-01` }))).toThrow('not a reference by digest')
+    expect(() => parseReleaseImages(JSON.stringify({ ...MAP, compute: { '18': `${R}/compute-pg18@sha256:abc` } }))).toThrow('compute 18 image is not a reference by digest')
+    expect(() => parseReleaseImages(JSON.stringify({ ...MAP, compute: { '17': MAP.compute!['18'] } }))).toThrow('versions other than 18 and 19')
+    expect(() => parseReleaseImages(JSON.stringify({ ...MAP, release: '' }))).toThrow('names no release')
+    expect(() => parseReleaseImages(JSON.stringify({ ...MAP, images: {} }))).toThrow('fields it should not: images')
+    expect(() => parseReleaseImages('{')).toThrow('not JSON')
+    expect(() => parseReleaseImages('[]')).toThrow('not an object')
+  })
+
+  test('the map names the images of its release on its registry; what the Platform pins comes first; another release or registry keeps its tags', () => {
+    const spec = (extra: Record<string, unknown> = {}) => { const s = specOf(platform(extra) as any); if ('errors' in s) throw new Error(s.errors.join('; ')); return s.spec }
+    expect(imagesOf(spec(), 'release-2026-12-01', MAP)).toEqual({ release: 'release-2026-12-01', storage: MAP.storage!, control: MAP.control!, compute: { 18: MAP.compute!['18']!, 19: MAP.compute!['19']! } })
+    const pinned = imagesOf(spec({ images: { control: 'example.com/own/control:mine' } }), 'release-2026-12-01', MAP)
+    expect(pinned.control).toBe('example.com/own/control:mine')
+    expect(pinned.storage).toBe(MAP.storage!)
+    expect(imagesOf(spec({ release: 'release-2026-12-15' }), 'release-2026-12-15', MAP).storage).toBe(`${R}/storage:release-2026-12-15`)
+    expect(imagesOf(spec({ images: { registry: 'mirror.example.com/peat' } }), 'release-2026-12-01', MAP).storage).toBe('mirror.example.com/peat/storage:release-2026-12-01')
+    // a map that names fewer images: the rest are the registry's tags
+    expect(imagesOf(spec(), 'release-2026-12-01', { release: 'release-2026-12-01', registry: R, storage: MAP.storage }).control).toBe(`${R}/control:release-2026-12-01`)
+  })
+
+  test('an install of the map\'s release runs every piece by digest, and records the digests as what it runs', async () => {
+    k.put(platform())
+    await reconcile(k, { releaseImages: MAP })
+    expect(k.get('apps/v1', 'deployments', 'peat', 'storage-controller').spec.template.spec.containers[0].image).toBe(MAP.storage)
+    expect(k.get('apps/v1', 'statefulsets', 'peat', 'pageserver-w1').spec.template.spec.containers.map((c: any) => c.image)).toEqual([MAP.storage])
+    const control = k.get('apps/v1', 'deployments', 'peat', 'peat-control')
+    expect(control.spec.template.spec.containers[0].image).toBe(MAP.control)
+    expect(env(control)).toMatchObject({ STORAGE_IMAGE: MAP.storage, COMPUTE_IMAGE: MAP.compute!['18'], COMPUTE_IMAGE_PG19: MAP.compute!['19'] })
+    expect(k.get('apps/v1', 'deployments', 'peat-gateway', 'peat-gateway').spec.template.spec.containers[0].image).toBe(MAP.control)
+    // the guards admit the digests: the control layer makes the computes and the safekeepers of exactly these images
+    const guards = JSON.stringify(k.all('validatingadmissionpolicies'))
+    for (const i of [MAP.storage, MAP.compute!['18'], MAP.compute!['19']]) expect(guards).toContain(`'${i}'`)
+    ready()
+    await reconcile(k, { releaseImages: MAP })
+    expect(statusOf()).toMatchObject({ phase: 'Ready', release: 'release-2026-12-01', images: { storage: MAP.storage, control: MAP.control } })
+  })
+
+  test('a platform that runs the release by tags is moved to the digests by the ordered upgrade, never by rendering every piece anew', async () => {
+    k.put(platform())
+    await reconcile(k)
+    ready()
+    await reconcile(k)
+    expect(statusOf()).toMatchObject({ phase: 'Ready', images: { storage: `${R}/storage:release-2026-12-01` } })
+    const r = await reconcile(k, { releaseImages: MAP })
+    expect(r.phase).toBe('Upgrading')
+    expect(statusOf().upgrade).toMatchObject({ from: 'release-2026-12-01', to: 'release-2026-12-01', toImages: { storage: MAP.storage } })
+    // the pieces not yet stepped stay on the tags they run
+    expect(k.get('apps/v1', 'statefulsets', 'peat', 'pageserver-w2').spec.template.spec.containers[0].image).toBe(`${R}/storage:release-2026-12-01`)
+  })
+
+  test('the install file made from a map runs its control image and hands the operator the map; --image names another', () => {
+    const dep = (m: any[]) => m.find((x) => x.kind === 'Deployment')
+    const withMap = dep(installManifests(MAP.control!, undefined, MAP) as any[])
+    expect(withMap.spec.template.spec.containers[0].image).toBe(MAP.control)
+    expect(parseReleaseImages(env(withMap)[RELEASE_IMAGES_ENV] as string)).toEqual(MAP)
+    expect(env(dep(installManifests('img') as any[]))[RELEASE_IMAGES_ENV]).toBeUndefined()
   })
 })
