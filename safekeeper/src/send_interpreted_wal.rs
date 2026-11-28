@@ -926,15 +926,6 @@ mod tests {
         .unwrap();
         let end_pos = end_watch.get();
 
-        let streaming_wal_reader = StreamingWalReader::new(
-            resident_tli,
-            None,
-            start_lsn,
-            end_pos,
-            end_watch,
-            MAX_SEND_SIZE,
-        );
-
         let shard_0 =
             ShardIdentity::new(ShardNumber(0), ShardCount(SHARD_COUNT), DEFAULT_STRIPE_SIZE)
                 .unwrap();
@@ -972,6 +963,21 @@ mod tests {
             .collect::<Vec<_>>();
 
         let first_sender = senders.first_mut().unwrap();
+
+        // The stream must start where the reader does, as in send_wal.rs. It used to start at the
+        // timeline's first LSN while the decoder started at the first sender's: a chunk the reader
+        // consumed before it had handled the fanout notifications (which reset the stream) was fed
+        // to a decoder at the wrong position and failed with "invalid xlog page header", about
+        // 1 run in 60 on a loaded machine.
+        let streaming_wal_reader = StreamingWalReader::new(
+            resident_tli,
+            None,
+            first_sender.start_lsn,
+            end_pos,
+            end_watch,
+            MAX_SEND_SIZE,
+        );
+
         let handle = InterpretedWalReader::spawn(
             streaming_wal_reader,
             first_sender.start_lsn,
