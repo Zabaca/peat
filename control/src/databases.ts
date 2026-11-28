@@ -82,6 +82,8 @@ export function databaseAction(o: DbObject, all: DbObject[], ctx: { replacementO
       const p = others.find((x) => x.metadata.name === from && x.metadata.namespace === o.metadata.namespace)
       if (!p) return { do: 'wait', why: `no database ${from} in ${o.metadata.namespace} to make it from` }
       if (!made(p)) return { do: 'wait', why: `${from} is not made yet` }
+      // a replica's data is its primary's: a branch, a restore or a replica is made from the primary, never from a replica
+      if (p.spec?.replicaOf) return { do: 'refuse', why: `${from} is a replica of ${p.spec.replicaOf}: make ${o.spec?.replicaOf ? 'a replica' : o.spec?.at ? 'a restore' : 'a branch'} of ${p.spec.replicaOf} instead` }
       if (o.spec?.pgVersion && p.status?.pgVersion && o.spec.pgVersion !== p.status.pgVersion) return { do: 'refuse', why: `a branch or a replica is of its parent's version (${p.status.pgVersion}), not ${o.spec.pgVersion}` }
       // a restore to a moment before the parent moved to a newer version: the parent's timeline then was the old copy's
       const mv = p.status?.move

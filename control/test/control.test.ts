@@ -197,6 +197,22 @@ describe('what the control layer makes, and what its account must be granted', (
   })
 })
 
+describe('a read replica, reached as any database', () => {
+  test('it has its own route port and name Service; the routes, the route lookup and the Clusters the gateways wake and put to sleep include it', () => {
+    const replica = control.slice(control.indexOf('async function makeReplica'), control.indexOf('// A deleted database'))
+    expect(replica).toContain('const port = await claimPort(RECORDS, name, parent.timeline, PORT_BASE, await usedPorts())')
+    expect(replica).toContain('await apply(`/api/v1/namespaces/${DB_NS}/services`, name, nameService(name))')
+    expect(replica).not.toContain('port: 0')
+    expect(control).toContain('const rows = (async () => (await listDbs()).filter((d) => d.port && !d.closed).map((d) =>')
+    expect(control).toContain("return d && d.port && !d.closed ? json({ port: d.port })")
+    const cl = control.slice(control.indexOf('async function clusters()'), control.indexOf('// The routes the gateways listen on'))
+    expect(cl).toContain('const dbs = await listDbs()')
+    expect(cl).not.toContain("d.mode !== 'primary'")
+    // one made before replicas had routes is given one
+    expect(control).toContain("if (s && s.mode === 'replica' && !s.port && !o.metadata.deletionTimestamp && recs.has(name)) {")
+  })
+})
+
 describe('who may call which route', () => {
   test('a gateway reaches only what its program calls (never a delete, a restore, the trim, an upgrade or a registration), the safekeepers one question and the storage controller its hook', () => {
     const routes = callerRoutes()
