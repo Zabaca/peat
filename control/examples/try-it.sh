@@ -88,6 +88,13 @@ echo "  wrote and read back: $(sql 'select count(*) from t') rows, over TLS veri
 
 say "asleep, then woken by a connection"
 peat stop hello
+# the status says asleep as soon as the stop is asked; the compute's pod can still answer for a few seconds while it ends, which would
+# make the "wake" below measure nothing (seen: a connection answered in 0.1 s by the old compute, then cut). Wait until the pod is gone.
+t0=$(date +%s)
+until [ -z "$(k -n peat-compute get pods -l compute=hello -o name)" ]; do
+  [ $(( $(date +%s) - t0 )) -lt 120 ] || { echo "the compute's pod did not end in 2 minutes: kubectl --context kind-$CLUSTER -n peat-compute get pods" >&2; exit 1; }
+  sleep 1
+done
 k get database hello
 t0=$(date +%s)
 echo "  a connection wakes it: $(sql 'select count(*) from t') rows, $(( $(date +%s) - t0 )) s"
