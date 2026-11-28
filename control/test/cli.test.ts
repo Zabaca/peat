@@ -108,6 +108,18 @@ describe('keeping them', () => {
     expect(await peat('move', 'orders', '--back', '--no-wait')).toBe(0)
     expect(k.get(DB, 'databases', 'shop', 'orders').spec.requests.moveBack).toBe('2026-12-01T12:00:00.000Z')
   })
+  test('after a way back the spec still names 19: moving to 19 again asks a retry, never waits on nothing', async () => {
+    made('orders', 'shop', { pgVersion: 18 })
+    const o = k.get(DB, 'databases', 'shop', 'orders')
+    o.spec = { pgVersion: 19 }
+    o.status.move = { to: 19, state: 'back', message: 'back on Postgres 18 as of the move' }
+    setTimeout(() => { const x = k.get(DB, 'databases', 'shop', 'orders'); x.status.move = { to: 19, state: 'done', request: x.spec.requests?.retryMove, message: 'moved to Postgres 19 under its own name' } }, 20)
+    expect(await peat('move', 'orders', '--pg', '19', '--verify', 'full')).toBe(0)
+    const spec = k.get(DB, 'databases', 'shop', 'orders').spec
+    expect(spec.requests.retryMove).toBe('2026-12-01T12:00:00.000Z')
+    expect(spec.moveVerify).toBe('full')
+    expect(lines.at(-1)).toBe('shop/orders: done: moved to Postgres 19 under its own name')
+  })
   test('a move to a version not above the one it runs is refused before anything is asked', async () => {
     made('orders', 'shop', { pgVersion: 19 })
     expect(await peat('move', 'orders', '--pg', '19')).toBe(1)

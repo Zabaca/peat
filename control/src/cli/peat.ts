@@ -222,6 +222,14 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
         if (Number(o.status?.pgVersion ?? 0) >= pg) throw new Refused(`${a} runs Postgres ${o.status?.pgVersion}: a move goes to a newer version`)
         const verify = opts['verify'] === undefined ? undefined : String(opts['verify'])
         if (verify !== undefined && verify !== 'counts' && verify !== 'full') throw new Refused(`--verify is counts (every table's row count, the default) or full (every row), not ${JSON.stringify(verify)}`)
+        // the spec already names the version (a move that went back, or failed): raising it again changes nothing, so the move is asked
+        // again as a retry, which a person would ask with --retry; one under way is followed
+        if (Number(o.spec?.pgVersion ?? 0) === pg) {
+          const mv = o.status?.move ?? {}
+          if (mv.state && !moveDone(o) && !mv.rehearsal) return await follow((y) => y.status?.move?.to === pg && !y.status?.move?.rehearsal, `the move to Postgres ${pg}, under way`)
+          await patch(o, { spec: { ...(verify ? { moveVerify: verify } : {}), requests: { retryMove: at } } })
+          return await follow((y) => y.status?.move?.request === at, `the move to Postgres ${pg} again (a retry: the spec names it already)`)
+        }
         await patch(o, { spec: { pgVersion: pg, ...(verify ? { moveVerify: verify } : {}) } })
         return await follow((y) => y.status?.move?.to === pg && !y.status?.move?.rehearsal, `the move to Postgres ${pg}`)
       }
