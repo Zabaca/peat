@@ -234,7 +234,7 @@ export const databaseStatus: Schema = obj('The database as it is.', {
   observedGeneration: int('The generation of the spec this status is about.'),
   phase: str('Creating, Ready (awake or asleep), Closed, Moving, Deleting or Failed.', { enum: ['Creating', 'Ready', 'Closed', 'Moving', 'Deleting', 'Failed'] }),
   message: str('What a person reads first.'),
-  host: str('The name a client connects to from outside the cluster (<name>.<domain>), when the platform has a domain.'),
+  host: str('The name a client connects to: <name>.<domain> when the platform has a domain (from outside the cluster), else the name inside the cluster.'),
   serviceHost: str('The name inside the cluster.'),
   port: int('The port (the front door\'s, 5432).'),
   loginSecret: str('The Secret in this namespace holding its login: username, password, and a connection URL.'),

@@ -114,7 +114,7 @@ const describe = (o: any): string => {
   return [
     `${o.metadata.namespace}/${o.metadata.name}: ${s.phase ?? 'Creating'}${s.awake ? ', awake' : ''}${s.pgVersion ? `, Postgres ${s.pgVersion}` : ''}`,
     ...(s.host ? [`  connect to ${s.host}:${s.port ?? 5432}`] : []),
-    ...(s.serviceHost ? [`  inside the cluster: ${s.serviceHost}:${s.port ?? 5432}`] : []),
+    ...(s.serviceHost && s.serviceHost !== s.host ? [`  inside the cluster: ${s.serviceHost}:${s.port ?? 5432}`] : []),
     ...(s.loginSecret ? [`  login: Secret ${s.loginSecret}; authority's certificate: ConfigMap ${s.caConfigMap ?? 'peat-ca'} (sslmode=verify-full)`] : []),
     ...(o.spec?.parent ? [`  made from ${o.spec.parent}${o.spec.at ? ` at ${o.spec.at}` : ''}`] : []),
     ...(o.spec?.replicaOf ? [`  a replica of ${o.spec.replicaOf}`] : []),

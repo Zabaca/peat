@@ -3,7 +3,7 @@ import { reconcile } from '../src/operator/reconcile'
 import { differences } from '../src/operator/differences'
 import type { Storage } from '../src/operator/storage'
 import { decide, imagesFor, nextPhase, sameImage, stepsOf, type UpgradeState } from '../src/operator/upgrade'
-import { FakeKube } from './fake-kube'
+import { FakeKube, storeSecret } from './fake-kube'
 
 // The ordered upgrade, first as decisions, then as passes of the operator over an API server in memory with a stand-in storage: the order,
 // the checks between steps, a halt that waits for a person, a retry, going back over only what moved, quiet hours, and adoption.
@@ -114,6 +114,7 @@ const image = (kind: string, ns: string, name: string) => k.get('apps/v1', kind,
 beforeEach(async () => {
   k = new FakeKube()
   for (const n of ['machine-1', 'machine-2', 'machine-3']) k.put({ apiVersion: 'v1', kind: 'Node', metadata: { name: n, labels: LABEL } })
+  k.put(storeSecret('s'))
   clock = new Date('2026-12-01T12:00:00Z')
   unsettled = []
   calls.length = 0

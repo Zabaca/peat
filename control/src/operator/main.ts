@@ -3,6 +3,7 @@
 import { randomBytes } from 'node:crypto'
 import { inCluster, ok, type Kube } from '../kube'
 import { reconcile } from './reconcile'
+import { bunStoreProbe } from './prereqs'
 import { GROUP } from '../names'
 import { RELEASE_IMAGES_ENV, parseReleaseImages, type ReleaseImages } from './platform'
 
@@ -85,7 +86,7 @@ for (;;) {
     leading = await lease(k)
     if (leading !== was) console.log(`lease: ${ME} ${leading ? 'acts now' : 'no longer acts'}`)
     if (leading) {
-      const r = await reconcile(k, { releaseImages })
+      const r = await reconcile(k, { releaseImages, storeProbe: bunStoreProbe })
       passes++
       lastOk = Date.now()
       if (r.applied || r.pruned || r.phase !== 'Ready') console.log(`pass: ${r.platform ?? '(none)'} ${r.phase}: ${r.message}${r.pruned ? ` (${r.pruned} removed)` : ''}`)

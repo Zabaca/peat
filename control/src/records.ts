@@ -88,7 +88,8 @@ export async function save(d: Deps, r: Db, more: Record<string, unknown> = {}): 
   ok(await d.kube('PATCH', `${dbObjectPath(r.namespace, r.name)}/status`, { status: {
     tenant: r.tenant, timeline: r.timeline, pgVersion: r.pg, createdAt: r.created,
     record: { mode: r.mode, root: r.root, parent: r.parent, from: r.from, port: r.port },
-    serviceHost: `${r.name}.${d.dbNs}.svc`, ...(d.domain ? { host: `${r.name}.${d.domain}` } : {}), port: 5432,
+    // the address a client connects to: the platform's domain, else the name inside the cluster (what `kubectl get database` shows as Host)
+    serviceHost: `${r.name}.${d.dbNs}.svc`, host: d.domain ? `${r.name}.${d.domain}` : `${r.name}.${d.dbNs}.svc`, port: 5432,
     ...more,
   } }, 'application/merge-patch+json'), `record ${r.name}`)
 }

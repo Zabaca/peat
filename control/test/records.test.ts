@@ -66,6 +66,11 @@ describe('the record, in the status and in the platform namespace', () => {
     expect(o.status).toMatchObject({ phase: 'Ready', host: 'orders.db.example.com', serviceHost: 'orders.peat-db.svc', port: 5432 })
     expect((await readRecords(deps)).get('orders')!.db).toEqual(d)
   })
+  test('with no domain the host is the name inside the cluster, so kubectl get database always shows where to connect', async () => {
+    object('orders', 'shop')
+    await save({ ...deps, domain: '' }, root('orders', hex('a')), { phase: 'Ready' })
+    expect(k.get('peat.zabaca.com/v1alpha1', 'databases', 'shop', 'orders').status).toMatchObject({ host: 'orders.peat-db.svc', serviceHost: 'orders.peat-db.svc' })
+  })
   test('a record from before Database objects reads as one of the database namespace, with no parent it was made from', () => {
     const old = fromConfigMap({ metadata: { name: 'db-lake', creationTimestamp: '2026-10-01T00:00:00Z' }, data: { tenant: hex('a'), timeline: hex('b'), parent: '', root: 'true', mode: 'primary', port: '15011', pg: '18' } }, 'peat-db')
     expect(old).toMatchObject({ name: 'lake', namespace: 'peat-db', from: '', created: '2026-10-01T00:00:00Z', pg: 18, port: 15011 })

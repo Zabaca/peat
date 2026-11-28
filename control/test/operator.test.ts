@@ -5,7 +5,8 @@ import { PLACEMENTS_CONFIG_MAP, reconcile } from '../src/operator/reconcile'
 import { KEYS_SECRET, MANAGED_BY } from '../src/operator/render'
 import { EXEC_ROLE, OPERATOR_EXEC_POLICY, OPERATOR_POLICIES, SECRETS_ROLE, installManifests } from '../src/install/install'
 import { RELEASE_IMAGES_ENV, imagesOf, parseReleaseImages, specOf, type ReleaseImages } from '../src/operator/platform'
-import { FakeKube } from './fake-kube'
+import { FakeKube, storeSecret } from './fake-kube'
+import type { StoreProbe } from '../src/operator/prereqs'
 
 // The operator as an installer meets it: a Platform declared on a cluster of labelled machines, one pass (or a few), and what the cluster
 // then holds and what the Platform's status says. The API server is the in-memory one of fake-kube.ts.
@@ -24,6 +25,7 @@ beforeEach(() => {
   k = new FakeKube()
   for (const n of ['machine-1', 'machine-2', 'machine-3']) k.put(node(n))
   k.put(node('other-work', false))
+  k.put(storeSecret())
 })
 const statusOf = (name = 'peat') => k.get('peat.zabaca.com/v1alpha1', 'platforms', null, name).status
 
@@ -200,6 +202,8 @@ describe('the review\'s rules', () => {
 })
 
 describe('a given authority, and an issuer', () => {
+  // the issuer the tests name, as cert-manager has it
+  beforeEach(() => { k.put({ apiVersion: 'cert-manager.io/v1', kind: 'ClusterIssuer', metadata: { name: 'corp-ca' }, spec: {} }) })
   test('keys.caSecret is read from the platform namespace, and peat-ca carries its certificate', async () => {
     const { newCa } = await import('../src/operator/keys')
     const ca = newCa()
@@ -653,5 +657,94 @@ describe('the release\'s image map: every piece by digest', () => {
     expect(withMap.spec.template.spec.containers[0].image).toBe(MAP.control)
     expect(parseReleaseImages(env(withMap)[RELEASE_IMAGES_ENV] as string)).toEqual(MAP)
     expect(env(dep(installManifests('img') as any[]))[RELEASE_IMAGES_ENV]).toBeUndefined()
+  })
+})
+
+describe('what a first install needs from outside, said with what to do', () => {
+  const nothingMade = () => expect([...k.all('statefulsets'), ...k.all('deployments')]).toEqual([])
+  test('a Platform just applied says Installing at once, even when its first pass goes no further', async () => {
+    k.put(platform())
+    k.forced.set('GET /api/v1/nodes', { status: 500, json: { message: 'the API server is busy' } })
+    await expect(reconcile(k)).rejects.toThrow()
+    expect(statusOf()).toMatchObject({ phase: 'Installing', message: 'taken up: checking what it needs' })
+  })
+  test('no labelled machine: the command that labels one', async () => {
+    for (const n of ['machine-1', 'machine-2', 'machine-3']) k.put({ ...node(n, false) })
+    k.put(platform())
+    await reconcile(k)
+    expect(statusOf().message).toContain('kubectl label node <node> peat.zabaca.com/machine=true (three for the default spread, or one with spread none)')
+  })
+  test('the store\'s Secret missing, or lacking a key: Failed with the command that makes it, and nothing made', async () => {
+    k.objects.clear()
+    for (const n of ['machine-1', 'machine-2', 'machine-3']) k.put(node(n))
+    k.put(platform())
+    await reconcile(k)
+    expect(statusOf()).toMatchObject({ phase: 'Failed', message: "the store's Secret peat/peat-store is missing: make it with kubectl -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=<key id> --from-literal=AWS_SECRET_ACCESS_KEY=<secret key>" })
+    nothingMade()
+    // the namespaces are made first, so the Secret can be put in
+    expect(k.get('v1', 'namespaces', null, 'peat')).toBeDefined()
+    k.put(storeSecret('peat-store', 'peat', { AWS_ACCESS_KEY_ID: 'id-only' }))
+    await reconcile(k)
+    expect(statusOf().message).toBe("the store's Secret peat/peat-store has no AWS_SECRET_ACCESS_KEY: add it (the store's access key id and secret key)")
+    nothingMade()
+    k.put(storeSecret())
+    expect((await reconcile(k)).phase).toBe('Installing')
+  })
+  test('records in Postgres: its URL\'s Secret missing is said with the command', async () => {
+    k.put(platform({ controller: { records: 'postgres', postgres: { urlSecret: 'records-db' } } }))
+    await reconcile(k)
+    expect(statusOf().message).toContain('controller.postgres: the Secret peat/records-db is missing: make it with kubectl -n peat create secret generic records-db --from-literal=uri=postgresql://')
+  })
+  test('certificates.issuer without cert-manager, or naming an issuer that is not there: Failed with what to do', async () => {
+    k.put(platform({ certificates: { issuer: { name: 'corp-ca', kind: 'ClusterIssuer' } } }))
+    k.forced.set('GET /apis/cert-manager.io/v1', { status: 404, json: {} })
+    await reconcile(k)
+    expect(statusOf()).toMatchObject({ phase: 'Failed', message: "certificates.issuer names ClusterIssuer/corp-ca, but cert-manager is not installed (the cluster serves no cert-manager.io/v1): install cert-manager, or leave certificates.issuer out, and the platform's own authority signs the databases' certificates" })
+    nothingMade()
+    k.forced.delete('GET /apis/cert-manager.io/v1')
+    await reconcile(k)
+    expect(statusOf().message).toContain('certificates.issuer names ClusterIssuer/corp-ca, which the cluster does not have: make it')
+    k.put(platform({ certificates: { issuer: { name: 'team-ca' } } }))
+    await reconcile(k)
+    expect(statusOf().message).toContain('certificates.issuer names Issuer/team-ca, which is not in peat-compute')
+    k.put({ apiVersion: 'cert-manager.io/v1', kind: 'Issuer', metadata: { name: 'team-ca', namespace: 'peat-compute' }, spec: {} })
+    expect((await reconcile(k)).phase).toBe('Installing')
+  })
+  test('the bucket: one request to the store while not Ready; not found or refused fails it with the store\'s own words and never the key; a store not answering does not', async () => {
+    const asked: string[] = []
+    let answer: Awaited<ReturnType<StoreProbe>> = { ok: false, refused: true, error: 'NoSuchBucket: The specified bucket does not exist' }
+    const storeProbe: StoreProbe = async (p) => { asked.push(`${p.endpoint} ${p.bucket} ${p.prefix} ${p.id}`); return answer }
+    k.put(platform())
+    await reconcile(k, { storeProbe })
+    expect(asked).toEqual(['https://s3.example.com peat-data pageserver test-key-id'])
+    expect(statusOf()).toMatchObject({ phase: 'Failed', message: 'the store at https://s3.example.com answered for the bucket peat-data (with the Secret peat/peat-store): NoSuchBucket: The specified bucket does not exist: make the bucket, or set objectStore\'s bucket, endpoint or Secret to the store\'s' })
+    expect(statusOf().message).not.toContain('test-secret-key')
+    nothingMade()
+    answer = { ok: false, refused: false, error: 'the store did not answer in 10 s' }
+    expect((await reconcile(k, { storeProbe })).phase).toBe('Installing')
+    answer = { ok: true }
+    for (const o of [...k.all('deployments'), ...k.all('statefulsets')]) o.status = { readyReplicas: o.spec.replicas, updatedReplicas: o.spec.replicas }
+    for (const [i] of ['machine-1', 'machine-2', 'machine-3'].entries()) k.put({ apiVersion: 'apps/v1', kind: 'StatefulSet', metadata: { name: `safekeeper-w${i + 1}`, namespace: 'peat', labels: { 'peat-sk': 'true' } }, spec: { replicas: 1, template: { spec: { containers: [{ name: 'safekeeper', image: 'ghcr.io/zabaca/peat/storage:release-2026-12-01' }] } } }, status: { readyReplicas: 1, updatedReplicas: 1 } })
+    await reconcile(k, { storeProbe })
+    expect(statusOf().message).toBe('every piece is ready on release-2026-12-01')
+    const n = asked.length
+    await reconcile(k, { storeProbe })
+    expect(asked.length).toBe(n) // a Ready platform asks the store nothing
+  })
+  test('the real probe reads a store\'s refusal as one, and the credentials never appear in what it says', async () => {
+    const { bunStoreProbe } = await import('../src/operator/prereqs')
+    // nothing listens on this port: the store did not answer, which is not a refusal
+    const a = await bunStoreProbe({ endpoint: 'http://127.0.0.1:9', region: 'us-east-1', bucket: 'peat', prefix: 'pageserver', id: 'AKIDEXAMPLE', secret: 'wJalrXUtnFEMIEXAMPLEKEY' })
+    expect(a.ok).toBe(false)
+    if (!a.ok) { expect(a.refused).toBe(false); expect(a.error).not.toContain('wJalrXUtnFEMIEXAMPLEKEY') }
+  })
+  test('a piece whose image cannot be pulled says which image and the pull\'s error', async () => {
+    k.put(platform())
+    await reconcile(k)
+    const ctl = k.get('apps/v1', 'deployments', 'peat', 'storage-controller')
+    const image = ctl.spec.template.spec.containers[0].image
+    k.put({ apiVersion: 'v1', kind: 'Pod', metadata: { name: 'storage-controller-abc', namespace: 'peat', labels: ctl.spec.selector.matchLabels }, status: { containerStatuses: [{ name: 'storage-controller', image, ready: false, state: { waiting: { reason: 'ImagePullBackOff', message: `Back-off pulling image "${image}": not found` } } }] } })
+    await reconcile(k)
+    expect(statusOf().message).toContain(`storage-controller (0 of 1 ready: the image ${image} cannot be pulled (ImagePullBackOff: Back-off pulling image "${image}": not found))`)
   })
 })
