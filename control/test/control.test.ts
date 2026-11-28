@@ -234,8 +234,30 @@ describe("a database's own idle time", () => {
     expect(idle).toContain("if (typeof own !== 'string' || !own) return IDLE_MINUTES")
     expect(idle).toContain('return String(Math.max(1, Math.round(durationMs(own) / 60_000)))')
     expect(control).toContain('[SLEEP_IDLE_MINUTES]: idleMinutes,')
-    expect(control).toContain('clusterRow(d, pods, deps.get(d.name), idleMinutesFor(objects.get(d.name)))')
-    expect(control).toContain("idleMinutesFor((await dbObjects()).find((o) => o.metadata.name === name)))")
+    expect(control).toContain('clusterRow(d, pods, deps.get(d.name), idleMinutesFor(objects.get(d.name)), isStopping(objects.get(d.name)))')
+    expect(control).toContain('idleMinutesFor(o), isStopping(o))')
+  })
+})
+
+describe('a stop through a door: no connection is handed to a compute that is ending', () => {
+  test('marked stopping first, then the settle, then the stop; the mark goes once the pod is on its way out, asleep once it is gone', () => {
+    const behind = control.slice(control.indexOf('async function stopBehindTheDoor'), control.indexOf('// ---- the reconciler'))
+    expect(behind.indexOf('setTimeout(res, STOP_SETTLE_MS)')).toBeLessThan(behind.indexOf('await stopCompute(name, false, false)'))
+    expect(behind.indexOf('await stopCompute(name, false, false)')).toBeLessThan(behind.indexOf('{ stopping: null }'))
+    expect(behind.indexOf('{ stopping: null }')).toBeLessThan(behind.indexOf('await computeGone(name)'))
+    expect(behind.indexOf('await computeGone(name)')).toBeLessThan(behind.indexOf('markAwake(d, false)'))
+    expect(control).toContain("await patchDbStatus(d.namespace, name, { stopping: new Date().toISOString() })")
+  })
+  test('while marked: no address, the row asleep, and a start waits for the stop to end', () => {
+    expect(control).toContain('!stopping.has(p.metadata.labels.compute)) out[p.metadata.labels.compute] = p.status.podIP')
+    expect(control).toContain('const awake = (replicas ?? 0) > 0 && !stopping')
+    const start = control.slice(control.indexOf('async function startCompute'), control.indexOf('const existing = await livePod(d.name)'))
+    expect(start).toContain('if (!isStopping(o)) break')
+  })
+  test('a person\'s stop is answered once the compute has ended; the gateway\'s sleep and a restart go through the door too', () => {
+    expect(control).toContain("await stopThroughDoor(name)\n        await patchDbStatus(ns, name, { answered: { ...(o.status?.answered ?? {}), stop: act.request }, awake: false,")
+    expect(control).toContain('const shut = await shutTheDoor(name)')
+    expect(control).toContain('await stopThroughDoor(d.name)\n    await startCompute(d)')
   })
 })
 
