@@ -324,8 +324,10 @@ sql 'create table t (id int primary key, payload text)'
 sql "insert into t select g, md5(g::text) from generate_series(1, 100000) g"
 [ "$(sql 'select count(*) from t')" = 100000 ] || fail 'the rows written were not read back'
 echo "  first answer $first_s s after the make; 100000 rows written and read back with verify-full"
-got=$(k -n peat-compute get pods -l compute=first -o jsonpath='{.items[0].spec.containers[0].image}')
-[ "$got" = "$compute18" ] || [ "$got" = "$compute19" ] || fail "the first database's compute runs $got, not one of the given compute images"
+if [ -n "$map" ]; then
+  got=$(k -n peat-compute get pods -l compute=first -o jsonpath='{.items[0].spec.containers[0].image}')
+  [ "$got" = "$compute18" ] || [ "$got" = "$compute19" ] || fail "the first database's compute runs $got, not one of the map's compute images"
+fi
 
 if [ "$records" = kubernetes ]; then
   step "the storage controller's pod deleted and made again: the new one leads at its own address, the copy current, a new database attached"
