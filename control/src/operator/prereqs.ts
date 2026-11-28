@@ -1,6 +1,6 @@
 // What a Platform needs from outside it before its pieces can start, checked by the operator so that a first install says what is missing
 // and what to do, instead of waiting in Installing on pods that cannot start: the store's Secrets and their keys, the store's bucket (one
-// request to the store, while the platform is not Ready), the records' Postgres Secret, and cert-manager and the issuer when
+// request to the store, on a first install only), the records' Postgres Secret, and cert-manager and the issuer when
 // certificates.issuer names one. And, for a piece that is not ready, why its pods are not: an image that cannot be pulled, a container
 // that cannot be made or keeps failing, a pod that cannot be placed.
 import { S3Client } from 'bun'
@@ -83,13 +83,15 @@ export const bunStoreProbe: StoreProbe = async (p) => {
 /** For each piece's bucket and Secret, one request to the store: a bucket not found or credentials refused, with the store's error. */
 export async function storeProblems(r: Resolved, creds: Map<string, { id: string; secret: string }>, probe: StoreProbe): Promise<{ problems: string[]; unanswered: string[] }> {
   const problems: string[] = [], unanswered: string[] = []
-  const seen = new Set<string>()
+  // each bucket and Secret once, all asked at the same time: a store that does not answer holds the pass for one wait, not one per bucket
+  const asks = new Map<string, (typeof r.store.pageservers) & { id: string; secret: string }>()
   for (const ref of [r.store.pageservers, r.store.safekeepers, r.store.records]) {
     const c = creds.get(ref.credentialsSecret)
     const once = `${ref.bucket}|${ref.credentialsSecret}`
-    if (!c || seen.has(once)) continue
-    seen.add(once)
-    const a = await probe({ endpoint: r.store.endpoint, region: r.store.region, bucket: ref.bucket, prefix: ref.prefix, id: c.id, secret: c.secret })
+    if (c && !asks.has(once)) asks.set(once, { ...ref, ...c })
+  }
+  const answers = await Promise.all([...asks.values()].map(async (ref) => ({ ref, a: await probe({ endpoint: r.store.endpoint, region: r.store.region, bucket: ref.bucket, prefix: ref.prefix, id: ref.id, secret: ref.secret }) })))
+  for (const { ref, a } of answers) {
     if (a.ok) continue
     const said = `the store at ${r.store.endpoint} answered for the bucket ${ref.bucket} (with the Secret ${r.names.namespace}/${ref.credentialsSecret}): ${a.error}`
     if (a.refused) problems.push(`${said}: make the bucket, or set objectStore's bucket, endpoint or Secret to the store's`)

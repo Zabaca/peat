@@ -710,7 +710,7 @@ describe('what a first install needs from outside, said with what to do', () => 
     k.put({ apiVersion: 'cert-manager.io/v1', kind: 'Issuer', metadata: { name: 'team-ca', namespace: 'peat-compute' }, spec: {} })
     expect((await reconcile(k)).phase).toBe('Installing')
   })
-  test('the bucket: one request to the store while not Ready; not found or refused fails it with the store\'s own words and never the key; a store not answering does not', async () => {
+  test('the bucket: one request to the store on a first install; not found or refused fails it with the store\'s own words and never the key; a store not answering does not', async () => {
     const asked: string[] = []
     let answer: Awaited<ReturnType<StoreProbe>> = { ok: false, refused: true, error: 'NoSuchBucket: The specified bucket does not exist' }
     const storeProbe: StoreProbe = async (p) => { asked.push(`${p.endpoint} ${p.bucket} ${p.prefix} ${p.id}`); return answer }
@@ -727,9 +727,35 @@ describe('what a first install needs from outside, said with what to do', () => 
     for (const [i] of ['machine-1', 'machine-2', 'machine-3'].entries()) k.put({ apiVersion: 'apps/v1', kind: 'StatefulSet', metadata: { name: `safekeeper-w${i + 1}`, namespace: 'peat', labels: { 'peat-sk': 'true' } }, spec: { replicas: 1, template: { spec: { containers: [{ name: 'safekeeper', image: 'ghcr.io/zabaca/peat/storage:release-2026-12-01' }] } } }, status: { readyReplicas: 1, updatedReplicas: 1 } })
     await reconcile(k, { storeProbe })
     expect(statusOf().message).toBe('every piece is ready on release-2026-12-01')
+    const firstReady = statusOf().firstReadyAt
+    expect(Date.parse(firstReady)).toBeGreaterThan(0)
     const n = asked.length
     await reconcile(k, { storeProbe })
     expect(asked.length).toBe(n) // a Ready platform asks the store nothing
+    // one that has been Ready, with a piece down (a restart, a drain): Installing again, and still asks the store nothing
+    k.get('apps/v1', 'deployments', 'peat', 'storage-controller').status = { readyReplicas: 0, updatedReplicas: 1 }
+    expect((await reconcile(k, { storeProbe })).phase).toBe('Installing')
+    expect(asked.length).toBe(n)
+    expect(statusOf().firstReadyAt).toBe(firstReady)
+  })
+  test('a platform an earlier operator ran (a release recorded, no first Ready time) asks the store nothing', async () => {
+    const asked: string[] = []
+    const storeProbe: StoreProbe = async (p) => { asked.push(p.bucket); return { ok: false, refused: true, error: 'NoSuchBucket' } }
+    k.put({ ...platform(), status: { phase: 'Installing', release: 'release-2026-12-01' } })
+    await reconcile(k, { storeProbe })
+    expect(asked).toEqual([])
+  })
+  test('the buckets are asked at once: a store that does not answer holds a pass for one wait, not one per bucket', async () => {
+    const started: string[] = []
+    let release: () => void = () => {}
+    const gate = new Promise<void>((res) => { release = res })
+    const storeProbe: StoreProbe = async (p) => { started.push(p.bucket); await gate; return { ok: true } }
+    k.put(platform({ objectStore: { endpoint: 'https://s3.example.com', credentialsSecret: 'peat-store', pageservers: { bucket: 'ps', credentialsSecret: 'peat-store' }, safekeepers: { bucket: 'sk', credentialsSecret: 'peat-store' }, records: { bucket: 'rec', credentialsSecret: 'peat-store' } } }))
+    const pass = reconcile(k, { storeProbe })
+    for (let i = 0; i < 50 && started.length < 3; i++) await Bun.sleep(5)
+    expect(started.sort()).toEqual(['ps', 'rec', 'sk'])
+    release()
+    expect((await pass).phase).toBe('Installing')
   })
   test('the real probe reads a store\'s refusal as one, and the credentials never appear in what it says', async () => {
     const { bunStoreProbe } = await import('../src/operator/prereqs')

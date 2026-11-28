@@ -223,7 +223,7 @@ export interface Deps {
   now?: () => Date
   /** The image map of the operator's own release (from its install file): the digests of the pieces the Platform does not pin. */
   releaseImages?: ReleaseImages
-  /** One request to the store, for the bucket check while the platform is not Ready (the operator's pod passes the real one; none: no check). */
+  /** One request to the store, for the bucket check of a first install (the operator's pod passes the real one; none: no check). */
   storeProbe?: StoreProbe
 }
 
@@ -259,7 +259,9 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const p = ordered[0]!
   for (const other of ordered.slice(1)) await writeStatus(k, other, { phase: 'Failed', message: `a cluster holds one platform: ${p.metadata.name} is the one acted on` })
   const done = async (phase: string, message: string, more: Record<string, unknown> = {}, counts = { applied: 0, pruned: 0, refused: [] as string[] }): Promise<PassResult> => {
-    await writeStatus(k, p, { phase, message, ...more })
+    // the first time it is Ready, kept: from then on it is a platform that has run, never a first install
+    const first = phase === 'Ready' && !(p.status as any)?.firstReadyAt ? { firstReadyAt: now.toISOString() } : {}
+    await writeStatus(k, p, { phase, message, ...more, ...first })
     return { platform: p.metadata.name, phase, message, ...counts }
   }
   // a Platform just applied says at once that it is taken up (the first pass may take a while before it writes its outcome)
@@ -343,11 +345,14 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   for (const m of rendered0.filter((x) => x.kind === 'Namespace')) await applyOne(m)
 
   // what it needs from outside, in the namespaces just made: the Secrets the pieces read, cert-manager and the issuer when one is named,
-  // and, while it is not Ready, one request to the store for each bucket (a bucket not found or credentials refused fail it; a store that
-  // does not answer is only logged, as it may pass)
+  // and, on a first install (never Ready: no first Ready time, no release recorded, no upgrade, which only starts from one), one request
+  // to the store for each bucket (a bucket not found or credentials refused fail it; a store that does not answer is only logged, as it
+  // may pass). A platform that has run asks the store nothing, whatever its phase now (a piece restarting, an upgrade)
   const secrets = await secretProblems(k, r)
   const outside = [...secrets.problems, ...(await issuerProblems(k, r))]
-  if (!outside.length && deps.storeProbe && (p.status as any)?.phase !== 'Ready') {
+  const st = (p.status ?? {}) as any
+  const firstInstall = !st.firstReadyAt && !st.release && !st.upgrade
+  if (!outside.length && deps.storeProbe && firstInstall) {
     const store = await storeProblems(r, secrets.creds, deps.storeProbe)
     outside.push(...store.problems)
     for (const u of store.unanswered) console.log(`the store check: ${u}`)
