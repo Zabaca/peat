@@ -70,8 +70,11 @@ data, read only, and is reached like any database: through the front door by its
 `<name>.<domain>`), with its own `<name>-login` (the primary's login) and `sslmode=verify-full` against the published authority. It
 reads the primary's rows with the usual replica lag (its compute streams the primary's write-ahead log from the safekeepers, and reads
 pages from the pageservers), and a write is refused with Postgres's own error ("cannot execute ... in a read-only transaction"). The
-gateways wake it on a connection and put it to sleep when idle, as a primary, and each on its own: a replica woken while its primary
-sleeps answers with what the primary last wrote (nothing is written meanwhile, so it is not behind), and does not wake the primary.
+gateways wake it on a connection and put it to sleep when idle, as a primary, and each on its own; waking it does not wake the primary.
+A woken replica is Ready, and the gateways pass it a caller, only once it has replayed its primary's write-ahead log up to where the
+safekeepers had committed it when the replica was started, so its first read sees every write acknowledged before the wake (asleep
+or awake, the primary's last writes included). If it cannot catch up within 20 s of Postgres starting
+(the safekeepers or the pageserver are slow), it answers anyway and its status says so, and it then catches up as it streams.
 A replica runs its primary's version: moving a replica is refused, and moving its primary is refused while it has replicas (delete
 them, move, make them again); deleting the primary waits for its replicas to be deleted first, as for its branches. A branch, a
 restore or a replica of a replica is refused, naming the primary to make it from. A replica made before replicas had routes is given
