@@ -70,7 +70,8 @@ bun "$control/src/install/install.ts" --image "ghcr.io/zabaca/peat/control:$RELE
 k -n peat-system rollout status deployment/peat-operator --timeout=300s
 
 say "the platform: the store's key, then one Platform object"
-k create namespace peat
+# made here unless the install file already made it
+k create namespace peat --dry-run=client -o yaml | k apply -f -
 k -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=peat-try --from-literal=AWS_SECRET_ACCESS_KEY=peat-try-secret
 sed "s/release-2026-12-01/$RELEASE/" "$here/trial.yaml" | k apply -f -
 phase=

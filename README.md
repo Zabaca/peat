@@ -33,7 +33,7 @@ What the cluster needs:
 
 - **Kubernetes 1.30 or newer** (the operator installs `ValidatingAdmissionPolicy` rules; Peat's own test runs on 1.34). IPv6-only clusters are not supported yet. A cluster whose network plugin enforces `NetworkPolicy` gets the operator's per-piece network rules; one that does not still runs.
 - **Three machines** labelled for the platform (`kubectl label node <node> peat.zabaca.com/machine=true`), each with a local directory for the storage (by default `/var/lib/peat`, which the operator makes) or a storage class instead (`storage.storageClass` under `pageservers` and `safekeepers` in the Platform). The pieces are spread so one machine's loss is survived; the Platform's status says what it survives. Images are built for amd64 and arm64.
-- **An S3-compatible bucket and a key** for it (one bucket for the whole platform, or one per piece), put in a Secret named in the Platform (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). The operator limits what each piece may reach on the network, with the store by its port: [Installing](control/README.md#installing) says what that means for a store behind a private address.
+- **An S3-compatible bucket, made beforehand, and a key** for it (one bucket for the whole platform, or one per piece), put in a Secret named in the Platform (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). The operator limits what each piece may reach on the network, with the store by its port: [Installing](control/README.md#installing) says what that means for a store behind a private address.
 - **cert-manager only if you want it:** by default the platform's own certificate authority signs the databases' certificates; name a cert-manager issuer in `certificates.issuer` to use yours.
 - **To reach databases from outside the cluster:** `gateways.domain` and a wildcard DNS name for it pointing at the front door (a `LoadBalancer` or `NodePort` Service, `gateways.service.type`). Clients check the certificate with the `peat-ca` ConfigMap's authority (`sslmode=verify-full`).
 
@@ -49,11 +49,14 @@ bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl a
 
 # 2. The machines, the store's key, the platform.
 kubectl label node <node-1> <node-2> <node-3> peat.zabaca.com/machine=true
+#    Make the bucket first, then put its key in a Secret, both BEFORE the Platform is applied. (The namespace may already
+#    exist if the install file made it; then skip the first line.)
 kubectl create namespace peat
 kubectl -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=<key> --from-literal=AWS_SECRET_ACCESS_KEY=<secret>
 cp examples/platform.yaml my-platform.yaml   # set release (the same <tag> or release name), objectStore, gateways.domain
 kubectl apply -f my-platform.yaml
-kubectl get platform peat -w                  # Installing, then Ready: the status names each piece
+kubectl get platform peat -w                  # Installing, then Ready
+kubectl get platform peat -o jsonpath='{.status.message}'   # why, when it is not Ready; .status.pieces lists each piece
 
 # 3. A database.
 bun src/cli/peat.ts make orders              # or apply examples/database.yaml
