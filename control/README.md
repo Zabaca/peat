@@ -94,10 +94,10 @@ the storage, control and both compute images, each `<image>:<tag>@sha256:<digest
 under the tag) and its install file (`peat.yaml`) from it, kept as the run's `peat-install` artifact and attached to a `release-*` tag's
 GitHub release (`.github/peat/image-map.sh`). That install file runs the operator by digest and hands it the map (`PEAT_RELEASE_IMAGES`):
 a Platform of that release and registry then runs every image it does not pin by the map's digest, and its status records the digests.
-An image the Platform pins in `images` comes first, and a Platform of another release or registry runs the tags. Applying a release's
-install file while the platform already runs that release by tags moves it to the digests through the ordered upgrade (the same
-release, other images), one piece at a time; the usual order, the new release's install file first and then its `release` in the
-Platform, makes that one upgrade.
+An image the Platform pins in `images` comes first, and a Platform of another release or registry runs the tags (its status says the
+map is of another release). A tag and its digest are one image: a platform already on the release by tags stays on them (no piece
+restarts) and goes to digests at its next upgrade, and an upgrade by tags under way when the install file lands goes on, never back.
+The usual order, the new release's install file first and then its `release` in the Platform, makes one upgrade, to the digests.
 
 1. Apply the install file: `kubectl apply --server-side -f peat.yaml` with a release's own, or make one:
    `bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl apply --server-side -f -` (add `--images images.json`

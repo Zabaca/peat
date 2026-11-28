@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { reconcile } from '../src/operator/reconcile'
 import { differences } from '../src/operator/differences'
 import type { Storage } from '../src/operator/storage'
-import { decide, imagesFor, nextPhase, stepsOf, type UpgradeState } from '../src/operator/upgrade'
+import { decide, imagesFor, nextPhase, sameImage, stepsOf, type UpgradeState } from '../src/operator/upgrade'
 import { FakeKube } from './fake-kube'
 
 // The ordered upgrade, first as decisions, then as passes of the operator over an API server in memory with a stand-in storage: the order,
@@ -11,6 +11,18 @@ import { FakeKube } from './fake-kube'
 const img = (rel: string) => ({ release: rel, storage: `s:${rel}`, control: `c:${rel}`, compute: { 18: `p18:${rel}`, 19: `p19:${rel}` } })
 const NOW = new Date('2026-12-01T12:00:00Z')
 const steps = stepsOf([2, 1], ['safekeeper-w3', 'safekeeper-w1', 'safekeeper-w2'])
+
+describe('one image under two names', () => {
+  test('a tag and the digest of that tag are one image; two digests, or a digest without a tag, are not', () => {
+    const d = (c: string) => `sha256:${c.repeat(64)}`
+    expect(sameImage('registry.example/peat/storage:r1', `registry.example/peat/storage:r1@${d('a')}`)).toBe(true)
+    expect(sameImage(`registry.example/peat/storage:r1@${d('a')}`, 'registry.example/peat/storage:r1')).toBe(true)
+    expect(sameImage('registry.example:5000/peat/storage:r1', `registry.example:5000/peat/storage:r1@${d('a')}`)).toBe(true)
+    expect(sameImage(`registry.example/peat/storage:r1@${d('a')}`, `registry.example/peat/storage:r1@${d('b')}`)).toBe(false)
+    expect(sameImage('registry.example/peat/storage:r2', `registry.example/peat/storage:r1@${d('a')}`)).toBe(false)
+    expect(sameImage('registry.example:5000/peat/storage', `registry.example:5000/peat/storage@${d('a')}`)).toBe(false)
+  })
+})
 
 describe('the decisions', () => {
   test('the order: the controller, each pageserver, each safekeeper, the gateways, the control layer', () => {

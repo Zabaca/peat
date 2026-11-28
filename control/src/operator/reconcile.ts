@@ -12,7 +12,7 @@ import { NONCE_ANNOTATION, Owned } from './owned'
 import { issuerCaFindings, keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
 import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type ReleaseImages, type Resolved } from './platform'
 import { storageOf, type Storage } from './storage'
-import { UNRECORDED, decide, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
+import { UNRECORDED, decide, identicalImages, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
 import { piecesOf, runStep } from './upgrade-run'
 import { differences } from './differences'
 import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, moveExecGrant, render, type Manifest } from './render'
@@ -374,13 +374,15 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
     stepMessage = work.message
   }
   const live = upgrade && !upgrade.complete ? upgrade : undefined
-  // the images each piece is rendered at: the step's, the finished upgrade's, or, while no upgrade may run, what the pieces run now: a
-  // changed release is never rendered outside the ordered steps
-  const at = decision.kind === 'finish' && !live ? () => decision.images : !live && running && !sameImages(running.images, r.images) ? () => running.images : imagesFor(live, r.images)
+  // the images each piece is rendered at: the step's, the finished upgrade's, or, while no upgrade runs, what the pieces run now: a
+  // changed release is never rendered outside the ordered steps, and a platform on its release's tags stays on them when the operator is
+  // handed the same release's digests (one image under two names: no piece restarts for it; the next upgrade goes to digests)
+  const steady = !live && decision.kind !== 'finish' && running && !identicalImages(running.images, r.images) ? running.images : undefined
+  const at = decision.kind === 'finish' && !live ? () => decision.images : steady ? () => steady : imagesFor(live, r.images)
   // the authority that signs the databases' certificates: with an issuer, only the one keys.caSecret names (none is published otherwise)
   const caPublished = !r.spec.certificates.issuer || Boolean(r.spec.keys.caSecret)
   const pub = await published(k, r, keys, caPublished)
-  const rendered = [...render(r, keys, at, live ? [live.fromImages.storage, live.toImages.storage] : [r.images.storage]), ...pub.manifests]
+  const rendered = [...render(r, keys, at, live ? [live.fromImages.storage, live.toImages.storage] : steady ? [steady.storage, r.images.storage] : [r.images.storage]), ...pub.manifests]
   for (const m of rendered.filter((x) => x.kind !== 'Namespace')) await applyOne(m)
   // a database's status names its copies once they are there: its login written (not a person's own Secret of that name, refused above)
   const loginsWritten = new Set(pub.manifests.filter((m) => m.kind === 'Secret').map(key).filter((k2) => !refused.some((x) => x.startsWith(`${k2} `))))
@@ -426,7 +428,10 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   if (live) return done('Upgrading', `${live.direction === 'forward' ? `${live.from} to ${live.to}` : `back from ${live.to} to ${live.from}`}: ${stepMessage}`, { ...more, ...midway }, counts)
   if (decision.kind === 'finish') return done(notReady.length ? 'Installing' : 'Ready', `the upgrade ${decision.state.direction === 'forward' ? 'to' : 'back to'} ${decision.release} is done: every piece runs it`, { ...more, release: decision.release, images: decision.images }, counts)
   const phase = notReady.length || refused.length || unstartable ? 'Installing' : 'Ready'
-  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
+  // an image map the operator was handed that is not of this Platform's release or registry (the install file of another release): said
+  const map = deps.releaseImages
+  const mapNote = map && (map.release !== spec.release || map.registry !== spec.images.registry.replace(/\/$/, '')) ? `; the operator's image map is of release ${map.release} on ${map.registry}, not ${spec.release} on ${spec.images.registry.replace(/\/$/, '')}: the images it does not pin are the registry's tags` : ''
+  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + mapNote + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
   // the release every piece runs, recorded once all are ready on it, whatever is refused: what the next upgrade starts from; never a
   // release no record names, nor images the pieces do not agree on (the images recorded under the release recorded)
   const record = !notReady.length && !status.release && (decision.kind === 'none' || startHeld) && !unstartable && running?.release !== UNRECORDED

@@ -603,17 +603,48 @@ describe('the release\'s image map: every piece by digest', () => {
     expect(statusOf()).toMatchObject({ phase: 'Ready', release: 'release-2026-12-01', images: { storage: MAP.storage, control: MAP.control } })
   })
 
-  test('a platform that runs the release by tags is moved to the digests by the ordered upgrade, never by rendering every piece anew', async () => {
+  // the three orders a release's install file and its release can land in: no piece is restarted twice for one release's tags and digests
+  test('a platform on the release by tags, handed the same release\'s digests, stays on its tags: no upgrade, no piece restarted', async () => {
     k.put(platform())
     await reconcile(k)
     ready()
     await reconcile(k)
-    expect(statusOf()).toMatchObject({ phase: 'Ready', images: { storage: `${R}/storage:release-2026-12-01` } })
+    const tag = `${R}/storage:release-2026-12-01`
+    expect(statusOf()).toMatchObject({ phase: 'Ready', images: { storage: tag } })
+    const before = JSON.stringify([...k.all('deployments'), ...k.all('statefulsets')].map((o) => o.spec.template))
+    const r = await reconcile(k, { releaseImages: MAP })
+    expect(r.phase).toBe('Ready')
+    expect(statusOf().upgrade).toBeUndefined()
+    expect(JSON.stringify([...k.all('deployments'), ...k.all('statefulsets')].map((o) => o.spec.template))).toBe(before)
+    // the control layer may still make a safekeeper of the image the platform runs (and of the digest, for the next upgrade)
+    const sts = k.all('validatingadmissionpolicies').find((p) => p.metadata.name === 'peat-control-statefulsets-keep-to-the-safekeeper')
+    expect(JSON.stringify(sts)).toContain(`'${tag}'`)
+  })
+  test('the install file first, then the release: one upgrade, to the digests', async () => {
+    k.put(platform({ release: 'release-2026-11-15' }))
+    await reconcile(k)
+    ready()
+    await reconcile(k)
+    expect(statusOf()).toMatchObject({ phase: 'Ready', release: 'release-2026-11-15' })
+    expect((await reconcile(k, { releaseImages: MAP })).phase).toBe('Ready')
+    expect(statusOf().message).toContain("the operator's image map is of release release-2026-12-01")
+    k.put(platform())
     const r = await reconcile(k, { releaseImages: MAP })
     expect(r.phase).toBe('Upgrading')
-    expect(statusOf().upgrade).toMatchObject({ from: 'release-2026-12-01', to: 'release-2026-12-01', toImages: { storage: MAP.storage } })
-    // the pieces not yet stepped stay on the tags they run
-    expect(k.get('apps/v1', 'statefulsets', 'peat', 'pageserver-w2').spec.template.spec.containers[0].image).toBe(`${R}/storage:release-2026-12-01`)
+    expect(statusOf().upgrade).toMatchObject({ from: 'release-2026-11-15', to: 'release-2026-12-01', direction: 'forward', toImages: { storage: MAP.storage } })
+  })
+  test('the install file landing mid-upgrade to the same release by tags: the upgrade goes on forward on its tags, never back and again', async () => {
+    k.put(platform({ release: 'release-2026-11-15' }))
+    await reconcile(k)
+    ready()
+    await reconcile(k)
+    k.put(platform())
+    expect((await reconcile(k)).phase).toBe('Upgrading')
+    const tags = statusOf().upgrade.toImages
+    expect(tags.storage).toBe(`${R}/storage:release-2026-12-01`)
+    await reconcile(k, { releaseImages: MAP })
+    expect(statusOf().upgrade).toMatchObject({ to: 'release-2026-12-01', direction: 'forward', toImages: { storage: tags.storage } })
+    expect(statusOf().upgrade.halted).toBeUndefined()
   })
 
   test('the install file made from a map runs its control image and hands the operator the map; --image names another', () => {
