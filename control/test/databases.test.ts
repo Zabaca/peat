@@ -32,6 +32,13 @@ describe('made as its spec says', () => {
     const elsewhere = db('x', { spec: { parent: 'orders' }, ns: 'other' })
     expect(act(elsewhere, [parent, elsewhere])).toEqual({ do: 'wait', why: 'no database orders in other to make it from' })
   })
+  test('a branch, a restore or a replica of a replica is refused, naming the primary to make it from', () => {
+    const primary = db('orders', { made: true }), ro = db('orders-ro', { made: true, spec: { replicaOf: 'orders' } })
+    const branch = db('ro-dev', { spec: { parent: 'orders-ro' } }), restore = db('ro-tue', { spec: { parent: 'orders-ro', at: '2026-12-01T09:30:00Z' } }), again = db('ro-ro', { spec: { replicaOf: 'orders-ro' } })
+    expect(act(branch, [primary, ro, branch])).toEqual({ do: 'refuse', why: 'orders-ro is a replica of orders: make a branch of orders instead' })
+    expect(act(restore, [primary, ro, restore])).toEqual({ do: 'refuse', why: 'orders-ro is a replica of orders: make a restore of orders instead' })
+    expect(act(again, [primary, ro, again])).toEqual({ do: 'refuse', why: 'orders-ro is a replica of orders: make a replica of orders instead' })
+  })
   test('a name is unique across the platform: the oldest object keeps it, a later one in another namespace is refused', () => {
     const first = db('orders', { ns: 'a' }), second = db('orders', { ns: 'b' })
     expect(act(first, [first, second])).toMatchObject({ do: 'make' })

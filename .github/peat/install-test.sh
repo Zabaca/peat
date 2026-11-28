@@ -446,6 +446,52 @@ then_count=$(shop 'select count(*) from items' orders-then.peat-db.svc)
 [ "$(shop 'select count(*) from items' "$shop_host")" = 3000 ] || fail 'the parent changed'
 echo "  the branch reads 3000 rows; the restore to $moment reads 1000; orders still 3000"
 
+step "a read replica: through the front door by its own name, its primary's rows, writes refused, asleep and woken"
+ro=orders-ro.peat-db.svc
+dbobj orders-ro 'replicaOf: orders'
+phase_is orders-ro Ready 120
+[ "$(k -n shop get database orders-ro -o jsonpath='{.status.serviceHost}')" = "$ro" ] || fail "orders-ro does not name its host: $(k -n shop get database orders-ro -o jsonpath='{.status}')"
+[ -n "$(k -n shop get database orders-ro -o jsonpath='{.status.record.port}')" ] && [ "$(k -n shop get database orders-ro -o jsonpath='{.status.record.port}')" != 0 ] || fail 'orders-ro has no route port'
+t0=$(date +%s); until shop 'select 1' "$ro" >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail "orders-ro did not answer through the front door: $(shop 'select 1' "$ro" 2>&1 | tail -1)"; sleep 3; done
+ro_first_s=$(since "$t0")
+[ "$(shop 'select count(*) from items' "$ro")" = 3000 ] || fail "the replica does not read its primary's rows"
+[ "$(shop 'select pg_is_in_recovery()' "$ro")" = t ] || fail 'orders-ro is not a standby'
+shop 'insert into items values (3001)' "$shop_host"
+t0=$(date +%s); until [ "$(shop 'select count(*) from items where id = 3001' "$ro" 2>/dev/null)" = 1 ]; do [ "$(since "$t0")" -lt 30 ] || fail 'a row written on the primary was not on the replica in 30 s'; sleep 0.5; done
+ro_lag_s=$(since "$t0")
+if ro_write=$(shop 'insert into items values (3002)' "$ro" 2>&1); then fail 'a write on the replica was taken'; fi
+grep -q 'read-only transaction' <<< "$ro_write" || fail "a write on the replica was refused, but not as read only: $ro_write"
+echo "  orders-ro answered through the front door ${ro_first_s} s after it was Ready; a row written on orders was on it within ${ro_lag_s} s; a write refused: $(tail -1 <<< "$ro_write" | cut -c1-120)"
+# asleep, a row written on its primary, then woken by a connection: its first read sees that row (it is Ready only once it has replayed
+# up to the safekeepers' position at the wake)
+ro_stop() { curl -fsS -X POST "localhost:18080/db/$1/stop" >/dev/null || fail "$1 was not stopped"; t0=$(date +%s); while k -n peat-compute get pods -l "compute=$1" -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 120 ] || fail "$1 did not stop"; sleep 2; done; }
+ro_stop orders-ro
+[ "$(k -n shop get database orders-ro -o jsonpath='{.status.awake}')" = false ] || fail 'a stopped replica reads awake'
+shop 'insert into items values (3002)' "$shop_host"
+t0=$(date +%s)
+[ "$(shop 'select count(*) from items where id = 3002' "$ro")" = 1 ] || fail "the replica's first read after a wake does not see a row its primary wrote while it slept"
+ro_wake_s=$(since "$t0")
+wake_lsn=$(k -n peat-compute get secret compute-orders-ro -o json | jq -r '.data["wake-lsn"] // ""' | base64 -d)
+[ -n "$wake_lsn" ] && [ "$wake_lsn" != 0/0 ] || fail "the replica's wake did not record the safekeepers' position ($wake_lsn)"
+[ "$ro_wake_s" -lt 20 ] || fail "the replica was Ready only at the bound (${ro_wake_s} s): it did not catch up to $wake_lsn"
+sleep 3
+k -n shop get database orders-ro -o jsonpath='{.status.message}' | grep -q 'answered before it had replayed' && fail "the replica's status says it was not caught up: $(k -n shop get database orders-ro -o jsonpath='{.status.message}')"
+echo "  asleep, a row written on orders, then woken by its first read in ${ro_wake_s} s: the row there (caught up to $wake_lsn)"
+# with its primary asleep too, woken: what the primary last wrote, and the primary left asleep
+ro_stop orders-ro
+ro_stop orders
+t0=$(date +%s)
+[ "$(shop 'select count(*) from items' "$ro")" = 3002 ] || fail 'the replica, woken with its primary asleep, does not read the rows its primary last wrote'
+ro_wake2_s=$(since "$t0")
+if k -n peat-compute get pods -l compute=orders -o name 2>/dev/null | grep -q .; then fail "waking the replica woke its primary"; fi
+echo "  woken with its primary asleep in ${ro_wake2_s} s: 3002 rows, its primary left asleep"
+# a branch of a replica is refused, naming the primary
+dbobj orders-ro-dev 'parent: orders-ro'
+t0=$(date +%s); until k -n shop get database orders-ro-dev -o jsonpath='{.status.message}' 2>/dev/null | grep -q 'is a replica of orders: make a branch of orders instead'; do [ "$(since "$t0")" -lt 60 ] || fail "a branch of the replica was not refused: $(k -n shop get database orders-ro-dev -o jsonpath='{.status.message}')"; sleep 2; done
+k -n shop delete database orders-ro-dev orders-ro --timeout=120s >/dev/null
+shop 'delete from items where id > 3000' "$shop_host"  # orders back to its 3000 rows, as the steps after this read them
+echo "  a branch of the replica refused, naming orders; both deleted"
+
 step "its status wiped, then written again from the platform's record"
 before=$(k -n shop get database orders -o jsonpath='{.status.tenant}/{.status.timeline}/{.status.record.port}')
 k -n shop patch database orders --subresource=status --type merge -p '{"status":null}'

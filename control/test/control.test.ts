@@ -197,6 +197,37 @@ describe('what the control layer makes, and what its account must be granted', (
   })
 })
 
+describe('a read replica, reached as any database', () => {
+  test('it has its own route port and name Service; the routes, the route lookup and the Clusters the gateways wake and put to sleep include it', () => {
+    const replica = control.slice(control.indexOf('async function makeReplica'), control.indexOf('// A deleted database'))
+    expect(replica).toContain('const port = await claimPort(RECORDS, name, parent.timeline, PORT_BASE, await usedPorts())')
+    expect(replica).toContain('await apply(`/api/v1/namespaces/${DB_NS}/services`, name, nameService(name))')
+    expect(replica).not.toContain('port: 0')
+    expect(control).toContain('const rows = (async () => (await listDbs()).filter((d) => d.port && !d.closed).map((d) =>')
+    expect(control).toContain("return d && d.port && !d.closed ? json({ port: d.port })")
+    const cl = control.slice(control.indexOf('async function clusters()'), control.indexOf('// The routes the gateways listen on'))
+    expect(cl).toContain('const dbs = await listDbs()')
+    expect(cl).not.toContain("d.mode !== 'primary'")
+    // one made before replicas had routes is given one
+    expect(control).toContain("if (s && s.mode === 'replica' && !s.port && !o.metadata.deletionTimestamp && recs.has(name)) {")
+  })
+  test('a woken replica is Ready only once it has replayed to the safekeepers\' position at the wake, or at the bound, said in its status', () => {
+    const start = control.slice(control.indexOf('async function startCompute'), control.indexOf('async function startPlaced'))
+    // the position read before the pod starts, into the spec Secret its pod mounts at /config
+    expect(start.indexOf('await commitLsnOf(d)')).toBeLessThan(start.indexOf("ok(await kube('PATCH', depPath(d.name)"))
+    expect(start).toContain("{ stringData: { 'wake-lsn': wake ?? '0/0' } }")
+    expect(start).toContain('void replicaCatchup(d, wake)')
+    expect(control).toContain("readinessProbe: { exec: { command: ['sh', '-c', readinessSql(d)] }")
+    const probe = control.slice(control.indexOf('const readinessSql'), control.indexOf('async function commitLsnOf'))
+    expect(probe).toContain("lsn=$(cat /config/wake-lsn 2>/dev/null || echo 0/0)")
+    expect(probe).toContain("(pg_last_wal_replay_lsn() >= '$lsn'::pg_lsn or now() - pg_postmaster_start_time() > interval '${REPLICA_CATCHUP_S} seconds')")
+    // a primary's probe is the login check alone
+    expect(probe).toContain("if (d.mode === 'primary') return `psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc \"${login}\" | grep -q 1`")
+    const catchup = control.slice(control.indexOf('async function replicaCatchup'), control.indexOf("/** A compute's pod."))
+    expect(catchup).toContain('if (lsn && took >= REPLICA_CATCHUP_S) {')
+  })
+})
+
 describe('who may call which route', () => {
   test('a gateway reaches only what its program calls (never a delete, a restore, the trim, an upgrade or a registration), the safekeepers one question and the storage controller its hook', () => {
     const routes = callerRoutes()

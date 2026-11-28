@@ -72,6 +72,9 @@ const PORT_BASE = 15010
 const COMPUTE_MEMORY_REQUEST = process.env['COMPUTE_MEMORY_REQUEST'] ?? '512Mi'
 const COMPUTE_MEMORY_LIMIT = process.env['COMPUTE_MEMORY_LIMIT'] ?? '1Gi'
 const PGDATA_LIMIT = process.env['PGDATA_LIMIT'] ?? '2Gi'
+// A woken replica is Ready once it has replayed its primary's write-ahead log up to the safekeepers' commit position at the wake (so its first
+// read sees every write acknowledged before it), or, if it cannot within this many seconds of Postgres starting, anyway, said in its status
+const REPLICA_CATCHUP_S = Number(process.env['REPLICA_CATCHUP_S'] ?? '20')
 const DEFAULT_PG = Number(process.env['DEFAULT_PG_VERSION'] || '19')
 // How many warm copies of a new database's pages the controller keeps on other pageservers: one (a pageserver's loss fails over in
 // seconds), or none when the platform has one pageserver (the controller cannot place a copy, and refuses the tenant)
@@ -340,6 +343,55 @@ async function refreshSpec(d: Db): Promise<void> {
   await kube('PATCH', `/api/v1/namespaces/${CNS}/secrets/compute-${d.name}`, { stringData: { 'config.json': JSON.stringify(cfg) } }, 'application/merge-patch+json')
 }
 
+/**
+ * The compute's readiness: the login works (the role and database exist); and for a replica, also caught up: it has replayed up to the
+ * wake's position (`wake-lsn` in its spec Secret, the safekeepers' commit position when it was started), or REPLICA_CATCHUP_S have passed
+ * since Postgres started (it then answers anyway, and the status says so: replicaCatchup).
+ */
+const readinessSql = (d: Pick<Db, 'mode'>) => {
+  const login = "select 1 from pg_roles r, pg_database d where r.rolname = 'app' and r.rolpassword is not null and d.datname = 'app'"
+  if (d.mode === 'primary') return `psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc "${login}" | grep -q 1`
+  return `lsn=$(cat /config/wake-lsn 2>/dev/null || echo 0/0); psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc "${login} and (pg_last_wal_replay_lsn() >= '$lsn'::pg_lsn or now() - pg_postmaster_start_time() > interval '${REPLICA_CATCHUP_S} seconds')" | grep -q 1`
+}
+
+/** The safekeepers' commit position of a timeline now (the highest a member answers), or null when none answers. */
+async function commitLsnOf(d: Db): Promise<string | null> {
+  const members = await safekeepersOf(d.tenant, d.timeline).then((x) => x.members, () => [] as string[])
+  let best: string | null = null
+  const n = (l: string) => { const [a, b] = l.split('/'); return BigInt(`0x${a}`) * 2n ** 32n + BigInt(`0x${b}`) }
+  for (const m of members) {
+    const r = await fetch(`http://${m.split(':')[0]}:7676/v1/tenant/${d.tenant}/timeline/${d.timeline}`, { headers: scoped('safekeeperdata'), signal: AbortSignal.timeout(2000) }).catch(() => null)
+    const lsn = r?.ok ? String(((await r.json()) as any).commit_lsn ?? '') : ''
+    if (/^[0-9A-F]+\/[0-9A-F]+$/i.test(lsn) && (!best || n(lsn) > n(best))) best = lsn
+  }
+  return best
+}
+
+/**
+ * After a replica's start, once its pod is Ready: whether it was Ready caught up or only at the bound (its Ready came REPLICA_CATCHUP_S
+ * or more after its container started), said in its status; a later wake that catches up takes the note back.
+ */
+const CATCHUP_NOTE = 'awake, but it answered before it had replayed its primary\'s writes up to the moment it was woken'
+async function replicaCatchup(d: Db, lsn: string | null): Promise<void> {
+  const t0 = Date.now()
+  while (Date.now() - t0 < (REPLICA_CATCHUP_S + 120) * 1000) {
+    const pod = await livePod(d.name)
+    const ready = (pod?.status?.conditions ?? []).find((c: any) => c.type === 'Ready' && c.status === 'True')
+    const started = pod?.status?.containerStatuses?.find((c: any) => c.name === 'compute')?.state?.running?.startedAt
+    if (ready && started) {
+      const took = (Date.parse(ready.lastTransitionTime) - Date.parse(started)) / 1000
+      const o = (await dbObjects()).find((x) => x.metadata.name === d.name)
+      const message = String(o?.status?.message ?? '')
+      if (lsn && took >= REPLICA_CATCHUP_S) {
+        console.log(`replica ${d.name}: Ready ${took} s after starting, at the bound, not seen caught up to ${lsn}`)
+        await patchDbStatus(d.namespace, d.name, { message: `${CATCHUP_NOTE} (${lsn}) within ${REPLICA_CATCHUP_S} s: a read may miss the newest writes until it catches up (the safekeepers or the pageserver are slow)` })
+      } else if (message.startsWith(CATCHUP_NOTE)) await patchDbStatus(d.namespace, d.name, { message: 'ready: it sleeps until a client connects' })
+      return
+    }
+    await new Promise((res) => setTimeout(res, 1000))
+  }
+}
+
 /** A compute's pod. A move's target (`moveTarget`) carries the label its network rule selects and mounts the move's script at /move. */
 const computePodTemplate = (d: Db, moveTarget = false) => {
   const labels = { app: 'peat-compute', compute: d.name, tenant: d.tenant, ...(moveTarget ? { [MOVE_TARGET_LABEL]: 'target' } : {}) }
@@ -371,7 +423,7 @@ const computePodTemplate = (d: Db, moveTarget = false) => {
         resources: { requests: { cpu: '250m', memory: COMPUTE_MEMORY_REQUEST }, limits: { memory: COMPUTE_MEMORY_LIMIT } },
         // Ready means the login works: compute_ctl starts Postgres first and creates the spec's role and database a little later (longer under load), and a pod that is only listening answers a client with
         // "password authentication failed" (found 2026-11-17, making databases in batches of ten); so the probe asks Postgres whether the role and database exist (an exec probe judges only the exit code, so the answer is piped to grep: the first version of it passed on an empty answer). A tcp probe on 5432 was the first version.
-        readinessProbe: { exec: { command: ['sh', '-c', `psql -h 127.0.0.1 -U cloud_admin -d postgres -Atc "select 1 from pg_roles r, pg_database d where r.rolname = 'app' and r.rolpassword is not null and d.datname = 'app'" | grep -q 1`] }, periodSeconds: 1, timeoutSeconds: 3 },
+        readinessProbe: { exec: { command: ['sh', '-c', readinessSql(d)] }, periodSeconds: 1, timeoutSeconds: 3 },
         volumeMounts: [{ name: 'config', mountPath: '/config' }, { name: 'pgdata', mountPath: '/var/db/postgres' }, { name: 'tls', mountPath: '/tls', readOnly: true }, { name: 'hba', mountPath: '/hba', readOnly: true }, ...(moveTarget ? [{ name: 'move', mountPath: '/move', readOnly: true }] : [])],
       }],
       volumes: [
@@ -451,6 +503,9 @@ async function startCompute(d: Db, opts: { evenClosed?: boolean; moveTarget?: bo
   // created once and left to cert-manager to renew: `apply` replaces on a conflict, and a replace of a custom resource needs its resourceVersion (found 2026-11-19, the first wake: 422), so an existing one is not touched
   await ensureCertificate(d.name)
   await writeSpec(d)
+  // a replica's wake position, read before its pod starts (its probe holds it not Ready until it has replayed that far)
+  const wake = d.mode === 'replica' ? await commitLsnOf(d).catch(() => null) : null
+  if (d.mode === 'replica') ok(await kube('PATCH', `/api/v1/namespaces/${CNS}/secrets/compute-${d.name}`, { stringData: { 'wake-lsn': wake ?? '0/0' } }, 'application/merge-patch+json'), `write ${d.name}'s wake position`)
   // a compute takes the platform's current image for its version at its next start (an upgrade changes the image; an awake compute keeps its own until it sleeps, or the restart hours)
   if (dep.status === 200) {
     const image = computeImageFor(d.pg, COMPUTE_IMAGES)
@@ -466,6 +521,7 @@ async function startCompute(d: Db, opts: { evenClosed?: boolean; moveTarget?: bo
     }), `create deployment compute-${d.name}`)
   }
   markAwake(d, true)
+  if (d.mode === 'replica') void replicaCatchup(d, wake).catch((e) => console.log(`replica ${d.name}: the catch-up look: ${e}`))
   return `compute-${d.name}`
 }
 /**
@@ -1416,8 +1472,11 @@ async function makeReplica(from: string, name: string, namespace: string): Promi
   const root = parent.root ? parent.name : parent.parent
   const ids = await beginMaking(RECORDS, name, namespace, { tenant: parent.tenant, timeline: parent.timeline }, { root: false, mode: 'replica', parent: root, from })
   if ('taken' in ids) throw new Error(`the name ${name} is being made in ${ids.taken}`)
-  // a replica is a second compute on the parent's own timeline: same tenant and timeline, read only; no route (it is reached through its own Service)
-  return { name, namespace, tenant: parent.tenant, timeline: parent.timeline, parent: root, from, root: false, mode: 'replica', port: 0, created: new Date().toISOString(), pg: parent.pg, closed: false }
+  // a replica is a second compute on the parent's own timeline: same tenant and timeline, read only; reached like any database, through the
+  // front door by its own name (its own route port and name Service), and woken and put to sleep by the gateways as a primary is
+  const port = await claimPort(RECORDS, name, parent.timeline, PORT_BASE, await usedPorts())
+  await apply(`/api/v1/namespaces/${DB_NS}/services`, name, nameService(name))
+  return { name, namespace, tenant: parent.tenant, timeline: parent.timeline, parent: root, from, root: false, mode: 'replica', port, created: new Date().toISOString(), pg: parent.pg, closed: false }
 }
 
 // A deleted database's compute and names go at once; its data in the store stays for the Platform's hold (DELETE_HOLD: `7d` by default,
@@ -1838,6 +1897,15 @@ async function reconcileDatabases() {
     // a record the status holds and the platform's ConfigMaps lost is written again from the status
     const s = recordOf(o)
     if (s && !o.metadata.deletionTimestamp && !o.metadata.annotations?.[COPYING] && !recs.has(name)) await writeRecord(RECORDS, s).then(() => console.log(`database: ${key}: its record written again from its status`), (e) => console.log(`database ${key}: write its record: ${e}`))
+    // a replica made before replicas had routes: its port and name Service now, so the front door reaches it by its name
+    if (s && s.mode === 'replica' && !s.port && !o.metadata.deletionTimestamp && recs.has(name)) {
+      await (async () => {
+        const port = await claimPort(RECORDS, name, s.timeline, PORT_BASE, await usedPorts())
+        await apply(`/api/v1/namespaces/${DB_NS}/services`, name, nameService(name))
+        await saveDb({ ...s, port })
+        console.log(`database: ${key}: a replica given its route (port ${port})`)
+      })().catch((e) => console.log(`database ${key}: give the replica its route: ${e}`))
+    }
     const act = databaseAction(o, all, { replacementOpen: busy, records })
     if (act.do === 'none') continue
     // a move and its way back run in the background (a copy may take long), one at a time for a database
@@ -2011,7 +2079,8 @@ let clustersCache: { at: number; rows: Promise<any[]> } | undefined
 async function clusters(): Promise<any[]> {
   if (clustersCache && Date.now() - clustersCache.at < 3000) return clustersCache.rows
   const rows = (async () => {
-    const dbs = (await listDbs()).filter((d) => d.mode === 'primary')
+    // primaries and replicas: the gateways wake each on a connection and put it to sleep when idle
+    const dbs = await listDbs()
     const pods = ok(await kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=app%3Dpeat-compute`), 'list pods').json.items as any[]
     const deps = new Map((ok(await kube('GET', `/apis/apps/v1/namespaces/${CNS}/deployments?labelSelector=peat-compute-deploy`), 'list deployments').json.items as any[]).map((x) => [x.metadata.labels.compute as string, x.spec.replicas as number]))
     return dbs.map((d) => clusterRow(d, pods, deps.get(d.name)))
@@ -2023,7 +2092,7 @@ async function clusters(): Promise<any[]> {
 /** One database's row, without reading the others: what a gateway asks for each time a caller needs a wake or a look (with 1,001 databases the list took long enough under load that a replaced compute's callers waited 50 s). */
 async function clusterOne(name: string): Promise<any | null> {
   const d = await getDb(name)
-  if (!d || d.mode !== 'primary') return null
+  if (!d) return null
   const [pods, dep] = await Promise.all([
     kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=${encodeURIComponent(computeSelector(name))}`),
     kube('GET', depPath(name)),
@@ -2036,7 +2105,8 @@ async function clusterOne(name: string): Promise<any | null> {
 let routesCache: { at: number; rows: Promise<any[]> } | undefined
 async function routeRows(): Promise<any[]> {
   if (routesCache && Date.now() - routesCache.at < 3000) return routesCache.rows
-  const rows = (async () => (await listDbs()).filter((d) => d.mode === 'primary' && d.port && !d.closed).map((d) => ({ metadata: { name: d.name, annotations: { [ROUTE_ANNOTATION]: `${NS}/${d.name}` } }, spec: { ports: [{ port: 5432, targetPort: d.port }] } })))()
+  // every database with a route port, primaries and replicas alike (a replica made before replicas had routes is given one by the loop)
+  const rows = (async () => (await listDbs()).filter((d) => d.port && !d.closed).map((d) => ({ metadata: { name: d.name, annotations: { [ROUTE_ANNOTATION]: `${NS}/${d.name}` } }, spec: { ports: [{ port: 5432, targetPort: d.port }] } })))()
   routesCache = { at: Date.now(), rows }
   rows.catch(() => { if (routesCache?.rows === rows) routesCache = undefined })
   return rows
@@ -2411,7 +2481,7 @@ Bun.serve({
       if (req.method === 'GET' && path.startsWith('/cluster/')) { if (!DB_NAME.test(path.slice('/cluster/'.length))) return json({ error: 'bad name' }, 400); const row = await clusterOne(path.slice('/cluster/'.length)); return row ? json(row) : json({ error: 'no such database' }, 404) }
       if (req.method === 'GET' && path === '/services') return json(await routeRows())
       if (req.method === 'GET' && path === '/compute-addrs') return json(await computeAddrs())
-      if (req.method === 'GET' && path.startsWith('/route/')) { if (!DB_NAME.test(path.slice('/route/'.length))) return json({ error: 'bad name' }, 400); const d = await getDb(path.slice('/route/'.length)); return d && d.mode === 'primary' && !d.closed ? json({ port: d.port }) : d?.closed ? json({ error: `${d.name} is closed` }, 409) : json({ error: 'no such database' }, 404) }
+      if (req.method === 'GET' && path.startsWith('/route/')) { if (!DB_NAME.test(path.slice('/route/'.length))) return json({ error: 'bad name' }, 400); const d = await getDb(path.slice('/route/'.length)); return d && d.port && !d.closed ? json({ port: d.port }) : d?.closed ? json({ error: `${d.name} is closed` }, 409) : json({ error: 'no such database' }, 404) }
       if (req.method === 'GET' && path.startsWith('/pod/')) { if (!POD_NAME.test(path.slice(5))) return json({ error: 'bad name' }, 400); const r = await kube('GET', `/api/v1/namespaces/${CNS}/pods/${path.slice(5)}`); return json(r.json, r.status) }
       // Making a database through the API writes its Database object (in DB_NS, or `namespace`; a branch, a restore and a replica in their
       // parent's) and waits for the acting layer to make it, as the command does: one record, whoever asks.
