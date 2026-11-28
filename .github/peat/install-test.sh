@@ -588,6 +588,22 @@ peatc branch cli-made cli-dev -n shop --timeout 120 || fail 'peat branch failed'
 peatc restore cli-made cli-then --at "$cli_moment" -n shop --timeout 120 || fail 'peat restore failed'
 t0=$(date +%s); until [ "$(cli 'select count(*) from n' cli-dev.peat-db.svc 2>/dev/null)" = 30 ]; do [ "$(since "$t0")" -lt 180 ] || fail 'the branch peat made does not read its parent'\''s 30 rows'; sleep 3; done
 t0=$(date +%s); until [ "$(cli 'select count(*) from n' cli-then.peat-db.svc 2>/dev/null)" = 10 ]; do [ "$(since "$t0")" -lt 180 ] || fail "the restore peat made does not read the 10 rows of $cli_moment"; sleep 3; done
+# a connection right after a stop is never handed to the compute that is ending: ten rounds of peat stop, then a query at once; each meets a
+# fresh Postgres (a new start time) and no query is cut
+prev=$(cli 'select pg_postmaster_start_time()' cli-made.peat-db.svc) || fail 'cli-made did not answer before the stop rounds'
+waked=''
+for round in 1 2 3 4 5 6 7 8 9 10; do
+  peatc stop cli-made -n shop >/dev/null || fail "peat stop failed (round $round)"
+  [ "$(k -n shop get database cli-made -o jsonpath='{.status.awake}')" = false ] || fail "peat stop returned with cli-made reading awake (round $round)"
+  [ -z "$(k -n peat-compute get pods -l compute=cli-made -o name 2>/dev/null)" ] || fail "peat stop returned with the compute still there (round $round): $(k -n peat-compute get pods -l compute=cli-made 2>&1 | tail -1)"
+  t0=$(date +%s)
+  got=$(cli 'select pg_postmaster_start_time(), count(*) from n' cli-made.peat-db.svc 2>&1) || fail "round $round: the query right after the stop failed: $got"
+  start=${got%%|*}
+  [ "$start" != "$prev" ] || fail "round $round: the query reached the compute that was stopped (its start time $start)"
+  [ "${got##*|}" = 30 ] || fail "round $round: the query read ${got##*|} rows, not 30"
+  prev=$start; waked="$waked $(since "$t0")"
+done
+echo "  ten rounds of peat stop, then a query at once: each a fresh Postgres, none cut; woken in (s):$waked"
 peatc stop cli-made -n shop || fail 'peat stop failed'
 peatc close cli-made -n shop || fail 'peat close failed'
 peatc open cli-made -n shop || fail 'peat open failed'

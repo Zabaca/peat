@@ -496,6 +496,12 @@ class ClosedDb extends Error {}
  * one-off start (`evenClosed`: a safekeeper replacement's first start of a timeline never written, which no client reaches).
  */
 async function startCompute(d: Db, opts: { evenClosed?: boolean; moveTarget?: boolean } = {}): Promise<string> {
+  // a stop under way (its door, stopThroughDoor) runs to its end first, so the start makes a fresh compute, never takes the one that is ending
+  for (let i = 0; i < 120; i++) {
+    const o = ok(await kube('GET', dbObjectPath(d.namespace, d.name)), `read ${d.name}`, [404]).json
+    if (!isStopping(o)) break
+    await new Promise((res) => setTimeout(res, 250))
+  }
   const existing = await livePod(d.name)
   const dep = await kube('GET', depPath(d.name))
   if (existing && dep.status === 200 && dep.json.spec.replicas === 1) return existing.metadata.name
@@ -580,23 +586,69 @@ async function look(d: Db, name: string, requestAt: number): Promise<{ pod: stri
 }
 const rootOf = (d: Db): string => d.parent.split('/')[0] === '' ? d.name : d.parent // a branch's login is its root's; parent holds the root's name for a branch of a branch too (see makeBranch)
 
-async function stopCompute(name: string, waitGone = false): Promise<void> {
+async function stopCompute(name: string, waitGone = false, markAsleep = true): Promise<void> {
   // scale to zero first (so nothing makes the pod again), then delete what is left (a pod on a machine that is gone would otherwise sit `Terminating` for as long as the machine is off)
   const sc = await kube('PATCH', depPath(name), { spec: { replicas: 0 } }, 'application/merge-patch+json')
   if (sc.status >= 300 && sc.status !== 404) ok(sc, `scale compute-${name} down`)
   const r = ok(await kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=${encodeURIComponent(computeSelector(name))}`), 'list pods')
   for (const p of r.json.items as any[]) await kube('DELETE', `/api/v1/namespaces/${CNS}/pods/${p.metadata.name}`, { gracePeriodSeconds: 5 })
-  void getDb(name).then((d) => { if (d) markAwake(d, false) }, () => {})
+  // asleep once the compute has ended: when the caller waits for its pod to go, then; else now (the caller says when, markAsleep false)
+  const asleep = () => void getDb(name).then((d) => { if (d) markAwake(d, false) }, () => {})
+  if (markAsleep && !waitGone) asleep()
   // a sleeping database has no compute Service: every Service is a rule on every machine's kube-proxy, and 2,000 of them (a route and a compute Service for each of 1,001 databases) made a Service's endpoint change
   // take 45 to 60 s to reach a client (seen 2026-11-19, the compute-worker cut: the pod and the gateway's own address answered at +13 to +27 s, the Service at +44 to +62 s). It is made again by the next start.
   // waitGone: the caller is about to delete the compute's timeline. A compute that is still shutting down keeps its walproposer reconnecting to the safekeepers, which answer "timeline not found" (3 ERROR lines on the
   // safekeepers per deleted compute, found 2026-11-18: an earlier version deleted the timeline right after asking the pod to go). So wait until the pod is gone (at most 20 s) before the timeline is deleted.
   if (!waitGone) return
+  await computeGone(name)
+  if (markAsleep) asleep()
+}
+/** Waits until the database's compute pods are gone (at most 20 s). */
+async function computeGone(name: string): Promise<void> {
   for (let i = 0; i < 40; i++) {
     const left = ok(await kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=${encodeURIComponent(computeSelector(name))}`), 'list pods').json.items as any[]
     if (left.length === 0) return
     await new Promise((res) => setTimeout(res, 500))
   }
+}
+
+/**
+ * A stop of a database a client may connect to (a person's stop, a gateway's sleep, a restart onto a new image), through a door, as a move's and a
+ * close's: first the database is marked stopping (status.stopping), which takes its compute out of the addresses the gateways dial and shows it asleep in
+ * the rows they read; then STOP_SETTLE_MS, longer than the gateways' and this layer's caches of the addresses (1 s each, and the records' 1 s), so no
+ * gateway still holds the address of a compute about to end; only then is it stopped. A connection meanwhile is never handed to it: its gateway finds no
+ * address, reads the database asleep, and wakes it, and the start waits for the door to close (startCompute), so it meets a fresh compute. The mark goes
+ * once the pod is on its way out (no address lists a pod that is); status.awake turns false once the pod is gone.
+ */
+const STOP_SETTLE_MS = Number(process.env['STOP_SETTLE_MS'] ?? '4000')
+/** A stopping mark older than this is a door a control layer that restarted left open: no longer read as one. */
+const STOPPING_STALE_MS = 60_000
+const isStopping = (o: any) => { const at = Date.parse(String(o?.status?.stopping ?? '')); return Number.isFinite(at) && Date.now() - at < STOPPING_STALE_MS }
+async function stopThroughDoor(name: string): Promise<void> {
+  const d = await shutTheDoor(name)
+  if (d) await stopBehindTheDoor(d)
+  else await stopCompute(name)
+}
+/** The door shut: the database marked stopping (null when there is no such database). */
+async function shutTheDoor(name: string): Promise<Db | null> {
+  const d = await getDb(name)
+  if (!d) return null
+  await patchDbStatus(d.namespace, name, { stopping: new Date().toISOString() })
+  addrsCache = undefined; clustersCache = undefined
+  return d
+}
+/** Behind a shut door: the settle, the stop, the mark taken back once the pod is on its way out, and asleep once it is gone. */
+async function stopBehindTheDoor(d: Db): Promise<void> {
+  const name = d.name
+  try {
+    await new Promise((res) => setTimeout(res, STOP_SETTLE_MS))
+    await stopCompute(name, false, false)
+  } finally {
+    await patchDbStatus(d.namespace, name, { stopping: null }).catch((e) => console.log(`stop ${name}: clear the stopping mark: ${e}`))
+    addrsCache = undefined; clustersCache = undefined
+  }
+  await computeGone(name)
+  markAwake(d, false)
 }
 
 // ---- the reconciler: a compute that is unknown, stuck or on a dead machine is gone, and is replaced
@@ -1511,7 +1563,7 @@ async function restartStaleComputes() {
     if (dep.spec.template.spec.containers[0].image === computeImageFor(d.pg, COMPUTE_IMAGES)) continue
     console.log(`restart hours: ${d.name} restarted onto the current compute image`)
     bump('compute_image_restarts_total')
-    await stopCompute(d.name, true)
+    await stopThroughDoor(d.name)
     await startCompute(d)
     return // one a minute
   }
@@ -1956,7 +2008,8 @@ async function reconcileDatabases() {
       } else if (act.do === 'open') {
         await patchDbStatus(ns, name, { phase: 'Ready', message: 'ready: it sleeps until a client connects' })
       } else if (act.do === 'stop') {
-        await stopCompute(name)
+        // answered once the compute has ended: `peat stop` returns to a database that is asleep, and a connection then wakes a fresh one
+        await stopThroughDoor(name)
         await patchDbStatus(ns, name, { answered: { ...(o.status?.answered ?? {}), stop: act.request }, awake: false, message: 'asleep: the next connection wakes it' })
       }
     } catch (e) {
@@ -2068,13 +2121,14 @@ const idleMinutesFor = (o: any): string => {
   try { return String(Math.max(1, Math.round(durationMs(own) / 60_000))) } catch { return IDLE_MINUTES }
 }
 
-function clusterRow(d: Db, pods: any[], replicas: number | undefined, idleMinutes: string = IDLE_MINUTES) {
+function clusterRow(d: Db, pods: any[], replicas: number | undefined, idleMinutes: string = IDLE_MINUTES, stopping = false) {
   const mine = pods.filter((p) => p.metadata.labels?.compute === d.name && !p.metadata.deletionTimestamp).sort((a, b) => (a.metadata.creationTimestamp < b.metadata.creationTimestamp ? 1 : -1))
   // a pod on a machine that stopped answering still reads Ready until Kubernetes notices (about 50 s): a machine this layer has declared dead does not count
   const pod = mine.find((p) => !nodeStates.get(p.spec?.nodeName)?.dead) ?? mine[0]
   const ready = podReady(pod) && !nodeStates.get(pod?.spec?.nodeName)?.dead ? 1 : 0
   // asleep means the Deployment is at zero (a compute being replaced is awake and not ready: the gateway holds its callers, as it holds them for a database that is starting)
-  const awake = (replicas ?? 0) > 0
+  // a database being stopped reads asleep: a gateway that finds no address for it wakes it (the start waits for the stop), never holds a caller for it as awake
+  const awake = (replicas ?? 0) > 0 && !stopping
   return {
     metadata: {
       name: d.name,
@@ -2095,7 +2149,7 @@ async function clusters(): Promise<any[]> {
     const pods = ok(await kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=app%3Dpeat-compute`), 'list pods').json.items as any[]
     const deps = new Map((ok(await kube('GET', `/apis/apps/v1/namespaces/${CNS}/deployments?labelSelector=peat-compute-deploy`), 'list deployments').json.items as any[]).map((x) => [x.metadata.labels.compute as string, x.spec.replicas as number]))
     const objects = new Map((await dbObjects()).map((o) => [String(o.metadata.name), o]))
-    return dbs.map((d) => clusterRow(d, pods, deps.get(d.name), idleMinutesFor(objects.get(d.name))))
+    return dbs.map((d) => clusterRow(d, pods, deps.get(d.name), idleMinutesFor(objects.get(d.name)), isStopping(objects.get(d.name))))
   })()
   clustersCache = { at: Date.now(), rows }
   rows.catch(() => { if (clustersCache?.rows === rows) clustersCache = undefined })
@@ -2110,7 +2164,8 @@ async function clusterOne(name: string): Promise<any | null> {
     kube('GET', depPath(name)),
   ])
   ok(pods, 'list pods')
-  return clusterRow(d, pods.json.items as any[], dep.status === 200 ? dep.json.spec.replicas : 0, idleMinutesFor((await dbObjects()).find((o) => o.metadata.name === name)))
+  const o = (await dbObjects()).find((x) => x.metadata.name === name)
+  return clusterRow(d, pods.json.items as any[], dep.status === 200 ? dep.json.spec.replicas : 0, idleMinutesFor(o), isStopping(o))
 }
 
 // The routes the gateways listen on, as the Service rows the gateway program reads (it reads Services; here they are built from the database records, so no Service exists per database).
@@ -2129,8 +2184,10 @@ async function computeAddrs(): Promise<Record<string, string>> {
   if (addrsCache && Date.now() - addrsCache.at < 1000) return addrsCache.rows
   const rows = (async () => {
     const pods = ok(await kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=app%3Dpeat-compute`), 'list pods').json.items as any[]
+    // a database being stopped (its door, stopThroughDoor) has no address: a caller is not handed a compute about to end
+    const stopping = new Set((await dbObjects()).filter(isStopping).map((o) => String(o.metadata.name)))
     const out: Record<string, string> = {}
-    for (const p of pods) if (!p.metadata.deletionTimestamp && p.status?.podIP && podReady(p) && !nodeStates.get(p.spec?.nodeName)?.dead && p.metadata.labels?.compute) out[p.metadata.labels.compute] = p.status.podIP
+    for (const p of pods) if (!p.metadata.deletionTimestamp && p.status?.podIP && podReady(p) && !nodeStates.get(p.spec?.nodeName)?.dead && p.metadata.labels?.compute && !stopping.has(p.metadata.labels.compute)) out[p.metadata.labels.compute] = p.status.podIP
     return out
   })()
   addrsCache = { at: Date.now(), rows }
@@ -2551,7 +2608,10 @@ Bun.serve({
           forgetDbs()
           const mvState = (await dbObjects()).find((x) => x.metadata.name === name)?.status?.move?.state
           if (mvState && !MOVE_STATES_DONE.includes(mvState)) return json({ error: `${name} is being moved: it is stopped when the move ends` }, 409)
-          await stopCompute(name); return json({ stopped: name })
+          // the gateway's sleep: the door is shut before the answer (no address, the row asleep); the stop goes on after it, within the gateway's 10 s limit or not
+          const shut = await shutTheDoor(name)
+          if (shut) void stopBehindTheDoor(shut).catch((e) => console.log(`stop ${name}: ${e}`)); else await stopCompute(name)
+          return json({ stopped: name })
         }
         if (req.method === 'GET') return json({ ...d, pod: (await livePod(name))?.metadata?.name ?? null })
       }
