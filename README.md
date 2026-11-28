@@ -13,6 +13,7 @@ Serverless Postgres, with storage separated from compute:
 - **Scale to zero.** A database nobody is using is stopped (its data stays); the next connection wakes it, in seconds.
 - **Instant branches.** Copy-on-write: a branch copies no data and costs only what it later changes.
 - **Point-in-time recovery.** Restore a database, or branch it, from any moment in its history (seven days by default).
+- **Read replicas.** A read-only copy that follows its primary, made with one object, asleep until you connect to it.
 
 ## What Peat adds
 
