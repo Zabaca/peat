@@ -93,7 +93,8 @@ the commit (`.github/peat/control.Dockerfile`; one program, the role named by it
    It makes the platform's four namespaces and binds the operator's narrower rights in them: every right on Secrets there (elsewhere
    only read, made and patched: each database's login), exec in the compute namespace only (to grant it to a move); it deletes no
    namespace and changes no admission policy but its own. A Platform that names its own namespaces (`spec.namespaces`) needs the same
-   names here: `--namespaces <platform>,<computes>,<gateways>,<databases>`.
+   names here: `--namespaces <platform>,<computes>,<gateways>,<databases>`; a Platform whose namespaces the install does not cover is
+   Failed, its status naming them and the `--namespaces` to install with.
 2. Label the machines the platform may use: `kubectl label node <node> peat.zabaca.com/machine=true` (three for the default spread; one
    for a trial with `spread: none`).
 3. Put the store's Secret in the platform namespace (`peat` by default, made by the install file): `AWS_ACCESS_KEY_ID`,
