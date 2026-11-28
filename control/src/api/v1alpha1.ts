@@ -220,7 +220,7 @@ export const databaseSpec: Schema = obj('A database on the platform. Its name is
   parent: str('A database (in the same namespace) this one is made from: a copy-on-write branch of it, or, with at, a restore of it to a moment. The parent is untouched.', { pattern: DATABASE_NAME }),
   at: str('With parent: the moment (an RFC 3339 time) or the log position (X/Y) the copy is made at; none: now.'),
   replicaOf: str("A database this one is a read replica of: a second compute on its parent's data, read only.", { pattern: DATABASE_NAME }),
-  idleAfter: duration("How long with no session before it sleeps; default the platform's. A duration (30m)."),
+  idleAfter: duration("How long with no session before it sleeps; default the platform's (computes.idleAfter). A duration (30m), taken in whole minutes, at least one; a change applies to an awake database too."),
   memory: obj('The memory of its compute; default the platform\'s.', { request: str('What it asks for.'), limit: str('What it may use.') }),
   closed: bool('True: every connection is refused and it stays asleep until this is false again.', { default: false }),
   keepOldFor: duration('After a move to a newer Postgres version, how long the old copy is kept, stopped, as the way back. A duration (30d).', { default: '30d' }),

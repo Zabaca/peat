@@ -516,6 +516,23 @@ k -n shop delete database orders-ro-dev orders-ro --timeout=120s >/dev/null
 shop 'delete from items where id > 3000' "$shop_host"  # orders back to its 3000 rows, as the steps after this read them
 echo "  a branch of the replica refused, naming orders; both deleted"
 
+step "a database's own idleAfter wins over the Platform's (1m), and a change to it reaches an awake database"
+dbobj orders-idle 'parent: orders, idleAfter: 2m'
+phase_is orders-idle Ready 120
+idle_row() { curl -fsS localhost:18080/cluster/orders-idle | jq -r '.metadata.annotations["xata.io/scale-to-zero-inactivity-minutes"]'; }
+[ "$(idle_row)" = 2 ] || fail "the gateways are not told orders-idle's own idle time: $(idle_row)"
+t0=$(date +%s); until shop 'select 1' orders-idle.peat-db.svc >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'orders-idle did not answer'; sleep 3; done
+t_idle=$(date +%s)
+# past the Platform's minute (and a gateway's look) it is still awake: its own two minutes hold
+while [ "$(since "$t_idle")" -lt 85 ]; do sleep 5; done
+k -n peat-compute get pods -l compute=orders-idle -o name 2>/dev/null | grep -q . || fail "orders-idle slept at the Platform's idle time, not its own"
+# its idle time shortened to a minute while awake (and idle for longer): it sleeps at the gateways' next looks
+k -n shop patch database orders-idle --type merge -p '{"spec":{"idleAfter":"1m"}}' >/dev/null
+t0=$(date +%s); until [ "$(idle_row)" = 1 ]; do [ "$(since "$t0")" -lt 30 ] || fail "the changed idle time did not reach the row: $(idle_row)"; sleep 1; done
+t0=$(date +%s); while k -n peat-compute get pods -l compute=orders-idle -o name 2>/dev/null | grep -q .; do [ "$(since "$t0")" -lt 90 ] || fail 'orders-idle did not sleep after its idle time was shortened'; sleep 2; done
+echo "  orders-idle (a branch, idleAfter 2m) awake 85 s after its last session, past the Platform's 1m; shortened to 1m while awake, asleep $(since "$t0") s later"
+k -n shop delete database orders-idle --timeout=120s >/dev/null
+
 step "its status wiped, then written again from the platform's record"
 before=$(k -n shop get database orders -o jsonpath='{.status.tenant}/{.status.timeline}/{.status.record.port}')
 k -n shop patch database orders --subresource=status --type merge -p '{"status":null}'
