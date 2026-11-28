@@ -295,6 +295,17 @@ redo_neon_heap_insert(XLogReaderState *record)
 
 		freespace = PageGetHeapFreeSpace(page); /* needed to update FSM below */
 
+#if PG_MAJORVERSION_NUM >= 19
+		/*
+		 * As heap_xlog_insert() in 19: set the page prunable to trigger
+		 * on-access pruning later, which may set the page all-visible in the
+		 * VM. See comments in heap_insert().
+		 */
+		if (TransactionIdIsNormal(XLogRecGetXid(record)) &&
+			!HeapTupleHeaderXminFrozen(htup))
+			PageSetPrunable(page, XLogRecGetXid(record));
+#endif
+
 		PageSetLSN(page, lsn);
 
 		if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
@@ -758,6 +769,9 @@ redo_neon_heap_multi_insert(XLogReaderState *record)
 	int			i;
 	bool		isinit = (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE) != 0;
 	XLogRedoAction action;
+#if PG_MAJORVERSION_NUM >= 19
+	bool		inserted_tuples_frozen = false;
+#endif
 
 	/*
 	 * Insertion doesn't overwrite MVCC data, so no conflict processing is
@@ -846,6 +860,12 @@ redo_neon_heap_multi_insert(XLogReaderState *record)
 			ItemPointerSetBlockNumber(&htup->t_ctid, blkno);
 			ItemPointerSetOffsetNumber(&htup->t_ctid, offnum);
 
+#if PG_MAJORVERSION_NUM >= 19
+			/* If one inserted tuple was frozen, they all were */
+			if (i == 0)
+				inserted_tuples_frozen = HeapTupleHeaderXminFrozen(htup);
+#endif
+
 			offnum = PageAddItem(page, (void *) htup, newlen, offnum, true, true);
 			if (offnum == InvalidOffsetNumber)
 				elog(PANIC, "neon_rm_redo: failed to add tuple");
@@ -860,9 +880,25 @@ redo_neon_heap_multi_insert(XLogReaderState *record)
 		if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
 			PageClearAllVisible(page);
 
+#if PG_MAJORVERSION_NUM >= 19
+		/*
+		 * As heap_xlog_multi_insert() in 19: XLH_INSERT_ALL_FROZEN_SET implies
+		 * that all tuples are visible, so set PD_ALL_VISIBLE and clear
+		 * pd_prune_xid; otherwise, unless the inserted tuples are frozen, set
+		 * pd_prune_xid so that the page gets on-access pruned.
+		 */
+		if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
+		{
+			PageSetAllVisible(page);
+			PageClearPrunable(page);
+		}
+		else if (!inserted_tuples_frozen)
+			PageSetPrunable(page, XLogRecGetXid(record));
+#else
 		/* XLH_INSERT_ALL_FROZEN_SET implies that all tuples are visible */
 		if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
 			PageSetAllVisible(page);
+#endif
 
 		MarkBufferDirty(buffer);
 	}
