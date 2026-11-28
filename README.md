@@ -49,9 +49,8 @@ bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl a
 
 # 2. The machines, the store's key, the platform.
 kubectl label node <node-1> <node-2> <node-3> peat.zabaca.com/machine=true
-#    Make the bucket first, then put its key in a Secret, both BEFORE the Platform is applied. (The namespace may already
-#    exist if the install file made it; then skip the first line.)
-kubectl create namespace peat
+#    Make the bucket first, then put its key in a Secret (the namespace `peat` is made by the install file), both BEFORE the
+#    Platform is applied.
 kubectl -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=<key> --from-literal=AWS_SECRET_ACCESS_KEY=<secret>
 cp examples/platform.yaml my-platform.yaml   # set release (the same <tag> or release name), objectStore, gateways.domain
 kubectl apply -f my-platform.yaml

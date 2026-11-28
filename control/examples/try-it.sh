@@ -26,7 +26,7 @@ k() { kubectl --context "kind-$CLUSTER" "$@"; }
 peat() { bun "$control/src/cli/peat.ts" --context "kind-$CLUSTER" "$@"; }
 say() { echo "== $* ($(( $(date +%s) - started )) s)"; }
 pf=
-trap '[ -z "$pf" ] || kill "$pf" 2>/dev/null || true' EXIT
+trap '[ -z "$pf" ] || { pkill -P "$pf" 2>/dev/null; kill "$pf" 2>/dev/null; } || true' EXIT
 
 for tool in docker kind kubectl bun psql; do
   command -v "$tool" >/dev/null || { echo "$tool is not on the PATH (needs docker, kind, kubectl, bun and psql)" >&2; exit 1; }
@@ -69,9 +69,7 @@ say "Peat's install file (the operator, the object kinds) from release $RELEASE"
 bun "$control/src/install/install.ts" --image "ghcr.io/zabaca/peat/control:$RELEASE" | k apply --server-side -f -
 k -n peat-system rollout status deployment/peat-operator --timeout=300s
 
-say "the platform: the store's key, then one Platform object"
-# made here unless the install file already made it
-k create namespace peat --dry-run=client -o yaml | k apply -f -
+say "the platform: the store's key (in the namespace the install file made), then one Platform object"
 k -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=peat-try --from-literal=AWS_SECRET_ACCESS_KEY=peat-try-secret
 sed "s/release-2026-12-01/$RELEASE/" "$here/trial.yaml" | k apply -f -
 phase=
@@ -92,10 +90,15 @@ pass=$(login password); host=$(login host)
 
 # the front door is a Service in the cluster; a tunnel brings it to this machine. libpq is given the database's own name for the
 # certificate and the TLS name the door routes by (host), and the tunnel's address (hostaddr) to dial.
-k -n peat-gateway port-forward svc/pg-front 15432:5432 >/dev/null 2>&1 &
+# (kubectl ends a port-forward when its stream is lost, so it runs in a loop that starts it again)
+( while :; do k -n peat-gateway port-forward svc/pg-front 15432:5432 >/dev/null 2>&1 || true; sleep 1; done ) &
 pf=$!
 sql() { PGPASSWORD="$pass" psql "host=$host hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=${TMPDIR:-/tmp}/peat-try-ca.crt connect_timeout=60" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
-until sql 'select 1' >/dev/null 2>&1; do sleep 3; done
+t0=$(date +%s)
+until sql 'select 1' >/dev/null 2>&1; do
+  [ $(( $(date +%s) - t0 )) -lt 300 ] || { echo "the database did not answer in 5 minutes: kubectl --context kind-$CLUSTER get database hello -o yaml" >&2; exit 1; }
+  sleep 3
+done
 sql 'create table t (id int primary key, note text)'
 sql "insert into t select g, md5(g::text) from generate_series(1, 100000) g"
 echo "  wrote and read back: $(sql 'select count(*) from t') rows, over TLS verified against the platform's own authority"
