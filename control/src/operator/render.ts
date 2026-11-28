@@ -66,8 +66,10 @@ const SCRAPER = { namespaceSelector: { matchLabels: { [SCRAPE_LABEL]: 'true' } }
 /** The operator's pods, in their own namespace: an upgrade reads the storage controller, the pageservers', the safekeepers' and the control layer's APIs, and drains and fills a pageserver. */
 export const OPERATOR_NAMESPACE = 'peat-system'
 const OPERATOR_PODS = { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': OPERATOR_NAMESPACE } }, podSelector: { matchLabels: { app: 'peat-operator' } } }
-/** The API server, at whatever address the cluster gives it (a policy sees the endpoint's address and port, not the Service's). */
-const API_SERVER = { to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(443, 6443) }
+/** The API server, at its endpoint's addresses and ports (a policy sees the endpoint's address and port, not the Service's): platform.ts, network. */
+const API_SERVER = (r: Resolved) => ({ to: r.network.apiServer.addresses.map((cidr) => ({ ipBlock: { cidr } })), ports: tcp(...r.network.apiServer.ports) })
+/** The kubelet port of the labelled machines (the control layer's probe that tells a dead machine). */
+const KUBELET = (r: Resolved) => ({ to: r.network.machines.map((cidr) => ({ ipBlock: { cidr } })), ports: tcp(10250) })
 const storePort = (endpoint: string): number => { const u = new URL(endpoint); return Number(u.port || (u.protocol === 'https:' ? 443 : 80)) }
 /** The object store, at its port and only its port (it may be outside the cluster or a pod inside it), less the ranges the Platform leaves out (platform.ts, storeEgressExcept). */
 const STORE = (r: Resolved) => ({ to: [{ ipBlock: { cidr: '0.0.0.0/0', ...(r.store.egressExcept.length ? { except: r.store.egressExcept } : {}) } }], ports: tcp(storePort(r.store.endpoint)) })
@@ -98,6 +100,13 @@ const twoMachines = (spread: string, labels: Record<string, string>) => spread =
 
 // ---- the base
 
+/**
+ * The operator's own way out to the store (a first install's bucket check), in its namespace: the install file's rules there (install.ts)
+ * hold the rest, and cannot name the store, which only the Platform does.
+ */
+export const OPERATOR_STORE_POLICY = 'peat-operator-store'
+export const operatorStorePolicy = (r: Resolved): Manifest => ({ apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy', metadata: meta(r, OPERATOR_STORE_POLICY, OPERATOR_NAMESPACE), spec: { podSelector: { matchLabels: { app: 'peat-operator' } }, policyTypes: ['Egress'], egress: [STORE(r)] } })
+
 export function base(r: Resolved): Manifest[] {
   const n = r.names
   const pss: [string, string][] = [[n.namespace, 'privileged'], [n.computeNamespace, 'baseline'], [n.gatewayNamespace, 'restricted'], [n.dbNamespace, 'restricted']]
@@ -106,6 +115,7 @@ export function base(r: Resolved): Manifest[] {
     ...pss.map(([name, level]) => ({ apiVersion: 'v1', kind: 'Namespace', metadata: meta(r, name, undefined, { 'pod-security.kubernetes.io/enforce': level }) })),
     { apiVersion: 'v1', kind: 'ConfigMap', metadata: meta(r, HBA_CONFIG_MAP, n.computeNamespace), data: { 'pg_hba.conf': HBA } },
     deny(n.namespace), deny(n.computeNamespace), deny(n.gatewayNamespace),
+    operatorStorePolicy(r),
   ]
 }
 
@@ -276,7 +286,7 @@ export function storagePolicies(r: Resolved): Manifest[] {
   const inPeat = (app: string) => piece(ns, app)
   const computes = piece(n.computeNamespace, 'peat-compute')
   const P = PORTS
-  const records = r.spec.controller.records === 'kubernetes' ? [API_SERVER, STORE(r)] : [{ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(5432) }]
+  const records = r.spec.controller.records === 'kubernetes' ? [API_SERVER(r), STORE(r)] : [{ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(5432) }]
   return [
     policy(r, ns, 'storage-broker', [{ from: [inPeat('pageserver'), inPeat('safekeeper'), SCRAPER], ports: tcp(P.brokerGrpc) }], [DNS]),
     policy(r, ns, 'storage-controller', [{ from: [inPeat('pageserver'), inPeat('peat-control'), OPERATOR_PODS, SCRAPER], ports: tcp(P.controller) }], [DNS, ...records, { to: [inPeat('pageserver')], ports: tcp(P.pageserverHttp) }, { to: [inPeat('safekeeper')], ports: tcp(P.safekeeperHttp) }, { to: [inPeat('peat-control')], ports: tcp(P.control) }]),
@@ -435,13 +445,13 @@ export function controlPolicies(r: Resolved): Manifest[] {
   const moveTarget = { ...inNamespace(n.computeNamespace), podSelector: { matchLabels: { app: 'peat-compute', [MOVE_TARGET_LABEL]: 'target' } } }
   return [
     policy(r, ns, 'peat-control', [{ from: [inPeat('storage-controller'), inPeat('safekeeper'), gateways, computes, OPERATOR_PODS, SCRAPER], ports: tcp(PORTS.control) }], [
-      DNS, API_SERVER,
+      DNS, API_SERVER(r),
       { to: [inPeat('storage-controller')], ports: tcp(PORTS.controller) },
       { to: [inPeat('pageserver')], ports: tcp(PORTS.pageserverHttp) },
       { to: [inPeat('safekeeper')], ports: tcp(PORTS.safekeeperHttp) },
       { to: [computes], ports: tcp(3080, 5432) },
       // the kubelet port of every platform machine, the probe that tells a dead machine; and the store, for the WAL trim
-      { to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(10250) },
+      KUBELET(r),
       STORE(r),
     ]),
     policy(r, n.computeNamespace, 'peat-compute', [{ from: [gateways], ports: tcp(5432) }, { from: [inPeat('peat-control')], ports: tcp(3080, 5432) }, { from: [moveTarget], ports: tcp(5432) }],
@@ -483,9 +493,9 @@ export function gateways(r: Resolved, images = r.images): Manifest[] {
         }) },
       },
     },
-    // In: the front door's 5432 from any pod (a client is a pod of the cluster or comes through the Service; the databases' own logins keep the wrong caller out: TLS and a password),
+    // In: the front door's 5432 from any pod, and from outside from gateways.allowFrom (all by default; a client is a pod of the cluster or comes through the Service; the databases' own logins keep the wrong caller out: TLS and a password),
     // the other gateway's and a scraper's 9090. Out: DNS, the control layer, the computes' 5432 and the other gateway's 9090.
-    policy(r, n.gatewayNamespace, 'peat-gateway', [{ from: [{ namespaceSelector: {} }, { ipBlock: { cidr: '0.0.0.0/0' } }], ports: tcp(PORTS.gatewayPg) }, { from: [SCRAPER, piece(n.gatewayNamespace, 'peat-gateway')], ports: tcp(PORTS.gatewayMetrics) }],
+    policy(r, n.gatewayNamespace, 'peat-gateway', [{ from: [{ namespaceSelector: {} }, ...r.spec.gateways.allowFrom.map((cidr) => ({ ipBlock: { cidr } }))], ports: tcp(PORTS.gatewayPg) }, { from: [SCRAPER, piece(n.gatewayNamespace, 'peat-gateway')], ports: tcp(PORTS.gatewayMetrics) }],
       [DNS, { to: [piece(n.namespace, 'peat-control')], ports: tcp(PORTS.control) }, { to: [piece(n.computeNamespace, 'peat-compute')], ports: tcp(5432) }, { to: [piece(n.gatewayNamespace, 'peat-gateway')], ports: tcp(PORTS.gatewayMetrics) }]),
   ]
 }

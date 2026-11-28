@@ -6,17 +6,17 @@
 // What it never does: change an object it did not make (one already there, of the same name, is reported and left alone; a namespace the
 // Platform names is the one exception, as a person makes it first to hold the store's Secret), delete an object it did not make, delete a
 // namespace, or copy the Platform's labels onto anything.
-import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
+import { API_VERSION, GROUP, type Platform, type PlatformSpec } from '../api/v1alpha1'
 import { ok, pathOf, serverApply, type Kube } from '../kube'
 import { NONCE_ANNOTATION, Owned } from './owned'
 import { issuerCaFindings, keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
 import { issuerProblems, podReasons, secretProblems, storeProblems, type StoreProbe } from './prereqs'
-import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type ReleaseImages, type Resolved } from './platform'
+import { choosePlacements, imagesOf, resolve, specOf, type ClusterRead, type Images, type Placements, type ReleaseImages, type Resolved } from './platform'
 import { storageOf, type Storage } from './storage'
 import { UNRECORDED, decide, identicalImages, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
 import { piecesOf, runStep } from './upgrade-run'
 import { differences } from './differences'
-import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, moveExecGrant, render, type Manifest } from './render'
+import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR_STORE_POLICY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, moveExecGrant, render, type Manifest } from './render'
 import { moveExecPods, moveExecRole } from '../move'
 
 export const FIELD_MANAGER = OPERATOR
@@ -65,6 +65,25 @@ async function writeStatus(k: Kube, p: Platform, status: Record<string, unknown>
 async function labelledMachines(k: Kube, r: { key: string; value: string }): Promise<{ names: string[]; nodes: any[] }> {
   const nodes = ok(await k.request('GET', `/api/v1/nodes?labelSelector=${sel({ [r.key]: r.value })}`), 'list the machines').json.items as any[]
   return { names: nodes.map((n) => n.metadata.name as string), nodes }
+}
+
+/**
+ * What the network rules need of the cluster: the API server's endpoint (the EndpointSlice kubernetes in default, its addresses and
+ * its ports; unread or empty: none, and the rules allow any address on 443 and 6443), and the internal addresses of the machines the
+ * control layer probes (the labelled ones and the outside keepers').
+ */
+async function clusterRead(k: Kube, spec: PlatformSpec, labelled: any[]): Promise<ClusterRead> {
+  // a read that fails (the API server busy: a 429, a 5xx) stops the pass, so the rules stay as they are; only a cluster with no such slice gets the any-address rule
+  const slice = ok(await k.request('GET', '/apis/discovery.k8s.io/v1/namespaces/default/endpointslices/kubernetes'), "read the API server's endpoint", [404])
+  const host = (a: string) => (a.includes(':') ? `${a}/128` : `${a}/32`)
+  const apiServer = slice.status === 200 ? {
+    // every address it lists, ready or not: one that is not ready for a moment (an API server restarting) is not dropped and added back
+    addresses: [...new Set(((slice.json.endpoints ?? []) as any[]).flatMap((e) => (e.addresses ?? []) as string[]).map(host))].sort(),
+    ports: [...new Set(((slice.json.ports ?? []) as any[]).map((x) => Number(x.port)).filter((x) => x > 0))].sort((a, b) => a - b),
+  } : undefined
+  const outside = spec.safekeepers.outside ? (await labelledMachines(k, spec.safekeepers.outside.label)).nodes : []
+  const machines = [...new Set([...labelled, ...outside].flatMap((n) => ((n.status?.addresses ?? []) as any[]).filter((a) => a.type === 'InternalIP').map((a) => host(String(a.address)))))]
+  return { ...(apiServer ? { apiServer } : {}), machines }
 }
 
 async function readPlacements(k: Kube, ns: string): Promise<Partial<Placements>> {
@@ -302,7 +321,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const zones = Object.fromEntries(machines.nodes.map((n) => [String(n.metadata.name), String(n.metadata?.labels?.[spec.safekeepers.zoneLabel] ?? n.metadata.name)]))
   const chosen = choosePlacements(spec, machines.names, kept, zones)
   if ('errors' in chosen) return failed(chosen.errors.join('; '), spec.namespaces.computes)
-  const r = resolve(p, spec, chosen.placements, deps.releaseImages)
+  const r = resolve(p, spec, chosen.placements, deps.releaseImages, await clusterRead(k, spec, machines.nodes))
 
   // the record of what the operator made, in its own namespace; a record that cannot be read stops the pass here
   const owned = await Owned.load(k, k.namespace)
@@ -342,7 +361,8 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
     applied.push(key(m))
   }
   const rendered0 = render(r, {})
-  for (const m of rendered0.filter((x) => x.kind === 'Namespace')) await applyOne(m)
+  // the namespaces, and the operator's own way out to the store, before what it needs from outside is checked (the bucket check calls the store)
+  for (const m of rendered0.filter((x) => x.kind === 'Namespace' || (x.kind === 'NetworkPolicy' && x.metadata.name === OPERATOR_STORE_POLICY))) await applyOne(m)
 
   // what it needs from outside, in the namespaces just made: the Secrets the pieces read, cert-manager and the issuer when one is named,
   // and, on a first install (never Ready: no first Ready time, no release recorded, no upgrade, which only starts from one), one request
@@ -460,7 +480,9 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   // an image map the operator was handed that is not of this Platform's release or registry (the install file of another release): said
   const map = deps.releaseImages
   const mapNote = map && (map.release !== spec.release || map.registry !== spec.images.registry.replace(/\/$/, '')) ? `; the operator's image map is of release ${map.release} on ${map.registry}, not ${spec.release} on ${spec.images.registry.replace(/\/$/, '')}: the images it does not pin are the registry's tags` : ''
-  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + mapNote + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
+  // the pieces' way out to the API server when neither the Platform nor the cluster's endpoint names it: said, as it is the broad rule
+  const apiNote = r.network.apiServerFrom === 'any' ? '; the pieces reach the API server at any address on 443 and 6443 (no EndpointSlice kubernetes in default to read, and no network.apiServer)' : ''
+  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + mapNote + apiNote + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
   // the release every piece runs, recorded once all are ready on it, whatever is refused: what the next upgrade starts from; never a
   // release no record names, nor images the pieces do not agree on (the images recorded under the release recorded)
   const record = !notReady.length && !status.release && (decision.kind === 'none' || startHeld) && !unstartable && running?.release !== UNRECORDED

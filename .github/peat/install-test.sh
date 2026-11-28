@@ -205,6 +205,30 @@ if [ -n "$map" ]; then
   echo "  the storage pieces, the control layer's settings and the status name the storage and compute images by digest"
 fi
 
+echo "== the ways out to the cluster itself, the operator's namespace closed, and the front door's way in"
+api_ip=$(k -n default get endpointslice kubernetes -o jsonpath='{.endpoints[0].addresses[0]}')
+api_port=$(k -n default get endpointslice kubernetes -o jsonpath='{.ports[0].port}')
+node_ip=$(k get node "$node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+rule_to() {  # rule_to <namespace> <policy> <port> <cidr>: the policy's way out on that port names that range
+  k -n "$1" get networkpolicy "$2" -o json | jq -e --argjson p "$3" --arg c "$4" '[.spec.egress[] | select(any(.ports[]?; .port == $p)) | .to[]?.ipBlock.cidr] | index($c) != null' >/dev/null
+}
+# the storage controller reaches the API server only with records kubernetes (with records postgres it reaches its database instead)
+api_pieces=peat-control; [ "$records" = kubernetes ] && api_pieces="peat-control storage-controller"
+for pol in $api_pieces; do
+  rule_to peat "$pol" "$api_port" "$api_ip/32" || fail "$pol's way out to the API server does not name its endpoint $api_ip:$api_port: $(k -n peat get networkpolicy "$pol" -o json | jq -c '.spec.egress')"
+  if rule_to peat "$pol" "$api_port" 0.0.0.0/0; then fail "$pol may still reach any address on $api_port"; fi
+done
+rule_to peat peat-control 10250 "$node_ip/32" || fail "the control layer's kubelet probe does not name the machine $node_ip"
+if rule_to peat peat-control 10250 0.0.0.0/0; then fail 'the control layer may still reach any address on 10250'; fi
+k -n peat-system get networkpolicy default-deny peat-operator peat-operator-store >/dev/null || fail "the operator's namespace is not closed by its rules"
+door_from() { k -n peat-gateway get networkpolicy peat-gateway -o json | jq -c '[.spec.ingress[] | select(any(.ports[]?; .port == 5432)) | .from[] | .ipBlock.cidr // "pods"]'; }
+[ "$(door_from)" = '["pods","0.0.0.0/0"]' ] || fail "the front door is not open to all by default: $(door_from)"
+k patch platform peat --type merge -p '{"spec":{"gateways":{"allowFrom":["192.0.2.0/24"]}}}' >/dev/null
+t0=$(date +%s); until [ "$(door_from)" = '["pods","192.0.2.0/24"]' ]; do [ "$(since "$t0")" -lt 60 ] || fail "gateways.allowFrom did not narrow the front door: $(door_from)"; sleep 2; done
+k patch platform peat --type json -p '[{"op":"remove","path":"/spec/gateways/allowFrom"}]' >/dev/null
+t0=$(date +%s); until [ "$(door_from)" = '["pods","0.0.0.0/0"]' ]; do [ "$(since "$t0")" -lt 60 ] || fail "the front door did not open to all again: $(door_from)"; sleep 2; done
+echo "  $api_pieces reach the API server at $api_ip:$api_port only, the kubelet port at $node_ip only; peat-system closed; the front door narrowed by allowFrom and open again"
+
 echo "== steady: the operator writes nothing to a settled platform"
 # the spec of every object it made (a generation where the kind has one, else the resourceVersion), read twice, three passes apart
 sel='app.kubernetes.io/managed-by=peat-operator'

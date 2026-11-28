@@ -18,7 +18,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { crds } from '../api/crds'
 import { DEFAULT_NAMES, GROUP } from '../names'
-import { COMPUTE_POLICY, EXEC_SHAPE_POLICY, NODE_POLICY, OPERATOR_NAMESPACE, SERVICE_POLICY, STATEFULSET_POLICY } from '../operator/render'
+import { COMPUTE_POLICY, EXEC_SHAPE_POLICY, NODE_POLICY, OPERATOR_NAMESPACE, PORTS, SERVICE_POLICY, STATEFULSET_POLICY } from '../operator/render'
 import { RELEASE_IMAGES_ENV, parseReleaseImages, type ReleaseImages } from '../operator/platform'
 
 export const OPERATOR_ACCOUNT = 'peat-operator'
@@ -42,7 +42,11 @@ export const OPERATOR_POLICIES = [NODE_POLICY, STATEFULSET_POLICY, SERVICE_POLIC
 export const SECRETS_ROLE = 'peat-operator-secrets'
 export const EXEC_ROLE = 'peat-operator-exec'
 
-export function installManifests(image: string, ns: InstallNamespaces = DEFAULT_INSTALL_NAMESPACES, map?: ReleaseImages): Record<string, unknown>[] {
+/** The address ranges the operator may reach the API server at: any, on its usual ports, unless the install names them (--api-server). */
+export const ANY_API_SERVER = ['0.0.0.0/0']
+export const ENDPOINT_ROLE = 'peat-operator-api-endpoint'
+
+export function installManifests(image: string, ns: InstallNamespaces = DEFAULT_INSTALL_NAMESPACES, map?: ReleaseImages, opts: { apiServer?: string[] } = {}): Record<string, unknown>[] {
   const meta = (name: string, namespace?: string) => ({ name, ...(namespace ? { namespace } : {}), labels })
   const subject = { kind: 'ServiceAccount', name: OPERATOR_ACCOUNT, namespace: OPERATOR_NAMESPACE }
   const platformNamespaces = [ns.platform, ns.computes, ns.gateways, ns.databases]
@@ -100,6 +104,28 @@ export function installManifests(image: string, ns: InstallNamespaces = DEFAULT_
       },
     },
     { apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicyBinding', metadata: meta(OPERATOR_EXEC_POLICY), spec: { policyName: OPERATOR_EXEC_POLICY, validationActions: ['Deny'] } },
+    // the API server's own endpoint, read by name only, for the pieces' way out to it (the EndpointSlice kubernetes in default)
+    { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'Role', metadata: meta(ENDPOINT_ROLE, 'default'), rules: [{ apiGroups: ['discovery.k8s.io'], resources: ['endpointslices'], resourceNames: ['kubernetes'], verbs: ['get'] }] },
+    { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'RoleBinding', metadata: meta(ENDPOINT_ROLE, 'default'), roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'Role', name: ENDPOINT_ROLE }, subjects: [subject] },
+    // the operator's namespace takes nothing and sends nothing but what the operator needs: in, its metrics and health (8081); out, DNS, the
+    // API server (any address on 443 and 6443, or --api-server), and the platform's pieces it reads (the storage controller, the pageservers',
+    // the safekeepers' and the control layer's APIs). Its way out to the store is the operator's own rule (peat-operator-store), made from
+    // the Platform, which alone names the store.
+    { apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy', metadata: meta('default-deny', OPERATOR_NAMESPACE), spec: { podSelector: {}, policyTypes: ['Ingress', 'Egress'] } },
+    {
+      apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy', metadata: meta(OPERATOR_ACCOUNT, OPERATOR_NAMESPACE),
+      spec: {
+        podSelector: { matchLabels: { app: 'peat-operator' } }, policyTypes: ['Ingress', 'Egress'],
+        ingress: [{ ports: [{ protocol: 'TCP', port: 8081 }] }],
+        egress: [
+          { to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } }, podSelector: { matchLabels: { 'k8s-app': 'kube-dns' } } }], ports: [{ protocol: 'UDP', port: 53 }, { protocol: 'TCP', port: 53 }] },
+          { to: (opts.apiServer ?? ANY_API_SERVER).map((cidr) => ({ ipBlock: { cidr } })), ports: [{ protocol: 'TCP', port: 443 }, { protocol: 'TCP', port: 6443 }] },
+          ...([['storage-controller', PORTS.controller], ['pageserver', PORTS.pageserverHttp], ['safekeeper', PORTS.safekeeperHttp], ['peat-control', PORTS.control]] as const).map(([app, port]) => ({
+            to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': ns.platform } }, podSelector: { matchLabels: { app } } }], ports: [{ protocol: 'TCP', port }],
+          })),
+        ],
+      },
+    },
     {
       apiVersion: 'apps/v1', kind: 'Deployment', metadata: meta(OPERATOR_ACCOUNT, OPERATOR_NAMESPACE),
       spec: {
@@ -131,12 +157,15 @@ if (import.meta.main) {
   let map: ReleaseImages | undefined
   try { map = mapFile ? parseReleaseImages(readFileSync(mapFile, 'utf8')) : undefined } catch (e) { console.error(`${mapFile}: ${String(e)}`); process.exit(2) }
   const image = arg('--image') ?? map?.control
-  if (!image) { console.error('usage: install.ts --image <control image> [--images <image map>] [--namespaces <platform>,<computes>,<gateways>,<databases>] [--out <file>] (or --images naming a control image)'); process.exit(2) }
+  if (!image) { console.error('usage: install.ts --image <control image> [--images <image map>] [--namespaces <platform>,<computes>,<gateways>,<databases>] [--api-server <cidr>,...] [--out <file>] (or --images naming a control image)'); process.exit(2) }
   // the Platform's namespaces, when it names its own (its spec.namespaces): the operator's rights on Secrets and exec are bound in them
   const given = arg('--namespaces')?.split(',')
   if (given && given.length !== 4) { console.error('--namespaces is four names: <platform>,<computes>,<gateways>,<databases>'); process.exit(2) }
   const ns = given ? { platform: given[0]!, computes: given[1]!, gateways: given[2]!, databases: given[3]! } : DEFAULT_INSTALL_NAMESPACES
-  const text = `# Peat's install file${map ? ` for release ${map.release}` : ''}. Apply it once, then declare a Platform (see control/examples/).\n${toYaml(installManifests(image, ns, map))}`
+  // where the operator reaches the API server, when the install names it (its endpoint's addresses as CIDRs): any address otherwise
+  const apiServer = arg('--api-server')?.split(',').filter(Boolean)
+  if (apiServer && !apiServer.every((c) => /^[0-9a-fA-F:.]+\/\d{1,3}$/.test(c))) { console.error('--api-server is CIDRs, comma separated, as 192.0.2.10/32,192.0.2.11/32'); process.exit(2) }
+  const text = `# Peat's install file${map ? ` for release ${map.release}` : ''}. Apply it once, then declare a Platform (see control/examples/).\n${toYaml(installManifests(image, ns, map, { ...(apiServer ? { apiServer } : {}) }))}`
   const out = arg('--out')
   if (out) writeFileSync(out, text)
   else process.stdout.write(text)

@@ -26,6 +26,8 @@ beforeEach(() => {
   for (const n of ['machine-1', 'machine-2', 'machine-3']) k.put(node(n))
   k.put(node('other-work', false))
   k.put(storeSecret())
+  // the API server's own endpoint, as every cluster has it
+  k.put({ apiVersion: 'discovery.k8s.io/v1', kind: 'EndpointSlice', metadata: { name: 'kubernetes', namespace: 'default' }, addressType: 'IPv4', endpoints: [{ addresses: ['192.0.2.1'] }], ports: [{ name: 'https', port: 6443, protocol: 'TCP' }] })
 })
 const statusOf = (name = 'peat') => k.get('peat.zabaca.com/v1alpha1', 'platforms', null, name).status
 
@@ -772,5 +774,65 @@ describe('what a first install needs from outside, said with what to do', () => 
     k.put({ apiVersion: 'v1', kind: 'Pod', metadata: { name: 'storage-controller-abc', namespace: 'peat', labels: ctl.spec.selector.matchLabels }, status: { containerStatuses: [{ name: 'storage-controller', image, ready: false, state: { waiting: { reason: 'ImagePullBackOff', message: `Back-off pulling image "${image}": not found` } } }] } })
     await reconcile(k)
     expect(statusOf().message).toContain(`storage-controller (0 of 1 ready: the image ${image} cannot be pulled (ImagePullBackOff: Back-off pulling image "${image}": not found))`)
+  })
+})
+
+describe('the network rules read from the cluster', () => {
+  const pol = (ns: string, name: string) => k.get('networking.k8s.io/v1', 'networkpolicies', ns, name)
+  const egressOn = (ns: string, name: string, port: number) => pol(ns, name).spec.egress.filter((e: any) => e.ports?.some((x: any) => x.port === port))
+  test('the API server at the addresses and port its EndpointSlice names, kept as it changes; the kubelet port at the labelled machines\' addresses', async () => {
+    k.put({ apiVersion: 'discovery.k8s.io/v1', kind: 'EndpointSlice', metadata: { name: 'kubernetes', namespace: 'default' }, addressType: 'IPv4', endpoints: [{ addresses: ['192.0.2.10'], conditions: { ready: true } }, { addresses: ['192.0.2.11'], conditions: { ready: false } }], ports: [{ name: 'https', port: 6443, protocol: 'TCP' }] })
+    for (const [i, n] of ['machine-1', 'machine-2', 'machine-3'].entries()) { const o = k.get('v1', 'nodes', null, n); o.status = { ...o.status, addresses: [{ type: 'InternalIP', address: `198.51.100.${i + 1}` }, { type: 'Hostname', address: n }] } }
+    k.put(platform())
+    await reconcile(k)
+    // every address it lists, the one not ready for a moment too (no rule that drops it and adds it back)
+    const both = [{ ipBlock: { cidr: '192.0.2.10/32' } }, { ipBlock: { cidr: '192.0.2.11/32' } }]
+    expect(egressOn('peat', 'peat-control', 6443)).toEqual([{ to: both, ports: [{ protocol: 'TCP', port: 6443 }] }])
+    expect(egressOn('peat', 'storage-controller', 6443)).toEqual([{ to: both, ports: [{ protocol: 'TCP', port: 6443 }] }])
+    expect(egressOn('peat', 'peat-control', 10250)[0].to).toEqual(['198.51.100.1/32', '198.51.100.2/32', '198.51.100.3/32'].map((cidr) => ({ ipBlock: { cidr } })))
+    // the machine not labelled is not one the control layer probes
+    expect(JSON.stringify(pol('peat', 'peat-control'))).not.toContain('other-work')
+    // the endpoint moves (a control plane machine replaced): the rule follows at the next pass
+    k.get('discovery.k8s.io/v1', 'endpointslices', 'default', 'kubernetes').endpoints = [{ addresses: ['192.0.2.20'], conditions: { ready: true } }]
+    await reconcile(k)
+    expect(egressOn('peat', 'peat-control', 6443)[0].to).toEqual([{ ipBlock: { cidr: '192.0.2.20/32' } }])
+    // the operator's own way out to the store, in its namespace
+    expect(pol('peat-system', 'peat-operator-store').spec.podSelector).toEqual({ matchLabels: { app: 'peat-operator' } })
+  })
+  test('no EndpointSlice to read: any address on 443 and 6443, as before, and the status says so', async () => {
+    k.objects.delete([...k.objects.keys()].find((x) => x.includes('|endpointslices|kubernetes'))!)
+    k.put(platform())
+    await reconcile(k)
+    expect(egressOn('peat', 'peat-control', 6443)).toEqual([{ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: [{ protocol: 'TCP', port: 443 }, { protocol: 'TCP', port: 6443 }] }])
+    expect(statusOf().message).toContain('the pieces reach the API server at any address on 443 and 6443 (no EndpointSlice kubernetes in default to read, and no network.apiServer)')
+  })
+  test('a read of the endpoint that fails (the API server busy) stops the pass: the rules stay as they were, never the broad one', async () => {
+    k.put(platform())
+    await reconcile(k)
+    const before = JSON.stringify(egressOn('peat', 'peat-control', 6443))
+    expect(before).toContain('192.0.2.1/32')
+    k.forced.set('GET /apis/discovery.k8s.io/v1/namespaces/default/endpointslices/kubernetes', { status: 429, json: { message: 'storage is (re)initializing' } })
+    await expect(reconcile(k)).rejects.toThrow("read the API server's endpoint: 429")
+    expect(JSON.stringify(egressOn('peat', 'peat-control', 6443))).toBe(before)
+    k.forced.clear()
+    await reconcile(k)
+    expect(JSON.stringify(egressOn('peat', 'peat-control', 6443))).toBe(before)
+  })
+  test('the install file: a default-deny in the operator\'s namespace and the operator\'s own rules; --api-server narrows its way to the API server; the endpoint read by name only', () => {
+    const m = installManifests('img') as any[]
+    const ofNs = m.filter((x) => x.kind === 'NetworkPolicy' && x.metadata.namespace === 'peat-system')
+    expect(ofNs.map((x) => x.metadata.name).sort()).toEqual(['default-deny', 'peat-operator'])
+    expect(ofNs.find((x) => x.metadata.name === 'default-deny').spec).toEqual({ podSelector: {}, policyTypes: ['Ingress', 'Egress'] })
+    const op = ofNs.find((x) => x.metadata.name === 'peat-operator').spec
+    expect(op.ingress).toEqual([{ ports: [{ protocol: 'TCP', port: 8081 }] }])
+    const to = (port: number) => op.egress.filter((e: any) => e.ports.some((x: any) => x.port === port)).map((e: any) => e.to)
+    expect(to(6443)).toEqual([[{ ipBlock: { cidr: '0.0.0.0/0' } }]])
+    expect(to(53)[0][0].podSelector).toEqual({ matchLabels: { 'k8s-app': 'kube-dns' } })
+    for (const [app, port] of [['storage-controller', 1234], ['pageserver', 9898], ['safekeeper', 7676], ['peat-control', 8080]] as const) expect(to(port)).toEqual([[{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'peat' } }, podSelector: { matchLabels: { app } } }]])
+    const narrowed = (installManifests('img', undefined, undefined, { apiServer: ['192.0.2.10/32'] }) as any[]).find((x) => x.kind === 'NetworkPolicy' && x.metadata.name === 'peat-operator').spec
+    expect(narrowed.egress.find((e: any) => e.ports.some((x: any) => x.port === 6443)).to).toEqual([{ ipBlock: { cidr: '192.0.2.10/32' } }])
+    const role = m.find((x) => x.kind === 'Role' && x.metadata.name === 'peat-operator-api-endpoint')
+    expect(role.metadata.namespace).toBe('default')
+    expect(role.rules).toEqual([{ apiGroups: ['discovery.k8s.io'], resources: ['endpointslices'], resourceNames: ['kubernetes'], verbs: ['get'] }])
   })
 })
