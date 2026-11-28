@@ -99,6 +99,54 @@ each one wrote and the pageservers uploaded to the store is kept; what was writt
 5. Each database is recovered under its own name, `POST /db/<name>/recover` (`?dry=1` first says what it would do): a new timeline
    from the store's last upload, the same name, address and login.
 
+## Install on a real cluster
+
+To try Peat on a laptop first, run `examples/try-it.sh` (about two minutes; the root README says what it needs). For a real cluster:
+
+What the cluster needs:
+
+- **Kubernetes 1.30 or newer** (the operator installs `ValidatingAdmissionPolicy` rules; Peat's own test runs on 1.34). IPv6-only clusters are not supported yet. A cluster whose network plugin enforces `NetworkPolicy` gets the operator's per-piece network rules; one that does not still runs.
+- **Three machines** labelled for the platform (`kubectl label node <node> peat.zabaca.com/machine=true`), each with a local directory for the storage (by default `/var/lib/peat`, which the operator makes) or a storage class instead (`storage.storageClass` under `pageservers` and `safekeepers` in the Platform). The pieces are spread so one machine's loss is survived; the Platform's status says what it survives. Images are built for amd64 and arm64.
+- **An S3-compatible bucket, made beforehand, and a key** for it (one bucket for the whole platform, or one per piece), put in a Secret named in the Platform (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). The operator limits what each piece may reach on the network, with the store by its port: [Installing](#installing) says what that means for a store behind a private address.
+- **cert-manager only if you want it:** by default the platform's own certificate authority signs the databases' certificates; name a cert-manager issuer in `certificates.issuer` to use yours.
+- **To reach databases from outside the cluster:** `gateways.domain` and a wildcard DNS name for it pointing at the front door (a `LoadBalancer` or `NodePort` Service, `gateways.service.type`). Clients check the certificate with the `peat-ca` ConfigMap's authority (`sslmode=verify-full`).
+
+The steps:
+
+```sh
+# 1. The install file: the operator and Peat's two object kinds (Platform and Database).
+#    Once a release is published this is one line (a GitHub release named release-<date> carries peat.yaml):
+kubectl apply --server-side -f https://github.com/Zabaca/peat/releases/download/<release>/peat.yaml
+#    Until then, make the same file from a checkout (Bun needed); <tag> is a release tag or a commit of main whose images are published:
+git clone https://github.com/Zabaca/peat && cd peat/control
+bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl apply --server-side -f -
+
+# 2. The machines, the store's key, the platform.
+kubectl label node <node-1> <node-2> <node-3> peat.zabaca.com/machine=true
+#    Make the bucket first, then put its key in a Secret (the namespace `peat` is made by the install file), both BEFORE the
+#    Platform is applied.
+kubectl -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=<key> --from-literal=AWS_SECRET_ACCESS_KEY=<secret>
+cp examples/platform.yaml my-platform.yaml   # set release (the same <tag> or release name), objectStore, gateways.domain
+kubectl apply -f my-platform.yaml
+kubectl get platform peat -w                  # Installing, then Ready
+kubectl get platform peat -o jsonpath='{.status.message}'   # why, when it is not Ready; .status.pieces lists each piece
+
+# 3. A database.
+bun src/cli/peat.ts make orders              # or apply examples/database.yaml
+bun src/cli/peat.ts url orders               # where to connect; the login is the Secret orders-login
+```
+
+`peat` is the same program as `bun src/cli/peat.ts`; CI also builds it as one file for Linux and macOS and attaches it to each release.
+
+**If the Platform is not Ready:** `kubectl get platform peat -o wide` shows its phase, and its Message column says what it is waiting for (the same text is `.status.message`; `.status.pieces` lists each piece and the release it runs). What the platform needs from outside is checked before anything is made, and a missing one is Failed with the command to run: no machine labelled (`kubectl label node <node> peat.zabaca.com/machine=true`), the `peat-store` Secret missing or lacking a key (`kubectl -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=<key id> --from-literal=AWS_SECRET_ACCESS_KEY=<secret key>`), and, with `certificates.issuer`, cert-manager or the issuer not there. On a first install a bucket that does not exist, or credentials the store refuses, fail the Platform with the store's own error (for example `NoSuchBucket`). A piece that is not ready says why: an image that cannot be pulled (a `release` whose images are not published), a container that cannot start, or a pod that cannot be placed. [Installing](#installing) has the rest.
+
+**Limits to know:**
+
+- **One Platform per cluster**, and the operator takes over nothing it did not make: **adopting an existing install is not supported**.
+- **IPv6-only clusters are not supported** (a pod's address cannot yet be passed to the storage controller as a URL).
+- The images are tagged with a release name or a commit of main; there is no `latest`.
+- `peat.zabaca.com/v1alpha1` is alpha: a field may change between releases, and what a release changes is in its notes once there are any.
+
 ## Installing
 
 The control image is `ghcr.io/zabaca/peat/control`, published with the storage and compute images on every merge to main, tagged with
