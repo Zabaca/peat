@@ -10,6 +10,11 @@ import { PG_VERSIONS } from './storage-spec'
 export const FINALIZER = `${GROUP}/storage`
 /** On a Database the copy of older records writes: the control layer leaves it alone until the copy has written its record. */
 export const COPYING = `${GROUP}/copying`
+/**
+ * On a copy a way back keeps (the version it left): when it is deleted. The copy carries its own time, so a second way back, which names
+ * another copy in the database's status, never leaves the first one kept for good.
+ */
+export const DELETE_AFTER = `${GROUP}/delete-after`
 /** On a drill's Database: the control layer gives it a name beginning `drill`, and deletes its data at once (no hold). */
 export const DRILL = `${GROUP}/drill`
 export const DB_NAME = /^[a-z][a-z0-9-]{0,30}$/

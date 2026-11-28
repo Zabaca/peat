@@ -37,6 +37,11 @@ export const MOVE_EXEC_COMMANDS = [['psql'], ['bash', MOVE_SCRIPT_PATH]] as cons
 export const targetNameOf = (hex: string) => `mv-${hex.slice(0, 12)}`
 /** The name of the old copy a real move leaves: `<name>-pg<old version>`, cut to fit 31 characters. */
 export const oldNameOf = (name: string, from: number) => `${name.slice(0, 31 - `-pg${from}`.length).replace(/-+$/, '')}-pg${from}`
+/**
+ * The names a way back may keep the version it leaves under, in order: `<name>-pg<newer>`, then `-2`, `-3` and on to `-9` (an earlier way
+ * back's copy, kept for its own keepOldFor, holds the first), each cut to fit 31 characters. The first free one is taken.
+ */
+export const newerNamesOf = (name: string, to: number): string[] => ['', ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `-${i}`)].map((n) => `${name.slice(0, 31 - `-pg${to}${n}`.length).replace(/-+$/, '')}-pg${to}${n}`)
 
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`
@@ -260,7 +265,7 @@ export const MOVE_SCRIPT = [
 
 // ---- what the database loop does about a move
 
-export interface MoveStatus { oldTimeline?: string; newerTimeline?: string; newerDatabase?: string; deleteNewerAfter?: string; verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
+export interface MoveStatus { backRefused?: string; oldTimeline?: string; newerTimeline?: string; newerDatabase?: string; deleteNewerAfter?: string; verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
 
 /** A pod of the compute namespace as the grant reads it. */
 export interface ComputePod { name: string; labels: Record<string, string>; deleting: boolean }

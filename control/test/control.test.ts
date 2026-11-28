@@ -257,7 +257,15 @@ describe('who may call which route', () => {
     expect(control).toContain("if (mv.state === 'going-back') return finishMoveBack(ns, name)")
     expect(back).toContain('const steps = backSteps({')
     for (const reads of ['grantExecs', 'localPsql', 'fingerprintSql', 'compareSides', 'WRITES_SQL', 'ROLES_SQL', 'readyPod', 'startCompute']) expect(back, reads).not.toContain(reads)
-    expect(back).toContain('const newer = oldNameOf(name, ')
+    // the version it leaves under the first free name (a second way back's copy beside the first), each copy carrying its own delete time
+    expect(back).toContain('if (!(await getDb(n)) && !records.has(n)) { newer = n; break }')
+    expect(back).toContain('annotations: { [DELETE_AFTER]: mv.deleteNewerAfter }')
+    expect(back).toContain("[COPYING]: 'true', ...(mv.deleteNewerAfter ? { [DELETE_AFTER]: mv.deleteNewerAfter } : {})")
+    // a refusal is in the status's message, in the move's backRefused that the command prints, and in the log
+    expect(back).toContain("move: { backRefused: `${request}: ${why}` }")
+    expect(back).toContain('console.log(`move back ${ns}/${name}: refused: ${why}`)')
+    const due = control.slice(control.indexOf('async function deleteOldCopies'), control.indexOf('// ---- the Database objects'))
+    expect(due).toContain("if (!after || !o.spec?.parent || o.metadata.deletionTimestamp || !(Date.parse(after) <= Date.now())) continue")
     expect(back).toContain('await stopCompute(name, true)')
     expect(back).toContain('what was written since is in ${newer} until ${mv.deleteNewerAfter}')
     const cleanup = control.slice(control.indexOf('async function cleanupMove'), control.indexOf('async function runMove'))

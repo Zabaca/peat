@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exitCodeOf, execPath, frame } from '../src/exec'
-import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, backSteps, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, moveFailure, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
+import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, backSteps, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, moveFailure, newerNamesOf, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
 
 // The move's pure parts: the globals filtered, the two sides compared, the decision of the database loop; and the exec's framing.
 
@@ -179,6 +179,14 @@ describe('names', () => {
     expect(targetNameOf('0123456789abcdef')).toBe('mv-0123456789ab')
     expect(oldNameOf('orders', 18)).toBe('orders-pg18')
     expect(oldNameOf('a'.repeat(31), 18)).toBe(`${'a'.repeat(26)}-pg18`)
+    // a way back's copy: the first name, then -2 to -9, each cut to fit 31 characters and every one a valid database name
+    expect(newerNamesOf('orders', 19).slice(0, 3)).toEqual(['orders-pg19', 'orders-pg19-2', 'orders-pg19-3'])
+    const long = newerNamesOf('a'.repeat(31), 19)
+    expect(long[0]).toBe(`${'a'.repeat(26)}-pg19`)
+    expect(long[1]).toBe(`${'a'.repeat(24)}-pg19-2`)
+    expect(long.length).toBe(9)
+    for (const n of long) expect(n).toMatch(/^[a-z][a-z0-9-]{0,30}$/)
+    expect(newerNamesOf('ab-', 19)[1]).toBe('ab-pg19-2')
     expect(oldNameOf(`${'a'.repeat(25)}-bbbbb`, 18).length).toBeLessThanOrEqual(31)
   })
 })
