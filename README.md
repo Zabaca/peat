@@ -28,7 +28,7 @@ Alpha (`peat.zabaca.com/v1alpha1`). It runs Zabaca's own production databases.
 On a laptop, about two minutes. You need Docker (running), [kind](https://kind.sigs.k8s.io/), `kubectl`, [Bun](https://bun.sh) and `psql`:
 
 ```sh
-git clone --depth 1 https://github.com/Zabaca/peat
+git clone --depth 1 --branch release-2026-11-28 https://github.com/Zabaca/peat
 peat/control/examples/try-it.sh
 ```
 

@@ -141,7 +141,7 @@ The steps (a trial on one machine: `examples/trial.yaml` in place of `examples/p
 kubectl apply --server-side -f https://github.com/Zabaca/peat/releases/download/release-2026-11-28/peat.yaml
 #    (To install a commit of main whose images are published instead, make the file from a checkout, Bun needed:
 #     bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<commit> | kubectl apply --server-side -f - )
-git clone --depth 1 https://github.com/Zabaca/peat && cd peat/control   # for examples/ and the peat command
+git clone --depth 1 --branch release-2026-11-28 https://github.com/Zabaca/peat && cd peat/control   # for examples/ and the peat command
 
 # 2. The machines, the store's key, the platform.
 kubectl label node <node-1> <node-2> <node-3> peat.zabaca.com/machine=true
