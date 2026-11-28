@@ -133,7 +133,12 @@ k -n peat-system rollout status deployment/peat-operator --timeout=180s
 
 echo "== the platform: its namespace and the store's Secret first, then one Platform"
 k get namespace peat >/dev/null 2>&1 || k create namespace peat  # the install file makes it
-k -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=peat-test --from-literal=AWS_SECRET_ACCESS_KEY=peat-test-secret
+store_secret() { k -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=peat-test --from-literal=AWS_SECRET_ACCESS_KEY=peat-test-secret; }
+# a fresh install (no UPGRADE_FROM) meets what a newcomer can get wrong first: the Platform is applied before the store's Secret, and
+# names a bucket the store does not have; each is said in its status with what to do, then put right
+newcomer=''; first_bucket=peat
+if [ -z "${UPGRADE_FROM:-}" ]; then newcomer=1; first_bucket=no-such-bucket; fi
+[ -n "$newcomer" ] || store_secret
 k -n store rollout status deployment/minio --timeout=180s
 if [ "$records" = postgres ]; then
   k -n peat create secret generic records-db --from-literal=uri='postgresql://postgres:peat-test@records-db.store.svc:5432/storage_controller'
@@ -147,7 +152,7 @@ spec:
   release: ${UPGRADE_FROM:-ci}
   images: $(if [ -n "${UPGRADE_FROM:-}" ] || [ -n "$map" ]; then echo "{ control: \"$control\" }"; else echo "{ storage: \"$storage\", control: \"$control\", compute: { \"18\": \"$compute18\", \"19\": \"$compute19\" } }"; fi)
   spread: none
-  objectStore: { endpoint: "http://minio.store.svc:9000", region: us-east-1, bucket: peat, credentialsSecret: peat-store }
+  objectStore: { endpoint: "http://minio.store.svc:9000", region: us-east-1, bucket: $first_bucket, credentialsSecret: peat-store }
   pageservers: { count: 1, storage: { hostPath: { path: /var/lib/peat/pageserver, create: true } } }
   safekeepers: { storage: { hostPath: { path: /var/lib/peat/safekeeper, create: true } } }
   controller: $(if [ "$records" = postgres ]; then echo '{ records: postgres, postgres: { urlSecret: records-db } }'; else echo '{ records: kubernetes }'; fi)
@@ -156,6 +161,23 @@ spec:
   computes: { idleAfter: 1m }
   databases: { deleteHold: 1h }
 EOF
+if [ -n "$newcomer" ]; then
+  echo "== what a first install needs, said with what to do: the store's Secret, then the bucket"
+  says() {  # <what> <text the status message must hold>
+    local t0 m; t0=$(date +%s)
+    until m=$(k get platform peat -o jsonpath='{.status.phase}: {.status.message}' 2>/dev/null) && grep -qF -- "$2" <<< "$m"; do
+      [ "$(since "$t0")" -lt 90 ] || fail "the Platform did not say $1: $m"
+      sleep 2
+    done
+    echo "  $(cut -c1-220 <<< "$m")"
+  }
+  says 'the store Secret is missing' "Failed: the store's Secret peat/peat-store is missing: make it with kubectl -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID="
+  [ -z "$(k -n peat get deploy,sts -o name 2>/dev/null)" ] || fail 'pieces were made before the store Secret was there'
+  store_secret >/dev/null
+  says 'the bucket is not there' "Failed: the store at http://minio.store.svc:9000 answered for the bucket no-such-bucket (with the Secret peat/peat-store): NoSuchBucket"
+  k get platform peat -o jsonpath='{.status.message}' | grep -q 'peat-test-secret' && fail 'the status shows the store secret key'
+  k patch platform peat --type merge -p '{"spec":{"objectStore":{"bucket":"peat"}}}' >/dev/null
+fi
 
 echo "== every piece Ready"
 t0=$(date +%s); phase=''
@@ -328,6 +350,8 @@ if [ -n "$map" ]; then
   got=$(k -n peat-compute get pods -l compute=first -o jsonpath='{.items[0].spec.containers[0].image}')
   [ "$got" = "$compute18" ] || [ "$got" = "$compute19" ] || fail "the first database's compute runs $got, not one of the map's compute images"
 fi
+first_host=$(k get database -A -o jsonpath='{range .items[?(@.metadata.name=="first")]}{.status.host}{end}')
+[ "$first_host" = first.peat-db.svc ] || fail "kubectl get database shows Host '$first_host' for first, not first.peat-db.svc"
 
 if [ "$records" = kubernetes ]; then
   step "the storage controller's pod deleted and made again: the new one leads at its own address, the copy current, a new database attached"

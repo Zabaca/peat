@@ -112,7 +112,19 @@ The usual order, the new release's install file first and then its `release` in 
 4. Apply a Platform (`examples/platform.yaml`, or `examples/trial.yaml` for one machine) and read `kubectl get platform` until it says
    Ready.
 
-`examples/try-it.sh` does exactly this for a person trying Peat, on a throwaway kind cluster with a MinIO store (about two minutes), then makes a
+`kubectl get platform` says Installing as soon as the Platform is taken up, and `kubectl get platform -o wide` (the Message column)
+says what it waits for. What it needs from outside is checked first, and each is Failed with what to do, before any piece is made: no
+machine labelled (the `kubectl label node` command); the store's Secret missing or without `AWS_ACCESS_KEY_ID` or
+`AWS_SECRET_ACCESS_KEY` (the `kubectl create secret` command); with `records: postgres`, the records' Secret; with
+`certificates.issuer`, cert-manager not installed or the issuer not there. On a first install (a platform never yet Ready: its status has
+no `firstReadyAt`), the operator also makes one request to the store for each bucket, all at once; a platform that has been Ready asks the
+store nothing, whatever its phase later (a piece restarting, an upgrade): a bucket the store does not have, or credentials it refuses, fail the Platform with the endpoint,
+the bucket and the store's own error (never the key); a store that does not answer is only logged. A piece that is not ready says why
+its pods are not: an image that cannot be pulled (the image and the pull's error, as for a `release` whose images are not published), a
+container that cannot start or keeps failing, a pod that cannot be placed. `kubectl get database` shows each database's Host: the name
+inside the cluster, or `<name>.<domain>` with `gateways.domain`.
+
+`examples/try-it.sh` does the four steps above for a person trying Peat, on a throwaway kind cluster with a MinIO store (about two minutes), then makes a
 database, writes and reads it with `psql`, puts it to sleep and wakes it by connecting. `.github/peat/install-test.sh` does it for CI, on one too (a one-machine trial with a MinIO store), then makes a
 database, writes and reads it through the front door with `sslmode=verify-full`, puts it to sleep and wakes it by connecting, and has
 the cluster's API server judge the admission rules as the control layer's account. CI runs it on every pull request (this change's

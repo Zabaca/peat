@@ -180,6 +180,7 @@ export const platformStatus: Schema = obj('What the operator found and did.', {
   images: imagesSchema('The images of that release: what the next upgrade starts from.'),
   message: str('What a person reads first.'),
   survives: str("What the platform survives: one machine's loss, or none (spread none)."),
+  firstReadyAt: str('When the platform was first Ready: the checks a first install needs from the store are made only before it.', { format: 'date-time' }),
   namespaces: obj('The namespaces the platform runs in, recorded: a Platform that names others is refused.', { platform: str('The platform namespace.'), computes: str('The computes\' namespace.'), gateways: str('The gateways\' namespace.'), databases: str('The database namespace.') }),
   pieces: list('Every piece and the release it runs.', obj('A piece.', {
     kind: str('Its kind.'), namespace: str('Its namespace.'), name: str('Its name.'),
@@ -234,7 +235,7 @@ export const databaseStatus: Schema = obj('The database as it is.', {
   observedGeneration: int('The generation of the spec this status is about.'),
   phase: str('Creating, Ready (awake or asleep), Closed, Moving, Deleting or Failed.', { enum: ['Creating', 'Ready', 'Closed', 'Moving', 'Deleting', 'Failed'] }),
   message: str('What a person reads first.'),
-  host: str('The name a client connects to from outside the cluster (<name>.<domain>), when the platform has a domain.'),
+  host: str('The name a client connects to: <name>.<domain> when the platform has a domain (from outside the cluster), else the name inside the cluster.'),
   serviceHost: str('The name inside the cluster.'),
   port: int('The port (the front door\'s, 5432).'),
   loginSecret: str('The Secret in this namespace holding its login: username, password, and a connection URL.'),

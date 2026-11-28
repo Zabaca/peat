@@ -71,6 +71,8 @@ export function installManifests(image: string, ns: InstallNamespaces = DEFAULT_
         { apiGroups: ['networking.k8s.io'], resources: ['networkpolicies'], verbs: ALL },
         { apiGroups: ['coordination.k8s.io'], resources: ['leases'], verbs: ALL },
         { apiGroups: ['cert-manager.io'], resources: ['certificates'], verbs: ALL },
+        // the issuer a Platform names (certificates.issuer), read to say when it is not there
+        { apiGroups: ['cert-manager.io'], resources: ['issuers', 'clusterissuers'], verbs: ['get'] },
         { apiGroups: ['rbac.authorization.k8s.io'], resources: ['roles', 'rolebindings', 'clusterroles', 'clusterrolebindings'], verbs: ALL },
         // admission policies: made (a create cannot name its object), then read, changed and removed only by the names of its own
         { apiGroups: ['admissionregistration.k8s.io'], resources: ['validatingadmissionpolicies', 'validatingadmissionpolicybindings'], verbs: ['create'] },

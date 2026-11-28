@@ -10,6 +10,7 @@ import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
 import { ok, pathOf, serverApply, type Kube } from '../kube'
 import { NONCE_ANNOTATION, Owned } from './owned'
 import { issuerCaFindings, keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
+import { issuerProblems, podReasons, secretProblems, storeProblems, type StoreProbe } from './prereqs'
 import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type ReleaseImages, type Resolved } from './platform'
 import { storageOf, type Storage } from './storage'
 import { UNRECORDED, decide, identicalImages, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
@@ -121,13 +122,20 @@ async function pieces(k: Kube, r: Resolved, rendered: Manifest[]): Promise<{ kin
     const ready = (o.status?.readyReplicas ?? 0) >= want && (o.status?.updatedReplicas ?? o.status?.currentReplicas ?? want) >= want
     return { ready, message: ready ? undefined : `${o.status?.readyReplicas ?? 0} of ${want} ready` }
   }
+  // one not ready says why its pods are not, when they say (an image that cannot be pulled, a container that cannot start, a pod not placed)
+  const judged = async (o: any, ns: string) => {
+    const j = judge(o)
+    if (j.ready) return j
+    const why = await podReasons(k, ns, o)
+    return why ? { ready: false, message: `${j.message}: ${why}` } : j
+  }
   for (const m of rendered.filter((x) => x.kind === 'Deployment' || x.kind === 'StatefulSet')) {
     const live = await k.request('GET', pathOf(m))
     if (live.status !== 200) { out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(m), ready: false, message: 'not made yet' }); continue }
-    out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(live.json), ...judge(live.json) })
+    out.push({ kind: m.kind, namespace: m.metadata.namespace!, name: m.metadata.name, release: releaseOf(live.json), ...(await judged(live.json, m.metadata.namespace!)) })
   }
   const sks = await k.request('GET', `/apis/apps/v1/namespaces/${r.names.namespace}/statefulsets?labelSelector=${sel({ 'peat-sk': 'true' })}`)
-  for (const s of (sks.status === 200 ? sks.json.items : []) as any[]) out.push({ kind: 'StatefulSet', namespace: r.names.namespace, name: s.metadata.name, release: releaseOf(s), ...judge(s) })
+  for (const s of (sks.status === 200 ? sks.json.items : []) as any[]) out.push({ kind: 'StatefulSet', namespace: r.names.namespace, name: s.metadata.name, release: releaseOf(s), ...(await judged(s, r.names.namespace)) })
   if (sks.status === 200 && (sks.json.items as any[]).length < r.spec.safekeepers.count) out.push({ kind: 'StatefulSet', namespace: r.names.namespace, name: 'safekeepers', release: r.images.release, ready: false, message: `${(sks.json.items as any[]).length} of ${r.spec.safekeepers.count} safekeepers made (the control layer makes them once it runs)` })
   return out
 }
@@ -215,6 +223,8 @@ export interface Deps {
   now?: () => Date
   /** The image map of the operator's own release (from its install file): the digests of the pieces the Platform does not pin. */
   releaseImages?: ReleaseImages
+  /** One request to the store, for the bucket check of a first install (the operator's pod passes the real one; none: no check). */
+  storeProbe?: StoreProbe
 }
 
 /**
@@ -249,9 +259,13 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const p = ordered[0]!
   for (const other of ordered.slice(1)) await writeStatus(k, other, { phase: 'Failed', message: `a cluster holds one platform: ${p.metadata.name} is the one acted on` })
   const done = async (phase: string, message: string, more: Record<string, unknown> = {}, counts = { applied: 0, pruned: 0, refused: [] as string[] }): Promise<PassResult> => {
-    await writeStatus(k, p, { phase, message, ...more })
+    // the first time it is Ready, kept: from then on it is a platform that has run, never a first install
+    const first = phase === 'Ready' && !(p.status as any)?.firstReadyAt ? { firstReadyAt: now.toISOString() } : {}
+    await writeStatus(k, p, { phase, message, ...more, ...first })
     return { platform: p.metadata.name, phase, message, ...counts }
   }
+  // a Platform just applied says at once that it is taken up (the first pass may take a while before it writes its outcome)
+  if (!(p.status as any)?.phase && !p.spec?.suspend) await writeStatus(k, p, { phase: 'Installing', message: 'taken up: checking what it needs' })
   // a pass that stops before its prune still takes back the move grants no move needs now (they hang on no key and no placement)
   const failed = async (message: string, computeNamespace: string | undefined): Promise<PassResult> => {
     await pruneMoveGrants(k, computeNamespace, p.metadata.name).catch((e) => console.log(`move grants: ${String(e).slice(0, 200)}`))
@@ -329,6 +343,21 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   }
   const rendered0 = render(r, {})
   for (const m of rendered0.filter((x) => x.kind === 'Namespace')) await applyOne(m)
+
+  // what it needs from outside, in the namespaces just made: the Secrets the pieces read, cert-manager and the issuer when one is named,
+  // and, on a first install (never Ready: no first Ready time, no release recorded, no upgrade, which only starts from one), one request
+  // to the store for each bucket (a bucket not found or credentials refused fail it; a store that does not answer is only logged, as it
+  // may pass). A platform that has run asks the store nothing, whatever its phase now (a piece restarting, an upgrade)
+  const secrets = await secretProblems(k, r)
+  const outside = [...secrets.problems, ...(await issuerProblems(k, r))]
+  const st = (p.status ?? {}) as any
+  const firstInstall = !st.firstReadyAt && !st.release && !st.upgrade
+  if (!outside.length && deps.storeProbe && firstInstall) {
+    const store = await storeProblems(r, secrets.creds, deps.storeProbe)
+    outside.push(...store.problems)
+    for (const u of store.unanswered) console.log(`the store check: ${u}`)
+  }
+  if (outside.length) return failed(outside.join('; '), r.names.computeNamespace)
 
   const read = await readKeys(k, r)
   let keys = read.kept

@@ -29,6 +29,10 @@ function parse(path: string): { group: string; ns: string | null; plural: string
   return { group, ns, plural: p[0]!, name: p[1] ?? null, sub: p[2] ?? null }
 }
 
+/** The store's Secret a Platform of the tests names (objectStore.credentialsSecret peat-store), with both keys: what an installer puts in first. */
+export const storeSecret = (name = 'peat-store', ns = 'peat', data: Record<string, string> = { AWS_ACCESS_KEY_ID: 'test-key-id', AWS_SECRET_ACCESS_KEY: 'test-secret-key' }) =>
+  ({ apiVersion: 'v1', kind: 'Secret', metadata: { name, namespace: ns }, data: Object.fromEntries(Object.entries(data).map(([a, v]) => [a, Buffer.from(v).toString('base64')])) })
+
 export class FakeKube implements Kube {
   namespace = 'peat-system'
   readonly objects = new Map<string, any>()

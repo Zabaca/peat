@@ -121,7 +121,7 @@ export function choosePlacements(spec: PlatformSpec, machines: string[], kept: P
   // a machine's zone: the value of safekeepers.zoneLabel on it (its own name with the default kubernetes.io/hostname)
   const zoneOf = (m: string) => zones[m] ?? m
   const sorted = [...machines].sort()
-  if (sorted.length === 0) return { errors: [`no machine carries the label ${spec.machines.label.key}=${spec.machines.label.value}: label the machines the platform may use`] }
+  if (sorted.length === 0) return { errors: [`no machine carries the label ${spec.machines.label.key}=${spec.machines.label.value}: label the machines the platform may use, kubectl label node <node> ${spec.machines.label.key}=${spec.machines.label.value} (${spec.spread === 'none' ? 'one is enough with spread none' : 'three for the default spread, or one with spread none'})`] }
   // what was chosen is kept (the data is on that machine); a count raised adds members on machines not yet used; a count lowered is refused
   const pick = (what: string, count: number, named: string[] | undefined, keptList: { id: number; node: string }[] | undefined, avoid: string[] = []): { id: number; node: string }[] => {
     if (keptList?.length && keptList.length > count) { errors.push(`${what}.count: ${count} is fewer than the ${keptList.length} the platform has; a ${what.replace(/s$/, '')} holds data, so one is removed by hand (drained first), never by lowering the count`); return keptList }
