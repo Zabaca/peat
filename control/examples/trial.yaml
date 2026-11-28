@@ -5,7 +5,7 @@ kind: Platform
 metadata:
   name: peat
 spec:
-  release: release-2026-12-01
+  release: release-2026-12-01   # a release tag, or a commit of main whose images are published (try-it.sh sets this)
   spread: none
   objectStore:
     endpoint: http://minio.minio.svc:9000

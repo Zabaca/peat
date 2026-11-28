@@ -15,8 +15,6 @@ made a setting, and the operator that installs and keeps a whole platform from o
 | The storage's checks | What an upgrade reads between steps (every node active, every shard attached, every secondary warm) and a pageserver's drain and fill. | `src/storage/` |
 | Shared names | Namespaces, the machine label, the dead taint, the API group: neutral defaults, each a setting. | `src/names.ts` |
 
-Still to come in this folder: the move of a database to a newer Postgres major (`peat move` and `pgVersion` raised are refused until then).
-
 ## Upgrades
 
 Changing the Platform's `release` (and its `images`, for an install that pins them) moves the platform one piece at a time: the storage
@@ -114,7 +112,8 @@ The usual order, the new release's install file first and then its `release` in 
 4. Apply a Platform (`examples/platform.yaml`, or `examples/trial.yaml` for one machine) and read `kubectl get platform` until it says
    Ready.
 
-`.github/peat/install-test.sh` does exactly this on a throwaway kind cluster (a one-machine trial with a MinIO store), then makes a
+`examples/try-it.sh` does exactly this for a person trying Peat, on a throwaway kind cluster with a MinIO store (about two minutes), then makes a
+database, writes and reads it with `psql`, puts it to sleep and wakes it by connecting. `.github/peat/install-test.sh` does it for CI, on one too (a one-machine trial with a MinIO store), then makes a
 database, writes and reads it through the front door with `sslmode=verify-full`, puts it to sleep and wakes it by connecting, and has
 the cluster's API server judge the admission rules as the control layer's account. CI runs it on every pull request (this change's
 control image against main's published storage images) and on every merge (that run's images), and publishes nothing a failed run
@@ -295,7 +294,7 @@ kubectl reads them), each change read back until the control layer has answered 
 `peat replica <of> <db>`, `peat stop <db>`, `peat close <db>`, `peat open <db>`, `peat delete <db> --yes`, `peat url <db>`,
 `peat ca [<db>]`, and for the platform `peat status` and `peat retry [<platform>]`. A database is looked up in the kubeconfig context's
 namespace, or `-n`'s; `-A` looks in every namespace and refuses a name more than one holds. A delete and a close name the context and
-server they act on. `peat move` is refused in this release: the release that carries a move out turns it on.
+server they act on.
 
 ## Settings
 

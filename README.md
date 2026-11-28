@@ -1,5 +1,85 @@
 # Peat
 
+**Peat is serverless Postgres storage: [Neon](https://github.com/neondatabase/neon)'s open-source engine, kept current on the newest PostgreSQL releases (18 and 19), with a Kubernetes operator that installs and runs the whole platform from one object.** You declare a `Platform` and a bucket; the operator brings up the storage, the control layer and the front door, and every database after that is one more small object (or one `peat make`).
+
+What it gives you:
+
+- **Databases that sleep and wake.** A database with no clients for a while is stopped (only its compute, never its data); the next connection through the front door wakes it, in seconds.
+- **Branches.** A copy-on-write copy of a database as it is now, made at once and costing only what it later changes.
+- **Restore to a moment.** A new database made from another as it was at a past moment (the history kept is seven days by default), with the original untouched.
+- **An ordered upgrade by changing one name.** Set the Platform's `release` and the operator moves the platform one piece at a time (storage, then each pageserver and safekeeper, the front door, the control layer), checking the whole platform between steps, halting if a check fails, and going back by setting the earlier name again.
+- **A move to a newer Postgres version under the database's own name.** Raise a database's `pgVersion` (18 to 19) and it is copied, compared and switched, keeping its name, address and login, with the old copy held as the way back.
+
+**Status: alpha.** The API is `peat.zabaca.com/v1alpha1` and may change. Zabaca runs its own production databases on Peat (since 2026-11-20; under this operator since 2026-11-27), but it is young, and what its tests do not cover is listed under [Known issues](#known-issues). It is written by AI coding agents (Anthropic's Claude) working for Zabaca, and every change is reviewed by a separate reviewing agent before it merges; "Who maintains and writes it", below, says more.
+
+## Quickstart
+
+### Try it on a laptop (about 2 minutes, one kind cluster to delete afterwards)
+
+You need Docker (running), [kind](https://kind.sigs.k8s.io/), `kubectl`, [Bun](https://bun.sh) and `psql`, and about 4 GB of memory and 5 GB of disk free for Docker (measured on an arm64 Mac: the cluster holds about 1.3 GB of memory and 2 GB of images). Nothing needs signing in; the images are public. It took 104 seconds from the start to a database slept and woken, once kind's own node image (about 1 GB) was downloaded, which is a one-time cost.
+
+```sh
+git clone --depth 1 https://github.com/Zabaca/peat
+peat/control/examples/try-it.sh
+```
+
+The script makes a kind cluster (`peat-try`, with a kubeconfig file of its own: yours is not touched), puts a MinIO in it as the store, installs Peat's operator, applies the one-machine Platform in [`control/examples/trial.yaml`](control/examples/trial.yaml), waits until it is Ready, makes a database, writes 100,000 rows and reads them back with `psql` over TLS checked against the platform's own certificate authority, puts the database to sleep, and wakes it by connecting. It ends by printing how to connect yourself. When you are done: `kind delete cluster --name peat-try`.
+
+A trial survives nothing: its pieces share one machine (`spread: none`), and the Platform's status says so. It is for looking, not for keeping data.
+
+### Install on a real cluster
+
+What the cluster needs:
+
+- **Kubernetes 1.30 or newer** (the operator installs `ValidatingAdmissionPolicy` rules; Peat's own test runs on 1.34). IPv6-only clusters are not supported yet. A cluster whose network plugin enforces `NetworkPolicy` gets the operator's per-piece network rules; one that does not still runs.
+- **Three machines** labelled for the platform (`kubectl label node <node> peat.zabaca.com/machine=true`), each with a local directory for the storage (by default `/var/lib/peat`, which the operator makes) or a storage class instead (`storage.storageClass` under `pageservers` and `safekeepers` in the Platform). The pieces are spread so one machine's loss is survived; the Platform's status says what it survives. Images are built for amd64 and arm64.
+- **An S3-compatible bucket, made beforehand, and a key** for it (one bucket for the whole platform, or one per piece), put in a Secret named in the Platform (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). The operator limits what each piece may reach on the network, with the store by its port: [Installing](control/README.md#installing) says what that means for a store behind a private address.
+- **cert-manager only if you want it:** by default the platform's own certificate authority signs the databases' certificates; name a cert-manager issuer in `certificates.issuer` to use yours.
+- **To reach databases from outside the cluster:** `gateways.domain` and a wildcard DNS name for it pointing at the front door (a `LoadBalancer` or `NodePort` Service, `gateways.service.type`). Clients check the certificate with the `peat-ca` ConfigMap's authority (`sslmode=verify-full`).
+
+The steps:
+
+```sh
+# 1. The install file: the operator and Peat's two object kinds (Platform and Database).
+#    Once a release is published this is one line (a GitHub release named release-<date> carries peat.yaml):
+kubectl apply --server-side -f https://github.com/Zabaca/peat/releases/download/<release>/peat.yaml
+#    Until then, make the same file from a checkout (Bun needed); <tag> is a release tag or a commit of main whose images are published:
+git clone https://github.com/Zabaca/peat && cd peat/control
+bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl apply --server-side -f -
+
+# 2. The machines, the store's key, the platform.
+kubectl label node <node-1> <node-2> <node-3> peat.zabaca.com/machine=true
+#    Make the bucket first, then put its key in a Secret (the namespace `peat` is made by the install file), both BEFORE the
+#    Platform is applied.
+kubectl -n peat create secret generic peat-store --from-literal=AWS_ACCESS_KEY_ID=<key> --from-literal=AWS_SECRET_ACCESS_KEY=<secret>
+cp examples/platform.yaml my-platform.yaml   # set release (the same <tag> or release name), objectStore, gateways.domain
+kubectl apply -f my-platform.yaml
+kubectl get platform peat -w                  # Installing, then Ready
+kubectl get platform peat -o jsonpath='{.status.message}'   # why, when it is not Ready; .status.pieces lists each piece
+
+# 3. A database.
+bun src/cli/peat.ts make orders              # or apply examples/database.yaml
+bun src/cli/peat.ts url orders               # where to connect; the login is the Secret orders-login
+```
+
+`peat` is the same program as `bun src/cli/peat.ts`; CI also builds it as one file for Linux and macOS and attaches it to each release.
+
+### Read on
+
+- [`control/README.md`](control/README.md): the operator and what it does and does not take over, the upgrade, databases (branches, restore to a moment, replicas, deleting and the hold), installing in detail, moving a database to a newer Postgres version, the `peat` command, settings.
+- [`control/examples/`](control/examples): `trial.yaml` (one machine), `platform.yaml` (three), `database.yaml` (a database, a branch, a restore).
+- The drills (`control/src/drills/`, described in `control/README.md`): failure drills a platform can run against itself, such as cut pods, wiped disks, an unreachable store.
+- [`.github/peat/install-test.sh`](.github/peat/install-test.sh): the install test CI runs on every change, which is the quickstart plus the failures it checks for.
+
+### Limits to know
+
+- **One Platform per cluster**, and the operator takes over nothing it did not make: **adopting an existing install is not supported**.
+- **IPv6-only clusters are not supported** (a pod's address cannot yet be passed to the storage controller as a URL).
+- The images are tagged with a release name or a commit of main; there is no `latest`.
+- `peat.zabaca.com/v1alpha1` is alpha: a field may change between releases, and what a release changes is in its notes once there are any.
+
+## How Peat relates to Neon
+
 **Peat is a fork of [Neon](https://github.com/neondatabase/neon)'s open-source code**: Neon's storage for Postgres (pageserver, safekeepers, storage broker, storage controller) and the Postgres extension its computes run, kept running on the latest PostgreSQL release. It is forked from Neon's code as the community fork [`jclab-oss/neon`](https://github.com/jclab-oss/neon) carries it, at that fork's pull request 14 (`ae51d78b121`), which sits on the community fork's `main` (`4f53557c4f6`: its author's seven commits on Neon's own `main`, `fa504217c61` of 2026-08-31); its Postgres tree is forked from Neon's [`neondatabase/postgres`](https://github.com/neondatabase/postgres) at `REL_18_STABLE_neon` (`a616eefea76`). Neon's code is under the Apache License 2.0 and its Postgres trees under the PostgreSQL licence; Peat's changes are under the same licences. **Peat is not affiliated with or endorsed by Neon or Databricks**; "Neon" is their name, and the code it names below is theirs.
 
 **Why it exists:** Neon's open repository stopped taking new PostgreSQL releases in 2025 (its newest vendored Postgres is 17.5, from July 2025). Neon's own Postgres repository went further, with `REL_17_STABLE_neon` at 17.8 and `REL_18_STABLE_neon` at 18.2 (both last changed in April 2026), but Neon's code never took them in; the community fork did (its pull requests 11 and 14), and Peat carries that work on to **Postgres 18.7**, and to **Postgres 19.0**, which is now its default (18 is still supported and tested), and is meant to follow later releases. It is young but deployed: Zabaca runs it in production for its own databases (its data lake and an internal store, on a Kubernetes cluster, since 2026-11-20; the lake moved to Postgres 19 on 2026-11-25, and by 2026-11-26 all of Zabaca's databases on Peat run on 19, and so does the storage controller's own Postgres, a separate Postgres beside Peat). Its own changes are listed below.
@@ -10,7 +90,7 @@
 
 Neon's own README, with its build and local-run instructions, is kept as [NEON-README.md](NEON-README.md); everything in it applies to Peat, with Peat's Postgres 19 (and 18, which is still supported) in place of Neon's 17.
 
-## What it is based on
+### What it is based on
 
 | Piece | Where it comes from |
 |---|---|
@@ -24,7 +104,7 @@ Neon's own README, with its build and local-run instructions, is kept as [NEON-R
 
 Every commit above keeps its original author and hash; the history of both upstream repositories and of the community fork is intact.
 
-## What Peat changed
+### What Peat changed
 
 **In the Postgres 18 tree** (`peat-postgres`, branch `REL_18_STABLE_peat`):
 
@@ -45,11 +125,11 @@ Each commit message says what it fixes and how it was found.
 
 Files Peat changed are the ones in the commits listed here; `git log fa504217c61..` shows every change since Neon's `main` (the community fork's and Peat's), and `git log ae51d78b121..` Peat's alone. Peat also replaced Neon's process files that would misdirect a contributor here (`CONTRIBUTING.md`, the pull request template; `CODEOWNERS`, the issue templates and the CI helpers of the removed workflows deleted) and trimmed Neon's README (`NEON-README.md`).
 
-## A known defect, found and corrected before publishing
+### A known defect, found and corrected before publishing
 
 The first repair of the build failure (item 2 above, in its first form) passed `NULL` for Neon's parent argument. That compiled and passed the test suite, but left the scan's `parent` variable without a value on 18.7's new path: under `SERIALIZABLE` isolation, an index-only scan with no usable keys on an empty B-tree index that races the index's first insert could start its prefetch from an arbitrary block number. Review found it; the published commit (`a9fd4c1bd18`) passes `&parent` and initialises the variable. **No test reaches this path yet; one could be written** by holding a backend inside the race window: with PostgreSQL's injection points (which Neon's build does not enable) or with a debugger, as Neon's suite already does elsewhere. It is a to-do. On the defective code the outcome depended on an uninitialised value, so such a test could not have failed reliably on it; upstream added no test for the race either.
 
-## A defect found after the port, fixed: a read replica and an unlogged relation on 18.7
+### A defect found after the port, fixed: a read replica and an unlogged relation on 18.7
 
 Found by Peat's replica test before publishing and published as a known defect; fixed in Peat's first pull request.
 
@@ -61,7 +141,7 @@ Found by Peat's replica test before publishing and published as a known defect; 
 
 **Tested:** `test_unlogged_init_fork_on_replica` covers an unlogged sequence, an unlogged table's `serial` column and a hash index on an unlogged table, each followed by a replica restart and one more such change replayed after it. On an arm64 Linux machine, release build: before the fix its three cases failed on 18.7 with the error above and passed on 17.8; after it they pass on both. The replica, standby and pg_regress test files (`test_unlogged`, `test_hot_standby`, `test_physical_replication`, `test_physical_and_logical_replicaiton`, `test_replica_promotes`, `test_replica_start`, `test_gin_redo`, `test_pg_regress`: 50 tests) pass on 18.7 and 17.8 with the fix. *Not tested:* identity columns and the other `ALTER SEQUENCE` forms (they reach the same redo). A replica promoted after replaying such a change was tested since: it is a limit Neon already had (next section).
 
-## A known limit, as in Neon: a promoted replica cannot read an unlogged table it replayed
+### A known limit, as in Neon: a promoted replica cannot read an unlogged table it replayed
 
 Found by `test_unlogged_serial_on_promoted_replica` (Peat's, pull request 3); **not fixed, and not Peat's**: it fails the same way on Postgres 17.8 and 18.7 from the same build, whether the replica is promoted with `pg_promote()` or by Neon's own `compute_ctl` (`/promote`).
 
@@ -75,7 +155,7 @@ Found by `test_unlogged_serial_on_promoted_replica` (Peat's, pull request 3); **
 
 The test is a strict expected failure, counted only when the table's own main fork is missing on its first use after the promotion (the read, or the insert after it), and only after the restart has shown the table working again, so a fix, or a change in the limit's shape, fails it. Fixing it is not planned in this piece.
 
-## Postgres 19 (Peat's own work, Peat's default)
+### Postgres 19 (Peat's own work, Peat's default)
 
 **What it is.** PostgreSQL 19.0 (`REL_19_0`, `5c839a2a08b`, 2026-11-16) with Neon's change to Postgres carried onto it: the branch `REL_19_STABLE_peat` of `peat-postgres`, which `vendor/postgres-v19` points at. Neon never ported its Postgres change to 19; the only 19 here is Peat's. **Postgres 19 is Peat's default since 2026-11-26** (a timeline created without a version is 19), after it had been built, tested and published beside 18 and Zabaca's data lake had moved to it (2026-11-25). **Postgres 18 stays fully supported**: the same 18.7 tree, built, tested (the whole suite) and published beside 19, and a timeline that asks for 18 gets it; databases already on 18 stay on 18 until they are copied. A database moves from 18 to 19 by copying it (below), not in place.
 
@@ -109,7 +189,7 @@ The test is a strict expected failure, counted only when the table's own main fo
 **Moving a database from 18 to 19** (measured on the VM, one run each): `pg_dump` with 19's own tools from the 18 compute, restored into a new 19 timeline: a pgbench database of 456 MB in 12.6 s (new database up in about 5 s of it), of 1,503 MB in 19.6 s; its branch, copied as a database of its own, 9.8 s and 17.3 s. Every table's count and a checksum of its contents were equal before and after. **What the move does to history and branches:** the new database's history starts at the end of the copy; the old LSNs mean nothing on it (a branch of it at one of the old numbers is accepted, and holds whatever the new timeline held at that number); a branch becomes a separate database and no longer shares storage with its parent. Restore points have to be taken again. Not tried: `pg_upgrade` of a base backup followed by Neon's timeline import, which could be faster for databases of tens of gigabytes.
 
 
-## Known issues
+### Known issues
 
 - **`existing_initdb_timeline_id` and the version, the narrower fix.** The pageserver now refuses that request without `pg_version` (above). The fuller fix would read the version from the initdb archive itself (its `PG_VERSION`), so a caller could not state the wrong one; not done. The test of the controller's side (`test_existing_initdb_needs_pg_version`) runs with one pageserver, so it does not reach the controller's branch for stale shard-zero locations, which passes the version the same way.
 - **walredo's redo path has no unit test on 18.** The pageserver's two short walredo tests replay WAL records and compare a page that were made on Postgres 14. Run against 18's redo process (once, on a maintainer's temporary VM, with the tests switched to 18 for that run; a transcript is kept in the maintainers' records, not in this repository), it refuses them (`FATAL: failed to decode WAL record: out-of-order block_id 0 at 0/16A9388`), so they are left out of the CI until records and an expected page are made on 18. Its ping and stderr tests run on 18. Redo on 18 is exercised end to end by the regression suite: every page whose WAL includes a Postgres record goes through the redo process (records the pageserver applies itself, Neon's own records such as clearing visibility-map bits, never reach it), under the upstream pg_regress and isolation suites and most of Neon's tests; what is missing is a unit test of the redo request itself.
@@ -117,7 +197,7 @@ The test is a strict expected failure, counted only when the table's own main fo
 - **Slow pageserver shutdown on GitHub's hosted runners.** On the 4-CPU runners a pageserver's shutdown is sometimes slower than the suite allows: it logs `Timed out flushing deletion queue on shutdown` (the pageserver gives that flush a hard-coded 5 seconds; allowed in the suite's log check since pull request 2), and some teardowns fail with "N out of M pageservers failed to stop gracefully". Seen in teardowns of `test_image_layer_compression`, `test_tx_abort_with_many_relations`, `test_pg_regress`, `test_scrubber_physical_gc_ancestors[2]`, `test_slow_secondary_downloads`, `test_truncate` and `test_image_consistent_lsn`; not seen on the 16-vCPU VMs. Tracked here as one item, rather than allowed piece by piece: the next step is to measure shutdown times on the runners, before allowing any more of it.
 - **`test_storage_controller_smoke[...nnnnn]` probably depends on the scheduler's tie-break by utilization (inferred, not shown).** It expects 4 shards on each of three pageservers. The scheduler ranks nodes by availability zone, then affinity, then each pageserver's reported utilization (`storage_controller/src/scheduler.rs`), and in a failed run's controller log the 12 shards landed 4, 3 and 5 across the nodes, so placement can vary with timing on a slow runner. It failed twice in a row on amd64 in two of the three main runs of 2026-11-19, and passed on rerun; it is not tied to the safekeeper code. Not fixed: a fix in the test would change what it asserts. `test_re_attach_with_stuck_secondary` had the same kind of cause (shown, not inferred) and is fixed: it now runs with two availability zones, and in 30 runs each on a hosted runner the old form failed 9 times on amd64 and 10 on arm64, the new form never.
 
-## What has been tested
+### What has been tested
 
 On an arm64 Linux machine, release build, Postgres 18.7, this tree:
 
@@ -130,7 +210,7 @@ On an arm64 Linux machine, release build, Postgres 18.7, this tree:
 - On GitHub's free amd64 runners (`ubuntu-24.04`, 4 vCPU, 16 GB), the same build, Rust tests, suite and images, beside arm64 in one run (Peat CI, run [`44587599664`](https://github.com/Zabaca/peat/actions/runs/44587599664), a manual run of pull request 12's branch): every job passed on both architectures, with no rerun of a job. Rust: 602 and 284 passed on amd64 (283 on arm64: the pageserver has one more test on x86), doctests passed. Regression suite on each of arm64 and amd64: 801 tests passed, 35 skipped and 2 expected failures (the promoted-replica limit above), the same counts as `main`'s last run on arm64. Tests that failed once and passed their rerun: arm64 one (`test_lfc_prewarm_cancel`), amd64 two (`test_pageserver_gc_compaction_interrupt`, `test_graceful_cluster_restart`); two earlier runs of the same code had others (`test_change_pageserver`, `test_storcon_create_delete_sk_down`, `test_slow_secondary_downloads`, `test_timeline_ancestor_detach_idempotent_success`), and one (`test_re_attach_with_stuck_secondary`, a known intermittent, above) failed twice in its shard on both architectures in the first of them, and passed when the job was rerun. With no cache yet, the amd64 build took 34 minutes and arm64's, with its caches, 21; the shards 10 to 14 minutes on either.
 - Not tested: debug and sanitizer builds, the compute image with its extensions. (PostgreSQL 19: the section below.)
 
-## Continuous integration
+### Continuous integration
 
 All of it runs on GitHub's standard hosted runners, free for public repositories, each architecture on its own native runner and never emulated (arm64: `ubuntu-24.04-arm`; amd64: `ubuntu-24.04`; both 4 vCPU and 16 GB of memory; GitHub's page states 14 GB of disk, and the runners Peat has had so far have a 145 GB root filesystem with over 100 GB free); no job needs a machine of the maintainers'. Every job that builds or tests is a pair, arm64 and amd64, judged by the same rule: the same expected failures and skips, no new failure. One architecture failing does not cancel the other's jobs, but the regression shards of both start only when both builds have finished. The workflow is `.github/workflows/peat-ci.yml`, its helpers are in `.github/peat/`.
 
