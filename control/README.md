@@ -90,9 +90,14 @@ The control image is `ghcr.io/zabaca/peat/control`, published with the storage a
 the commit (`.github/peat/control.Dockerfile`; one program, the role named by its first argument: `operator`, `control` or `gateway`).
 
 1. Apply the install file: `bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl apply --server-side -f -`.
+   It makes the platform's four namespaces and binds the operator's narrower rights in them: every right on Secrets there (elsewhere
+   only read, made and patched: each database's login), exec in the compute namespace only (to grant it to a move); it deletes no
+   namespace and changes no admission policy but its own. A Platform that names its own namespaces (`spec.namespaces`) needs the same
+   names here: `--namespaces <platform>,<computes>,<gateways>,<databases>`.
 2. Label the machines the platform may use: `kubectl label node <node> peat.zabaca.com/machine=true` (three for the default spread; one
    for a trial with `spread: none`).
-3. Make the platform namespace (`peat` by default) and put the store's Secret in it (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+3. Put the store's Secret in the platform namespace (`peat` by default, made by the install file): `AWS_ACCESS_KEY_ID`,
+   `AWS_SECRET_ACCESS_KEY`.
 4. Apply a Platform (`examples/platform.yaml`, or `examples/trial.yaml` for one machine) and read `kubectl get platform` until it says
    Ready.
 
