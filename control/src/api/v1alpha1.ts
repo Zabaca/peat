@@ -7,6 +7,8 @@ import type { Window } from '../quiet-hours'
 import { bool, duration, int, list, map, obj, rules, str, type Schema } from './schema'
 
 export { GROUP, VERSION }
+/** An IPv4 or IPv6 range, a.b.c.d/n or x:y::z/n. */
+const CIDR = '^((((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])/([0-9]|[12][0-9]|3[0-2]))|([0-9a-fA-F:]*:[0-9a-fA-F:.]*/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])))$'
 export const API_VERSION = `${GROUP}/${VERSION}`
 export const PG_VERSIONS = [18, 19] as const
 export type PgVersion = (typeof PG_VERSIONS)[number]
@@ -132,6 +134,13 @@ export const platformSpec: Schema = obj('One Peat platform: its storage, its con
       annotations: map('Annotations of the Service (a load balancer\'s settings).'),
     }, { default: { type: 'ClusterIP' } }),
     memory: memory('a gateway', '48Mi', '192Mi'),
+    allowFrom: list("The address ranges a client outside the cluster may reach the front door from, as CIDRs. Default: all (0.0.0.0/0). A pod of the cluster may always reach it. A client's own address is seen only where the way in keeps it (a Service with externalTrafficPolicy Local, or a load balancer that does): through one that does not, every client comes from a machine's address.", str('A CIDR.', { pattern: CIDR }), { default: ['0.0.0.0/0'] }),
+  }, { default: {} }),
+  network: obj('How the pieces reach the cluster itself.', {
+    apiServer: obj("Where the control layer and the storage controller (with records kubernetes) may reach the API server. Default: the addresses and ports of the cluster's own endpoint for it (the EndpointSlice kubernetes in default), read at every pass; given here, these instead (a cluster whose pods reach the API server through another address).", {
+      addresses: list('Its addresses, as CIDRs.', str('A CIDR.', { pattern: CIDR }), { minItems: 1 }),
+      ports: list('Its ports.', int('A port.', { minimum: 1, maximum: 65535 }), { minItems: 1 }),
+    }, { required: ['addresses', 'ports'] }),
   }, { default: {} }),
   certificates: obj("The databases' certificates.", {
     issuer: obj('A cert-manager issuer to sign them; none (the default): the platform\'s own certificate authority signs them. With an issuer, the ConfigMap peat-ca clients verify with carries the authority keys.caSecret names, or is not published (the platform\'s own authority would sign nothing).', {
@@ -286,7 +295,8 @@ export interface PlatformSpec {
   pageservers: { count?: number; machines?: string[]; memory: Memory; storage: Storage }
   safekeepers: { count: 3 | 5; zoneLabel: string; machines?: string[]; outside?: { machines?: string[]; label: { key: string; value: string }; tolerations?: Record<string, unknown>[] }; memory: Memory; storage: Storage }
   controller: { records: 'kubernetes' | 'postgres'; postgres?: { urlSecret: string; key: string }; machine?: string; memory: Memory }
-  gateways: { count: number; domain?: string; service: { type: 'ClusterIP' | 'LoadBalancer' | 'NodePort'; annotations?: Record<string, string> }; memory: Memory }
+  gateways: { count: number; domain?: string; service: { type: 'ClusterIP' | 'LoadBalancer' | 'NodePort'; annotations?: Record<string, string> }; memory: Memory; allowFrom: string[] }
+  network: { apiServer?: { addresses: string[]; ports: number[] } }
   certificates: { issuer?: { name: string; kind: 'Issuer' | 'ClusterIssuer' } }
   computes: { defaultPgVersion: PgVersion; idleAfter: string; memory: Memory; scratch: string }
   databases: { deleteHold: string }

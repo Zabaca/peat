@@ -64,6 +64,11 @@ export interface Resolved {
   names: Names
   images: Images
   store: { endpoint: string; region: string; egressExcept: string[]; pageservers: StoreRef; safekeepers: StoreRef; records: StoreRef; walTrim: string }
+  /**
+   * How the pieces reach the cluster itself: the API server's addresses and ports (the Platform's network.apiServer, else the cluster's own
+   * endpoint for it; none known: any address on 443 and 6443), and the labelled machines' addresses, for the kubelet port (none known: any).
+   */
+  network: { apiServer: { addresses: string[]; ports: number[] }; machines: string[] }
   placements: Placements
   /** What the platform survives, for the status. */
   survives: string
@@ -174,7 +179,12 @@ export function storeEgressExcept(endpoint: string, set?: string[]): string[] {
   return PRIVATE_RANGES
 }
 
-export function resolve(p: Platform, spec: PlatformSpec, placements: Placements, map?: ReleaseImages): Resolved {
+/** What the operator read of the cluster for the network rules: its API server's endpoint and the labelled machines' addresses. */
+export interface ClusterRead { apiServer?: { addresses: string[]; ports: number[] }; machines?: string[] }
+const ANY_API_SERVER = { addresses: ['0.0.0.0/0'], ports: [443, 6443] }
+
+export function resolve(p: Platform, spec: PlatformSpec, placements: Placements, map?: ReleaseImages, cluster: ClusterRead = {}): Resolved {
+  const apiServer = spec.network?.apiServer ?? (cluster.apiServer?.addresses.length && cluster.apiServer.ports.length ? cluster.apiServer : ANY_API_SERVER)
   return {
     name: p.metadata.name,
     spec,
@@ -189,6 +199,7 @@ export function resolve(p: Platform, spec: PlatformSpec, placements: Placements,
       records: storeRef(spec, spec.objectStore.records, 'storage-controller'),
       walTrim: spec.objectStore.walTrim?.credentialsSecret ?? storeRef(spec, spec.objectStore.safekeepers, 'safekeeper').credentialsSecret,
     },
+    network: { apiServer, machines: cluster.machines?.length ? [...cluster.machines].sort() : ['0.0.0.0/0'] },
     placements,
     survives: spec.spread === 'none' ? "no machine's loss: every piece is on one machine (spread none)" : "one machine's loss",
   }

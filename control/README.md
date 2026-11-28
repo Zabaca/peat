@@ -222,9 +222,22 @@ storage controller with its records' copy, the control layer) reach any address 
 100.64.0.0/10) when the endpoint is a public host, so a piece on a machine of a home or office network cannot reach that network's
 devices on that port; and nothing when the endpoint is a cluster Service, a single-label or private name, or a private address, so an
 in-cluster or private-network store keeps working. Set it for a public name that leads to a private address (`[]`), or to ranges of
-your own. What it bounds: the pageservers and the safekeepers. The storage controller and the control layer also reach the API server
-on 443 and 6443 at any address (a rule of their own, which a policy's rules add to), so with a store on 443 the private ranges stay
-reachable for those two on that port until that rule is narrowed.
+your own.
+
+The storage controller (with records kubernetes) and the control layer reach the API server only at the addresses and ports of the
+cluster's own endpoint for it (the EndpointSlice `kubernetes` in `default`, read at every pass, so the rule follows a control plane
+machine replaced), or at `network.apiServer` (`addresses` as CIDRs and `ports`) for a cluster whose pods reach it at another address;
+with neither known, at any address on 443 and 6443. The control layer reaches the kubelet port (10250) of the labelled machines (and
+the outside keepers') only. The front door takes 5432 from any pod of the cluster, and from outside from `gateways.allowFrom` (CIDRs, all
+by default); a client's own address reaches the rule only where the way in keeps it (a Service with `externalTrafficPolicy: Local`, or a
+load balancer that does), and through one that does not every client comes from a machine's address.
+
+The operator's own namespace is closed too, by the install file: a default-deny, and the operator's pod takes only 8081 (its metrics
+and health) and reaches only DNS, the API server (any address on 443 and 6443, or the CIDRs `--api-server` names when the file is made:
+`bun src/install/install.ts ... --api-server 192.0.2.10/32`), and the platform's pieces it reads (the storage controller, the
+pageservers', the safekeepers' and the control layer's APIs, in the platform namespace `--namespaces` names). Its way to the store,
+for a first install's bucket check, is a rule the operator makes from the Platform in its own namespace (`peat-operator-store`), as the
+store's address is the Platform's. The install file reads the API server's endpoint by name only (a Role in `default`).
 
 On upgrade an install with a public store has its store rule narrowed by these ranges; that breaks it only where a public name leads
 to a private address (an S3 interface endpoint with private DNS, a split-horizon MinIO, a private gateway): set

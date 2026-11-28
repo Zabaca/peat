@@ -76,7 +76,10 @@ describe('where the pods run', () => {
   })
   test('every object is in one of the platform\'s four namespaces, or cluster-scoped', () => {
     const nss = new Set(['peat', 'peat-compute', 'peat-gateway', 'peat-db'])
-    for (const m of all) if (m.metadata.namespace) expect([m.kind, m.metadata.name, nss.has(m.metadata.namespace)]).toEqual([m.kind, m.metadata.name, true])
+    // the one exception: the operator's own way out to the store, in the operator's namespace (the install file cannot name the store)
+    const outside = all.filter((m) => m.metadata.namespace && !nss.has(m.metadata.namespace))
+    expect(outside.map((m) => `${m.kind}/${m.metadata.namespace}/${m.metadata.name}`)).toEqual(['NetworkPolicy/peat-system/peat-operator-store'])
+    for (const m of all) if (m.metadata.namespace && m !== outside[0]) expect([m.kind, m.metadata.name, nss.has(m.metadata.namespace)]).toEqual([m.kind, m.metadata.name, true])
     expect(all.filter((m) => !m.metadata.namespace).map((m) => m.kind).sort()).toEqual([
       'ClusterRole', 'ClusterRole', 'ClusterRoleBinding', 'ClusterRoleBinding', 'Namespace', 'Namespace', 'Namespace', 'Namespace',
       ...Array(5).fill('ValidatingAdmissionPolicy'), ...Array(5).fill('ValidatingAdmissionPolicyBinding'),
@@ -219,6 +222,44 @@ describe('the control layer\'s account', () => {
     const pg = render(resolved({ controller: { records: 'postgres', postgres: { urlSecret: 'records-db' } } }), KEPT)
     expect(podOf(named(pg, 'Deployment', 'storage-controller')).automountServiceAccountToken).toBe(false)
     expect(pg.some((m) => m.kind === 'Role' && m.metadata.name === 'storage-controller')).toBe(false)
+  })
+})
+
+describe('the ways out to the cluster itself, and the front door\'s way in', () => {
+  // a store on a port of its own (9000), so that no rule on 443 or 6443 is the store's
+  const p = { apiVersion: 'peat.zabaca.com/v1alpha1', kind: 'Platform', metadata: { name: 'peat' }, spec: { release: 'release-2026-12-01', objectStore: { endpoint: 'https://s3.example.com:9000', bucket: 'peat-data', credentialsSecret: 'peat-store' } } } as unknown as Platform
+  const at = (spec: Record<string, unknown>, cluster: Parameters<typeof resolve>[4]) => {
+    const checked = specOf({ ...p, spec: { ...p.spec, ...spec } } as Platform)
+    if ('errors' in checked) throw new Error(checked.errors.join('; '))
+    const chosen = choosePlacements(checked.spec, MACHINES)
+    if ('errors' in chosen) throw new Error(chosen.errors.join('; '))
+    return render(resolve(p, checked.spec, chosen.placements, undefined, cluster), KEPT)
+  }
+  const egressOf = (ms: Manifest[], name: string, port: number) => named(ms, 'NetworkPolicy', name).spec.egress.filter((e: any) => e.ports?.some((x: any) => x.port === port))
+  test('the API server at its endpoint\'s addresses and ports; the Platform\'s own when it names them; any address on 443 and 6443 when neither is known', () => {
+    const read = at({}, { apiServer: { addresses: ['192.0.2.10/32', '192.0.2.11/32'], ports: [6443] }, machines: ['198.51.100.1/32', '198.51.100.2/32'] })
+    for (const name of ['peat-control', 'storage-controller']) {
+      expect(egressOf(read, name, 6443)).toEqual([{ to: [{ ipBlock: { cidr: '192.0.2.10/32' } }, { ipBlock: { cidr: '192.0.2.11/32' } }], ports: [{ protocol: 'TCP', port: 6443 }] }])
+      expect(egressOf(read, name, 443)).toEqual([])
+    }
+    // the kubelet port of the labelled machines only
+    expect(egressOf(read, 'peat-control', 10250)).toEqual([{ to: [{ ipBlock: { cidr: '198.51.100.1/32' } }, { ipBlock: { cidr: '198.51.100.2/32' } }], ports: [{ protocol: 'TCP', port: 10250 }] }])
+    const own = at({ network: { apiServer: { addresses: ['203.0.113.5/32'], ports: [443] } } }, { apiServer: { addresses: ['192.0.2.10/32'], ports: [6443] } })
+    expect(egressOf(own, 'peat-control', 443)).toEqual([{ to: [{ ipBlock: { cidr: '203.0.113.5/32' } }], ports: [{ protocol: 'TCP', port: 443 }] }])
+    const unknown = at({}, {})
+    expect(egressOf(unknown, 'peat-control', 6443)).toEqual([{ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: [{ protocol: 'TCP', port: 443 }, { protocol: 'TCP', port: 6443 }] }])
+    expect(egressOf(unknown, 'peat-control', 10250)).toEqual([{ to: [{ ipBlock: { cidr: '0.0.0.0/0' } }], ports: [{ protocol: 'TCP', port: 10250 }] }])
+    // records postgres: the controller reaches no API server
+    expect(egressOf(at({ controller: { records: 'postgres', postgres: { urlSecret: 'records-db' } } }, { apiServer: { addresses: ['192.0.2.10/32'], ports: [6443] } }), 'storage-controller', 6443)).toEqual([])
+  })
+  test('the front door from any pod, and from outside from gateways.allowFrom: all by default', () => {
+    const doorOf = (ms: Manifest[]) => named(ms, 'NetworkPolicy', 'peat-gateway').spec.ingress.find((i: any) => i.ports.some((x: any) => x.port === 5432)).from
+    expect(doorOf(at({}, {}))).toEqual([{ namespaceSelector: {} }, { ipBlock: { cidr: '0.0.0.0/0' } }])
+    expect(doorOf(at({ gateways: { allowFrom: ['203.0.113.0/24', '2001:db8::/32'] } }, {}))).toEqual([{ namespaceSelector: {} }, { ipBlock: { cidr: '203.0.113.0/24' } }, { ipBlock: { cidr: '2001:db8::/32' } }])
+  })
+  test('the operator\'s own way out to the store, in its namespace, at the store\'s port less what the store leaves out', () => {
+    const pol = named(at({}, {}), 'NetworkPolicy', 'peat-operator-store', 'peat-system')
+    expect(pol.spec).toEqual({ podSelector: { matchLabels: { app: 'peat-operator' } }, policyTypes: ['Egress'], egress: [{ to: [{ ipBlock: { cidr: '0.0.0.0/0', except: ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10'] } }], ports: [{ protocol: 'TCP', port: 9000 }] }] })
   })
 })
 
