@@ -36,12 +36,27 @@ def test_insert_redo_prune_xid(neon_simple_env: NeonEnv, pg_version: PgVersion):
         cur.execute("create table multi (id int, v text)")
         data = io.StringIO("".join(f"{i}\t{'x' * 100}\n" for i in range(1, ROWS + 1)))
         cur.copy_expert("copy multi from stdin", data)
+    # COPY FREEZE: multi-insert records that set the page all-frozen (the table must be made in
+    # the same transaction)
+    with endpoint.cursor(autocommit=False) as cur:
+        cur.execute("create table frozen (id int, v text)")
+        data = io.StringIO("".join(f"{i}\t{'x' * 100}\n" for i in range(1, ROWS + 1)))
+        cur.copy_expert("copy frozen from stdin with (freeze)", data)
+        cur.connection.commit()
 
     # Every page from the pageserver, rebuilt from the insert records
     endpoint.stop()
     endpoint.start()
 
     with endpoint.cursor() as cur:
+        # An all-frozen page needs no pruning: no mark, and PD_ALL_VISIBLE set (0x0004)
+        cur.execute("select prune_xid::text, flags from page_header(get_raw_page('frozen', 0))")
+        prune_xid, flags = cur.fetchone()
+        assert prune_xid == "0", (
+            f"frozen: the rebuilt all-frozen page is marked prunable ({prune_xid})"
+        )
+        assert flags & 0x0004, f"frozen: the rebuilt all-frozen page lacks PD_ALL_VISIBLE ({flags})"
+
         for table in ["single", "multi"]:
             cur.execute(f"select prune_xid::text from page_header(get_raw_page('{table}', 0))")
             prune_xid = cur.fetchone()[0]
