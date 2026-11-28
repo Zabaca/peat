@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { exitCodeOf, execPath, frame } from '../src/exec'
-import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, backSteps, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, moveFailure, newerNamesOf, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
+import { ROLES_SQL, SETTINGS_COPY_SQL, WRITES_SQL, backSteps, compareSides, dropRolesSql, endOutsideSessionsSql, filterGlobals, fingerprintSql, makeRoleSql, moveAction, moveFailure, freeCopyName, isCopyOf, newerNamesOf, oldNameOf, moveExecPods, outsideSessionsSql, rehearsalVersion, targetNameOf, writtenSince } from '../src/move'
 
 // The move's pure parts: the globals filtered, the two sides compared, the decision of the database loop; and the exec's framing.
 
@@ -187,6 +187,21 @@ describe('names', () => {
     expect(long.length).toBe(9)
     for (const n of long) expect(n).toMatch(/^[a-z][a-z0-9-]{0,30}$/)
     expect(newerNamesOf('ab-', 19)[1]).toBe('ab-pg19-2')
+  })
+  test('a copy\'s name is free only where no Database object holds it, made or not; only this database\'s own copy is taken up on a resume', () => {
+    const obj = (name: string) => ({ metadata: { name } })
+    const names = newerNamesOf('orders', 19)
+    // the first way back's copy (recorded), and a person's Database of the next name, unmade (no record): both hold their names
+    expect(freeCopyName(names, [obj('orders-pg19'), obj('orders-pg19-2')], new Set(['orders-pg19']))).toBe('orders-pg19-3')
+    expect(freeCopyName(['orders-pg18'], [], new Map([['orders-pg18', {}]]))).toBeUndefined()
+    expect(freeCopyName(['orders-pg18'], [], new Set())).toBe('orders-pg18')
+    const marks = ['peat.zabaca.com/copying', 'peat.zabaca.com/delete-after']
+    expect(isCopyOf({ metadata: { annotations: { 'peat.zabaca.com/copying': 'true' } }, spec: { parent: 'orders' } }, 'orders', marks)).toBe(true)
+    expect(isCopyOf({ metadata: { annotations: { 'peat.zabaca.com/delete-after': '2026-12-31T00:00:00Z' } }, spec: { parent: 'orders' } }, 'orders', marks)).toBe(true)
+    // a person's: unmarked, or made from another database
+    expect(isCopyOf({ metadata: {}, spec: { parent: 'orders' } }, 'orders', marks)).toBe(false)
+    expect(isCopyOf({ metadata: { annotations: { 'peat.zabaca.com/copying': 'true' } }, spec: { parent: 'items' } }, 'orders', marks)).toBe(false)
+    expect(isCopyOf(null, 'orders', marks)).toBe(false)
     expect(oldNameOf(`${'a'.repeat(25)}-bbbbb`, 18).length).toBeLessThanOrEqual(31)
   })
 })

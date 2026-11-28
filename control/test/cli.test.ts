@@ -137,6 +137,12 @@ describe('keeping them', () => {
     expect(await peat('move', 'items', '--back')).toBe(0)
     expect(lines.at(-1)).toBe('shop/items: back: back on Postgres 18 as of the move; what was written since is in items-pg19-2')
   })
+  test('a way back asked while a move is under way says it waits for that move', async () => {
+    made('orders', 'shop', { pgVersion: 18 })
+    k.get(DB, 'databases', 'shop', 'orders').status.move = { to: 19, state: 'copying', message: 'moving to Postgres 19' }
+    expect(await peat('move', 'orders', '--back', '--no-wait')).toBe(0)
+    expect(lines[0]).toBe('shop/orders: a move to Postgres 19 is under way (copying): the way back is taken up when it ends')
+  })
   test('a move to a version not above the one it runs is refused before anything is asked', async () => {
     made('orders', 'shop', { pgVersion: 19 })
     expect(await peat('move', 'orders', '--pg', '19')).toBe(1)

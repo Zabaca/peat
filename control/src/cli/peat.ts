@@ -206,6 +206,9 @@ export async function run(argv: string[], deps: { kube?: Kube; out?: Out; everyM
           return ['done', 'back'].includes(String(x.status?.move?.state)) ? 0 : 1
         }
         if (opts['back']) {
+          // a move under way runs to its end first: the way back is taken up then (or refused, if the move left nothing to go back from)
+          const under = o.status?.move ?? {}
+          if (under.state && !moveDone(o) && under.state !== 'going-back') out.line(`${o.metadata.namespace}/${o.metadata.name}${where}: a ${under.rehearsal ? 'rehearsal of the move' : 'move'} to Postgres ${under.to ?? '?'} is under way (${under.state}): the way back is taken up when it ends${wait ? '; waiting for it' : ''}`)
           await patch(o, { spec: { requests: { moveBack: at } } })
           // a refusal is answered at once, whatever the move's state (a move under way, one done): its reason printed, not the move's
           const refusedNow = (y: any) => y.status?.answered?.moveBack === at && String(y.status?.move?.backRefused ?? '').startsWith(`${at}: `)

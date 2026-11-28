@@ -42,6 +42,18 @@ export const oldNameOf = (name: string, from: number) => `${name.slice(0, 31 - `
  * back's copy, kept for its own keepOldFor, holds the first), each cut to fit 31 characters. The first free one is taken.
  */
 export const newerNamesOf = (name: string, to: number): string[] => ['', ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `-${i}`)].map((n) => `${name.slice(0, 31 - `-pg${to}${n}`.length).replace(/-+$/, '')}-pg${to}${n}`)
+/**
+ * The first of names no Database object holds (made or not: a person's object still waiting to be made, or refused, has no record yet but
+ * is theirs) and no record names; undefined when all are held.
+ */
+export const freeCopyName = (names: string[], objects: { metadata: { name: string } }[], recorded: Set<string> | Map<string, unknown>): string | undefined => names.find((n) => !objects.some((o) => o.metadata.name === n) && !recorded.has(n))
+/**
+ * Whether an object of a copy's name is the copy a move or a way back of `parent` began making (a resume finds it): it carries the
+ * marks it is made with (being copied, or its delete time) and is made from that database. Anything else of that name is someone
+ * else's, never made into the copy.
+ */
+export const isCopyOf = (o: { metadata?: { annotations?: Record<string, string> }; spec?: { parent?: string } } | null | undefined, parent: string, marks: string[]): boolean =>
+  Boolean(o && o.spec?.parent === parent && marks.some((m) => o.metadata?.annotations?.[m] !== undefined))
 
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`

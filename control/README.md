@@ -210,10 +210,10 @@ until it is back. It costs what was written since the move: that is in
 hand). The status says so: back on Postgres N as of the move; what was written since is in `<name>-pg<newer>` until a time. It is
 refused only when it cannot be done: no move to go back from (or one under way), the old copy or its timeline gone, or every name for
 the newer copy taken. A second way back (moved, back, forward again, back again) keeps the version it leaves under the next free name,
-`<name>-pg<newer>-2` (then `-3`, up to `-9`), beside the earlier copy; each copy carries its own delete time
+`<name>-pg<newer>-2` (then `-3`, up to `-9`; a name any Database holds, made or not, is passed over), beside the earlier copy; each copy carries its own delete time
 (`peat.zabaca.com/delete-after`), so the earlier one is still deleted when its keep period ends. A refusal is answered at once:
 `peat move <db> --back` prints its reason and exits 1 (it is also the status's message, `status.move.backRefused`, and the control
-layer's log). After a way back `spec.pgVersion` still names the
+layer's log). Asked while a move is under way, it says so and waits: the move runs to its end first. After a way back `spec.pgVersion` still names the
 newer version (the API server refuses to lower it, the guard against an accidental downgrade) while `status.pgVersion` says what runs.
 Moving forward again is a new move from what the database holds now, asked with `requests.retryMove` (`peat move <db> --retry`, or
 `peat move <db> --pg <newer>`, which asks the same when the spec already names that version, as it does after a way back): it
