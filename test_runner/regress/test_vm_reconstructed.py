@@ -99,7 +99,9 @@ def test_vm_reconstructed(neon_env_builder: NeonEnvBuilder, pg_version: PgVersio
         # Changes on some pages, clearing their bits, then the map set again
         cur.execute("delete from t where id between 1000 and 3000 and id % 3 = 0")
         cur.execute("update t set v = 'y' where id between 5000 and 7000 and id % 5 = 0")
-        cur.execute(f"insert into t select g, 'z' from generate_series({ROWS + 1}, {ROWS + 3000}) g")
+        cur.execute(
+            f"insert into t select g, 'z' from generate_series({ROWS + 1}, {ROWS + 3000}) g"
+        )
         set_map(cur)
         cur.execute("delete from t where id between 20000 and 21000")
         cur.execute("update t set v = 'w' where id between 30000 and 30500")
