@@ -4,7 +4,7 @@
 
 ## Why it exists
 
-Neon's open-source repository is no longer kept up in the open: it stopped taking new Postgres releases in 2025. Peat keeps it alive and current. Its changes are written by AI coding agents, and each one is reviewed by a separate reviewing agent before it merges.
+Neon's open-source repository is no longer kept up in the open: it stopped taking new Postgres releases in 2025. Peat keeps it alive and current.
 
 ## What it is
 
