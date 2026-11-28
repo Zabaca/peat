@@ -3,7 +3,11 @@
 // what that account may do, and the operator's Deployment, which runs the control image of the release.
 //
 //   bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> [--out peat.yaml]
+//   bun src/install/install.ts --images images.json [--image <control image>] [--out peat.yaml]
 //
+// `--images` takes a release's image map (images.json, which the publish job writes with each image's digest): the operator runs the
+// map's control image (unless `--image` names another) and is handed the map, so a Platform of that release runs every piece it does not
+// pin by digest. The publish job makes the release's own install file this way.
 // The operator makes every other piece (namespaces, accounts, Roles, admission rules, the storage, the control layer, the gateways), so its
 // account may make those kinds. It holds every rule it grants the pieces' accounts, so it needs neither `bind` nor `escalate`. Narrowed
 // where a default install allows: it deletes no namespace; on Secrets it has get, create and patch cluster-wide (each database's login,
@@ -15,6 +19,7 @@ import { join } from 'node:path'
 import { crds } from '../api/crds'
 import { DEFAULT_NAMES, GROUP } from '../names'
 import { COMPUTE_POLICY, EXEC_SHAPE_POLICY, NODE_POLICY, OPERATOR_NAMESPACE, SERVICE_POLICY, STATEFULSET_POLICY } from '../operator/render'
+import { RELEASE_IMAGES_ENV, parseReleaseImages, type ReleaseImages } from '../operator/platform'
 
 export const OPERATOR_ACCOUNT = 'peat-operator'
 export const OPERATOR_EXEC_POLICY = 'peat-operator-runs-no-exec'
@@ -37,7 +42,7 @@ export const OPERATOR_POLICIES = [NODE_POLICY, STATEFULSET_POLICY, SERVICE_POLIC
 export const SECRETS_ROLE = 'peat-operator-secrets'
 export const EXEC_ROLE = 'peat-operator-exec'
 
-export function installManifests(image: string, ns: InstallNamespaces = DEFAULT_INSTALL_NAMESPACES): Record<string, unknown>[] {
+export function installManifests(image: string, ns: InstallNamespaces = DEFAULT_INSTALL_NAMESPACES, map?: ReleaseImages): Record<string, unknown>[] {
   const meta = (name: string, namespace?: string) => ({ name, ...(namespace ? { namespace } : {}), labels })
   const subject = { kind: 'ServiceAccount', name: OPERATOR_ACCOUNT, namespace: OPERATOR_NAMESPACE }
   const platformNamespaces = [ns.platform, ns.computes, ns.gateways, ns.databases]
@@ -102,7 +107,7 @@ export function installManifests(image: string, ns: InstallNamespaces = DEFAULT_
           securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' } },
           containers: [{
             name: 'operator', image, args: ['operator'],
-            env: [{ name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } }, { name: 'HOME', value: '/tmp' }],
+            env: [{ name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } }, { name: 'HOME', value: '/tmp' }, ...(map ? [{ name: RELEASE_IMAGES_ENV, value: JSON.stringify(map) }] : [])],
             ports: [{ name: 'metrics', containerPort: 8081 }],
             resources: { requests: { cpu: '20m', memory: '64Mi' }, limits: { memory: '256Mi' } },
             securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ['ALL'] } },
@@ -120,13 +125,16 @@ export const toYaml = (docs: Record<string, unknown>[]): string => docs.map((d) 
 
 if (import.meta.main) {
   const arg = (name: string) => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : undefined }
-  const image = arg('--image')
-  if (!image) { console.error('usage: install.ts --image <control image> [--namespaces <platform>,<computes>,<gateways>,<databases>] [--out <file>]'); process.exit(2) }
+  const mapFile = arg('--images')
+  let map: ReleaseImages | undefined
+  try { map = mapFile ? parseReleaseImages(readFileSync(mapFile, 'utf8')) : undefined } catch (e) { console.error(`${mapFile}: ${String(e)}`); process.exit(2) }
+  const image = arg('--image') ?? map?.control
+  if (!image) { console.error('usage: install.ts --image <control image> [--images <image map>] [--namespaces <platform>,<computes>,<gateways>,<databases>] [--out <file>] (or --images naming a control image)'); process.exit(2) }
   // the Platform's namespaces, when it names its own (its spec.namespaces): the operator's rights on Secrets and exec are bound in them
   const given = arg('--namespaces')?.split(',')
   if (given && given.length !== 4) { console.error('--namespaces is four names: <platform>,<computes>,<gateways>,<databases>'); process.exit(2) }
   const ns = given ? { platform: given[0]!, computes: given[1]!, gateways: given[2]!, databases: given[3]! } : DEFAULT_INSTALL_NAMESPACES
-  const text = `# Peat's install file. Apply it once, then declare a Platform (see control/examples/).\n${toYaml(installManifests(image, ns))}`
+  const text = `# Peat's install file${map ? ` for release ${map.release}` : ''}. Apply it once, then declare a Platform (see control/examples/).\n${toYaml(installManifests(image, ns, map))}`
   const out = arg('--out')
   if (out) writeFileSync(out, text)
   else process.stdout.write(text)

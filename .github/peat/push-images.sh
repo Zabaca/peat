@@ -16,8 +16,9 @@
 # A failure before step 4 leaves nothing under any <tag> (the <tag>-<arch> tags may stay:
 # a rerun overwrites them). Expects the checked images loaded as peat-storage:ci-<arch>
 # and peat-compute:ci-<arch> (the publish job compares their IDs with the ones checked)
-# and a registry login. Tested by test-push-images.sh.
-# Usage: [PEAT_IMAGE_NAMES='storage compute-pg18'] push-images.sh <registry path, e.g. ghcr.io/zabaca/peat> <tag>
+# and a registry login. With PEAT_DIGESTS naming a file, a line "<name> <index digest>" is added to it for each name, the index read back
+# under <tag> (image-map.sh makes the release's image map from it). Tested by test-push-images.sh.
+# Usage: [PEAT_IMAGE_NAMES='storage compute-pg18'] [PEAT_DIGESTS=<file>] push-images.sh <registry path, e.g. ghcr.io/zabaca/peat> <tag>
 set -euo pipefail
 dest=$1; tag=$2
 arches=(arm64 amd64)
@@ -105,7 +106,9 @@ done
 
 for name in "${names[@]}"; do
   note=pushed; [ -z "${done_already[$name]:-}" ] || note="already published, unchanged"
+  [[ ${index[$name]} =~ ^sha256:[0-9a-f]{64}$ ]] || fail "$dest/$name:$tag read back with no index digest ('${index[$name]}')"
   echo "$dest/$name:$tag is ${index[$name]}: arm64 ${digest[$name,arm64]}, amd64 ${digest[$name,amd64]} ($note)"
+  [ -z "${PEAT_DIGESTS:-}" ] || echo "$name ${index[$name]}" >> "$PEAT_DIGESTS"
 done
 {
   echo "### Published"

@@ -5,8 +5,9 @@
 # index that would not name one linux/arm64 and one linux/amd64 image (refused before anything is put
 # under the tag); a push that fails for the second image (neither image under the tag),
 # then the rerun that completes; an existing tag that is not an index (refused); storage's
-# index made and compute's not, then the rerun that finishes compute.
-# Needs docker with buildx, curl and jq. Usage: test-push-images.sh
+# index made and compute's not, then the rerun that finishes compute; the digests the publish job keeps and the image map and install
+# file image-map.sh makes from them (each image by its index digest, read back), a rerun's map the same, a digest missing or doubled refused.
+# Needs docker with buildx, curl, jq and bun. Usage: test-push-images.sh
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
@@ -110,4 +111,40 @@ if ! PEAT_IMAGE_NAMES=control run_push t6; then die "publish of control alone"; 
 [ "$(docker buildx imagetools inspect --raw "$reg/control:t6" | jq '.manifests | length')" = 2 ] || die "control:t6 is not two images"
 ! published storage t6 && ! published compute-pg18 t6 || die "a call for control published other images"
 pass "control on its own: two images under the tag, nothing else published"
+# The publish job's three calls with PEAT_DIGESTS, then image-map.sh: the release's image map and install file name each image by the
+# digest of the index under the tag, and each reference reads back from the registry.
+build_images seven
+digests=$work/digests.txt
+PEAT_DIGESTS=$digests run_push t7 || die "publish of t7"
+PEAT_DIGESTS=$digests PEAT_IMAGE_NAMES=compute-pg19 run_push t7 || die "publish of compute-pg19 t7"
+PEAT_DIGESTS=$digests PEAT_IMAGE_NAMES=control run_push t7 || die "publish of control t7"
+for n in storage compute-pg18 compute-pg19 control; do
+  [ "$(awk -v n="$n" '$1 == n { print $2 }' "$digests")" = "$(index_digest "$n" t7)" ] || die "the digests file's $n is not the index under t7: $(cat "$digests")"
+done
+"$here/image-map.sh" "$reg" t7 "$digests" "$work/release" > "$work/out.txt" 2>&1 || die "image-map.sh"
+map=$work/release/images.json
+[ "$(jq -r .release "$map")" = t7 ] && [ "$(jq -r .registry "$map")" = "$reg" ] || die "the image map's release or registry: $(cat "$map")"
+for f in storage control 'compute."18"' 'compute."19"'; do
+  ref=$(jq -r ".$f" "$map")
+  n=$(case $f in storage) echo storage;; control) echo control;; *18*) echo compute-pg18;; *) echo compute-pg19;; esac)
+  [ "$ref" = "$reg/$n:t7@$(index_digest "$n" t7)" ] || die "the image map's $f is $ref, not $n by its index digest"
+  [ "$(docker buildx imagetools inspect --raw "$ref" | jq '.manifests | length')" = 2 ] || die "$ref does not read back as the index"
+done
+grep -q "image: $(jq -r .control "$map")" "$work/release/peat.yaml" || die "the install file does not run the control image by digest"
+grep -q "name: PEAT_RELEASE_IMAGES" "$work/release/peat.yaml" || die "the install file does not hand the operator the image map"
+pass "the image map and the install file: every image by the digest under the tag, each read back"
+# A rerun (every tag already published) writes the same digests again; a map is still made, and the same.
+cp "$map" "$work/first.json"
+PEAT_DIGESTS=$digests run_push t7 || die "rerun of t7"
+"$here/image-map.sh" "$reg" t7 "$digests" "$work/release" > "$work/out.txt" 2>&1 || die "image-map.sh after the rerun"
+cmp -s "$map" "$work/first.json" || die "the rerun's image map differs"
+pass "a rerun: the same digests, the same image map"
+# A digest missing, or two for one name, is no map.
+grep -v '^control ' "$digests" > "$work/missing.txt"
+if "$here/image-map.sh" "$reg" t7 "$work/missing.txt" "$work/bad" > "$work/out.txt" 2>&1; then die "image-map.sh made a map without control's digest"; fi
+grep -q "no single digest for control" "$work/out.txt" || die "a missing digest failed, but not for its reason"
+{ cat "$digests"; echo "storage sha256:$(printf '0%.0s' $(seq 64))"; } > "$work/two.txt"
+if "$here/image-map.sh" "$reg" t7 "$work/two.txt" "$work/bad" > "$work/out.txt" 2>&1; then die "image-map.sh made a map from two storage digests"; fi
+grep -q "no single digest for storage" "$work/out.txt" || die "two digests failed, but not for their reason"
+pass "a digest missing, or two for one image: no map"
 echo "all cases passed"

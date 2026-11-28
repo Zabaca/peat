@@ -49,8 +49,27 @@ export function stepsOf(pageservers: number[], safekeepers: string[]): string[] 
   const sk = [...safekeepers].sort((a, b) => Number(a.replace(/\D/g, '')) - Number(b.replace(/\D/g, '')))
   return ['controller', ...[...pageservers].sort((a, b) => a - b).map(pageserverPiece), ...sk, 'gateways', 'control']
 }
-/** The same images, field by field (a status read back from the API server need not keep the order its fields were written in). */
-export const sameImages = (a: Images, b: Images) => a.storage === b.storage && a.control === b.control && String(a.compute?.[18]) === String(b.compute?.[18]) && String(a.compute?.[19]) === String(b.compute?.[19])
+/**
+ * One image under two names: the same reference, or `x:tag` and `x:tag@sha256:d` (a release's tag and the digest its image map names
+ * for it, as a release's install file has it). Two digests are two images, whatever their tags say (an image pinned anew to mend one).
+ */
+export function sameImage(a: string, b: string): boolean {
+  if (a === b) return true
+  const digest = /@sha256:[0-9a-f]{64}$/
+  if (digest.test(a) === digest.test(b)) return false
+  const [byDigest, byTag] = digest.test(a) ? [a, b] : [b, a]
+  const named = byDigest.replace(digest, '')
+  // a tag: a colon after the last slash (a registry's port is before it)
+  return named === byTag && named.slice(named.lastIndexOf('/') + 1).includes(':')
+}
+/**
+ * The same images, field by field (a status read back from the API server need not keep the order its fields were written in), each by
+ * sameImage: a platform on a release's tags and the same release's digests is on one release, so moving from one to the other is never an
+ * upgrade, and an upgrade by tags under way is not undone by an install file that names the same release by digest.
+ */
+export const sameImages = (a: Images, b: Images) => sameImage(a.storage, b.storage) && sameImage(a.control, b.control) && sameImage(String(a.compute?.[18]), String(b.compute?.[18])) && sameImage(String(a.compute?.[19]), String(b.compute?.[19]))
+/** The very same references: what decides whether a piece's template would change. */
+export const identicalImages = (a: Images, b: Images) => a.storage === b.storage && a.control === b.control && String(a.compute?.[18]) === String(b.compute?.[18]) && String(a.compute?.[19]) === String(b.compute?.[19])
 
 /** Whether the current step's own images have been applied (so it renders at its target). */
 const applied = (p: Phase | undefined) => p !== undefined && p !== 'precheck' && p !== 'draining'

@@ -89,12 +89,24 @@ each one wrote and the pageservers uploaded to the store is kept; what was writt
 The control image is `ghcr.io/zabaca/peat/control`, published with the storage and compute images on every merge to main, tagged with
 the commit (`.github/peat/control.Dockerfile`; one program, the role named by its first argument: `operator`, `control` or `gateway`).
 
-1. Apply the install file: `bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl apply --server-side -f -`.
+A tag can be moved on the registry; a digest names one image. Each publish therefore also makes the release's image map (`images.json`:
+the storage, control and both compute images, each `<image>:<tag>@sha256:<digest>`, the digest of what was just pushed and read back
+under the tag) and its install file (`peat.yaml`) from it, kept as the run's `peat-install` artifact and attached to a `release-*` tag's
+GitHub release (`.github/peat/image-map.sh`). That install file runs the operator by digest and hands it the map (`PEAT_RELEASE_IMAGES`):
+a Platform of that release and registry then runs every image it does not pin by the map's digest, and its status records the digests.
+An image the Platform pins in `images` comes first, and a Platform of another release or registry runs the tags (its status says the
+map is of another release). A tag and its digest are one image: a platform already on the release by tags stays on them (no piece
+restarts) and goes to digests at its next upgrade, and an upgrade by tags under way when the install file lands goes on, never back.
+The usual order, the new release's install file first and then its `release` in the Platform, makes one upgrade, to the digests.
+
+1. Apply the install file: `kubectl apply --server-side -f peat.yaml` with a release's own, or make one:
+   `bun src/install/install.ts --image ghcr.io/zabaca/peat/control:<tag> | kubectl apply --server-side -f -` (add `--images images.json`
+   to make it from an image map; `--image` may then be left out).
    It makes the platform's four namespaces and binds the operator's narrower rights in them: every right on Secrets there (elsewhere
    only read, made and patched: each database's login), exec in the compute namespace only (to grant it to a move); it deletes no
    namespace and changes no admission policy but its own. A Platform that names its own namespaces (`spec.namespaces`) needs the same
-   names here: `--namespaces <platform>,<computes>,<gateways>,<databases>`; a Platform whose namespaces the install does not cover is
-   Failed, its status naming them and the `--namespaces` to install with.
+   names here: `--namespaces <platform>,<computes>,<gateways>,<databases>` (a release's own install file is made for the default ones);
+   a Platform whose namespaces the install does not cover is Failed, its status naming them and the `--namespaces` to install with.
 2. Label the machines the platform may use: `kubectl label node <node> peat.zabaca.com/machine=true` (three for the default spread; one
    for a trial with `spread: none`).
 3. Put the store's Secret in the platform namespace (`peat` by default, made by the install file): `AWS_ACCESS_KEY_ID`,

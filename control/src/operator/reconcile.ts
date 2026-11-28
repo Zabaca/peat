@@ -10,9 +10,9 @@ import { API_VERSION, GROUP, type Platform } from '../api/v1alpha1'
 import { ok, pathOf, serverApply, type Kube } from '../kube'
 import { NONCE_ANNOTATION, Owned } from './owned'
 import { issuerCaFindings, keyProblems, makeMissing, AUTH_PRIVATE, AUTH_PUBLIC, CA_CERT, CA_KEY } from './keys'
-import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type Resolved } from './platform'
+import { choosePlacements, imagesOf, resolve, specOf, type Images, type Placements, type ReleaseImages, type Resolved } from './platform'
 import { storageOf, type Storage } from './storage'
-import { UNRECORDED, decide, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
+import { UNRECORDED, decide, identicalImages, imagesFor, sameImages, stepsOf, type UpgradeState } from './upgrade'
 import { piecesOf, runStep } from './upgrade-run'
 import { differences } from './differences'
 import { COMPUTE_IMAGE_ENV, KEYS_SECRET, MANAGED_BY, OPERATOR, PLATFORM_LABEL, RECORDS_GROUP, RELEASE_ANNOTATION, moveExecGrant, render, type Manifest } from './render'
@@ -210,7 +210,12 @@ const imagesOfPod = (o: any): string[] => [...(o?.spec?.template?.spec?.containe
 
 
 /** One pass. Returns what it did, for the log and the tests. */
-export interface Deps { storage?: (r: Resolved, keys: Record<string, string>) => Storage; now?: () => Date }
+export interface Deps {
+  storage?: (r: Resolved, keys: Record<string, string>) => Storage
+  now?: () => Date
+  /** The image map of the operator's own release (from its install file): the digests of the pieces the Platform does not pin. */
+  releaseImages?: ReleaseImages
+}
 
 /**
  * Takes back each move grant (the Role and RoleBinding peat-move-<database> the operator made in the compute namespace) that no Database's
@@ -283,7 +288,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const zones = Object.fromEntries(machines.nodes.map((n) => [String(n.metadata.name), String(n.metadata?.labels?.[spec.safekeepers.zoneLabel] ?? n.metadata.name)]))
   const chosen = choosePlacements(spec, machines.names, kept, zones)
   if ('errors' in chosen) return failed(chosen.errors.join('; '), spec.namespaces.computes)
-  const r = resolve(p, spec, chosen.placements)
+  const r = resolve(p, spec, chosen.placements, deps.releaseImages)
 
   // the record of what the operator made, in its own namespace; a record that cannot be read stops the pass here
   const owned = await Owned.load(k, k.namespace)
@@ -348,7 +353,7 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   // pieces' images: once any piece runs, a changed release is only ever rendered through the ordered steps
   // (mid-upgrade the release is cleared and the pieces disagree by design: the upgrade's own state says what runs)
   const seeded = status.release || (status.upgrade && !status.upgrade.complete) ? null : await liveImages(k, r)
-  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? (await liveImages(k, r, String(status.release)))?.images ?? imagesOf(spec, String(status.release)) }
+  const running = status.release ? { release: String(status.release), images: (status.images as Images | undefined) ?? (await liveImages(k, r, String(status.release)))?.images ?? imagesOf(spec, String(status.release), deps.releaseImages) }
     : seeded ? { release: sameImages(seeded.images, r.images) ? spec.release : seeded.images.release, images: seeded.images } : undefined
   // why no upgrade may start from what runs: pieces on images that disagree, or images no release records (pin spec.images to them, and
   // the release is recorded under the spec's name)
@@ -369,13 +374,15 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
     stepMessage = work.message
   }
   const live = upgrade && !upgrade.complete ? upgrade : undefined
-  // the images each piece is rendered at: the step's, the finished upgrade's, or, while no upgrade may run, what the pieces run now: a
-  // changed release is never rendered outside the ordered steps
-  const at = decision.kind === 'finish' && !live ? () => decision.images : !live && running && !sameImages(running.images, r.images) ? () => running.images : imagesFor(live, r.images)
+  // the images each piece is rendered at: the step's, the finished upgrade's, or, while no upgrade runs, what the pieces run now: a
+  // changed release is never rendered outside the ordered steps, and a platform on its release's tags stays on them when the operator is
+  // handed the same release's digests (one image under two names: no piece restarts for it; the next upgrade goes to digests)
+  const steady = !live && decision.kind !== 'finish' && running && !identicalImages(running.images, r.images) ? running.images : undefined
+  const at = decision.kind === 'finish' && !live ? () => decision.images : steady ? () => steady : imagesFor(live, r.images)
   // the authority that signs the databases' certificates: with an issuer, only the one keys.caSecret names (none is published otherwise)
   const caPublished = !r.spec.certificates.issuer || Boolean(r.spec.keys.caSecret)
   const pub = await published(k, r, keys, caPublished)
-  const rendered = [...render(r, keys, at, live ? [live.fromImages.storage, live.toImages.storage] : [r.images.storage]), ...pub.manifests]
+  const rendered = [...render(r, keys, at, live ? [live.fromImages.storage, live.toImages.storage] : steady ? [steady.storage, r.images.storage] : [r.images.storage]), ...pub.manifests]
   for (const m of rendered.filter((x) => x.kind !== 'Namespace')) await applyOne(m)
   // a database's status names its copies once they are there: its login written (not a person's own Secret of that name, refused above)
   const loginsWritten = new Set(pub.manifests.filter((m) => m.kind === 'Secret').map(key).filter((k2) => !refused.some((x) => x.startsWith(`${k2} `))))
@@ -421,7 +428,10 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   if (live) return done('Upgrading', `${live.direction === 'forward' ? `${live.from} to ${live.to}` : `back from ${live.to} to ${live.from}`}: ${stepMessage}`, { ...more, ...midway }, counts)
   if (decision.kind === 'finish') return done(notReady.length ? 'Installing' : 'Ready', `the upgrade ${decision.state.direction === 'forward' ? 'to' : 'back to'} ${decision.release} is done: every piece runs it`, { ...more, release: decision.release, images: decision.images }, counts)
   const phase = notReady.length || refused.length || unstartable ? 'Installing' : 'Ready'
-  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
+  // an image map the operator was handed that is not of this Platform's release or registry (the install file of another release): said
+  const map = deps.releaseImages
+  const mapNote = map && (map.release !== spec.release || map.registry !== spec.images.registry.replace(/\/$/, '')) ? `; the operator's image map is of release ${map.release} on ${map.registry}, not ${spec.release} on ${spec.images.registry.replace(/\/$/, '')}: the images it does not pin are the registry's tags` : ''
+  const message = (unstartable ? unstartable : refused.length ? refused[0]! : notReady.length ? `waiting for ${notReady.map((x) => `${x.name}${x.message ? ` (${x.message})` : ''}`).join(', ')}` : `every piece is ready on ${spec.release}`) + mapNote + (read.issuer?.warnings.length ? `; ${read.issuer.warnings.join('; ')}` : '')
   // the release every piece runs, recorded once all are ready on it, whatever is refused: what the next upgrade starts from; never a
   // release no record names, nor images the pieces do not agree on (the images recorded under the release recorded)
   const record = !notReady.length && !status.release && (decision.kind === 'none' || startHeld) && !unstartable && running?.release !== UNRECORDED

@@ -114,7 +114,20 @@ spec: { selector: { app: records-db }, ports: [ { port: 5432 } ] }
 EOF
 
 echo "== the install file"
-(cd "$root/control" && bun src/install/install.ts --image "$control") > "$work/peat.yaml"
+# With the storage and compute images on a registry (no LOAD_IMAGES, no UPGRADE_FROM), the install file is made as the publish job makes a
+# release's: from an image map of their digests (image-map.sh), and the Platform pins only the control image, so every other piece runs
+# by digest from the map the operator is handed. The variables then name the images by digest, as everything after checks them.
+map=''
+if [ -z "${LOAD_IMAGES:-}" ] && [ -z "${UPGRADE_FROM:-}" ] && [[ $storage == */storage:* ]]; then
+  registry=${storage%/storage:*}
+  by_digest() { local d; d=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$1" | jq -r .digest); [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || fail "no digest for $1 on its registry ('$d')"; echo "$1@$d"; }
+  storage=$(by_digest "$storage"); compute18=$(by_digest "$compute18"); compute19=$(by_digest "$compute19")
+  map=$work/images.json
+  jq -n --arg registry "$registry" --arg storage "$storage" --arg c18 "$compute18" --arg c19 "$compute19" \
+    '{release: "ci", registry: $registry, storage: $storage, compute: {"18": $c18, "19": $c19}}' > "$map"
+  echo "  the image map: $(jq -c . "$map")"
+fi
+(cd "$root/control" && bun src/install/install.ts --image "$control" ${map:+--images "$map"}) > "$work/peat.yaml"
 k apply --server-side -f "$work/peat.yaml"
 k -n peat-system rollout status deployment/peat-operator --timeout=180s
 
@@ -132,7 +145,7 @@ kind: Platform
 metadata: { name: peat }
 spec:
   release: ${UPGRADE_FROM:-ci}
-  images: $(if [ -n "${UPGRADE_FROM:-}" ]; then echo "{ control: \"$control\" }"; else echo "{ storage: \"$storage\", control: \"$control\", compute: { \"18\": \"$compute18\", \"19\": \"$compute19\" } }"; fi)
+  images: $(if [ -n "${UPGRADE_FROM:-}" ] || [ -n "$map" ]; then echo "{ control: \"$control\" }"; else echo "{ storage: \"$storage\", control: \"$control\", compute: { \"18\": \"$compute18\", \"19\": \"$compute19\" } }"; fi)
   spread: none
   objectStore: { endpoint: "http://minio.store.svc:9000", region: us-east-1, bucket: peat, credentialsSecret: peat-store }
   pageservers: { count: 1, storage: { hostPath: { path: /var/lib/peat/pageserver, create: true } } }
@@ -155,6 +168,20 @@ done
 ready_s=$(since "$t0")
 echo "  Ready $ready_s s after the Platform was applied; survives: $(k get platform peat -o jsonpath='{.status.survives}')"
 k get platform peat -o jsonpath='{range .status.pieces[*]}{.kind} {.name} {.release} {.ready}{"\n"}{end}'
+
+if [ -n "$map" ]; then
+  echo "== the image map: the pieces the Platform does not pin run by digest"
+  [ -n "$(k -n peat-system get deployment peat-operator -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="PEAT_RELEASE_IMAGES")].value}')" ] || fail 'the operator was not handed the image map'
+  got=$(k -n peat get deployment storage-controller -o jsonpath='{.spec.template.spec.containers[0].image}')
+  [ "$got" = "$storage" ] || fail "the storage controller runs $got, not the map's $storage"
+  got=$(k -n peat get statefulset pageserver-w1 -o jsonpath='{.spec.template.spec.containers[0].image}')
+  [ "$got" = "$storage" ] || fail "the pageserver runs $got, not the map's $storage"
+  control_env() { k -n peat get deployment peat-control -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"; }
+  [ "$(control_env STORAGE_IMAGE)" = "$storage" ] && [ "$(control_env COMPUTE_IMAGE)" = "$compute18" ] && [ "$(control_env COMPUTE_IMAGE_PG19)" = "$compute19" ] \
+    || fail "the control layer is not told the map's images: storage $(control_env STORAGE_IMAGE), 18 $(control_env COMPUTE_IMAGE), 19 $(control_env COMPUTE_IMAGE_PG19)"
+  [ "$(k get platform peat -o jsonpath='{.status.images.storage}')" = "$storage" ] || fail "the status records $(k get platform peat -o jsonpath='{.status.images.storage}'), not the map's storage image"
+  echo "  the storage pieces, the control layer's settings and the status name the storage and compute images by digest"
+fi
 
 echo "== steady: the operator writes nothing to a settled platform"
 # the spec of every object it made (a generation where the kind has one, else the resourceVersion), read twice, three passes apart
@@ -297,6 +324,10 @@ sql 'create table t (id int primary key, payload text)'
 sql "insert into t select g, md5(g::text) from generate_series(1, 100000) g"
 [ "$(sql 'select count(*) from t')" = 100000 ] || fail 'the rows written were not read back'
 echo "  first answer $first_s s after the make; 100000 rows written and read back with verify-full"
+if [ -n "$map" ]; then
+  got=$(k -n peat-compute get pods -l compute=first -o jsonpath='{.items[0].spec.containers[0].image}')
+  [ "$got" = "$compute18" ] || [ "$got" = "$compute19" ] || fail "the first database's compute runs $got, not one of the map's compute images"
+fi
 
 if [ "$records" = kubernetes ]; then
   step "the storage controller's pod deleted and made again: the new one leads at its own address, the copy current, a new database attached"
