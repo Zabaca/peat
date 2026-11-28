@@ -37,6 +37,23 @@ export const MOVE_EXEC_COMMANDS = [['psql'], ['bash', MOVE_SCRIPT_PATH]] as cons
 export const targetNameOf = (hex: string) => `mv-${hex.slice(0, 12)}`
 /** The name of the old copy a real move leaves: `<name>-pg<old version>`, cut to fit 31 characters. */
 export const oldNameOf = (name: string, from: number) => `${name.slice(0, 31 - `-pg${from}`.length).replace(/-+$/, '')}-pg${from}`
+/**
+ * The names a way back may keep the version it leaves under, in order: `<name>-pg<newer>`, then `-2`, `-3` and on to `-9` (an earlier way
+ * back's copy, kept for its own keepOldFor, holds the first), each cut to fit 31 characters. The first free one is taken.
+ */
+export const newerNamesOf = (name: string, to: number): string[] => ['', ...[2, 3, 4, 5, 6, 7, 8, 9].map((i) => `-${i}`)].map((n) => `${name.slice(0, 31 - `-pg${to}${n}`.length).replace(/-+$/, '')}-pg${to}${n}`)
+/**
+ * The first of names no Database object holds (made or not: a person's object still waiting to be made, or refused, has no record yet but
+ * is theirs) and no record names; undefined when all are held.
+ */
+export const freeCopyName = (names: string[], objects: { metadata: { name: string } }[], recorded: Set<string> | Map<string, unknown>): string | undefined => names.find((n) => !objects.some((o) => o.metadata.name === n) && !recorded.has(n))
+/**
+ * Whether an object of a copy's name is the copy a move or a way back of `parent` began making (a resume finds it): it carries the
+ * marks it is made with (being copied, or its delete time) and is made from that database. Anything else of that name is someone
+ * else's, never made into the copy.
+ */
+export const isCopyOf = (o: { metadata?: { annotations?: Record<string, string> }; spec?: { parent?: string } } | null | undefined, parent: string, marks: string[]): boolean =>
+  Boolean(o && o.spec?.parent === parent && marks.some((m) => o.metadata?.annotations?.[m] !== undefined))
 
 const ident = (s: string) => `"${s.replace(/"/g, '""')}"`
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`
@@ -260,7 +277,7 @@ export const MOVE_SCRIPT = [
 
 // ---- what the database loop does about a move
 
-export interface MoveStatus { oldTimeline?: string; newerTimeline?: string; newerDatabase?: string; deleteNewerAfter?: string; verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
+export interface MoveStatus { backRefused?: string; oldTimeline?: string; newerTimeline?: string; newerDatabase?: string; deleteNewerAfter?: string; verify?: 'counts' | 'full'; from?: number; to?: number; rehearsal?: boolean; state?: string; request?: string; target?: string; toTimeline?: string; oldDatabase?: string; startedAt?: string; switchedAt?: string; deleteOldAfter?: string; seconds?: number; equal?: boolean; message?: string; pods?: string[] | null }
 
 /** A pod of the compute namespace as the grant reads it. */
 export interface ComputePod { name: string; labels: Record<string, string>; deleting: boolean }

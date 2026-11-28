@@ -641,10 +641,8 @@ case "$(newsql 'show server_version_num')" in 19*) ;; *) fail 'mv18-pg19 is not 
 k -n peat logs "pod/$new_ctl" --tail=-1 2>/dev/null | grep -q 'move back shop/mv18: back on Postgres 18' || fail "the way back was not finished by the restarted control layer: $(k -n peat logs "pod/$new_ctl" --tail=40 2>&1)"
 echo "  back on 18, finished by the control layer restarted in it (its last pass $(k -n shop get database mv18 -o jsonpath='{.status.move.seconds}') s, $back_s s in all with the hold), as frozen at the move (500 rows); the row written on 19 since is in the kept copy mv18-pg19"
 
-step "a move resumed after the control layer restarts mid-move, then its old copy deleted when keepOldFor ends"
-# asked again by the command as a person would after a way back (its spec still names 19): it asks a retry, never waits on nothing;
-# with a keepOldFor of seconds
-k -n shop patch database mv18 --type merge -p '{"spec":{"keepOldFor":"30s"}}' >/dev/null
+step "a move resumed after the control layer restarts mid-move"
+# asked again by the command as a person would after a way back (its spec still names 19): it asks a retry, never waits on nothing
 peatc move mv18 -n shop --pg 19 --no-wait >/dev/null || fail 'peat move --pg 19 after the way back failed'
 r1=$(k -n shop get database mv18 -o jsonpath='{.spec.requests.retryMove}')
 [ -n "$r1" ] || fail 'peat move --pg 19 after the way back did not ask the move again (requests.retryMove)'
@@ -664,7 +662,38 @@ case "$(mvsql 'show server_version_num')" in 19*) ;; *) fail 'mv18 answers, but 
 settings_kept 'in the resumed move'
 computes_now=$(k -n peat-compute get pods -l app=peat-compute -o name | wc -l | tr -d ' ')
 if k -n peat-compute get deployments -o name | grep -q 'compute-mv-'; then fail "the move left its own compute behind"; fi
-echo "  resumed and done on 19 (computes now: $computes_now); waiting for keepOldFor (30 s) to delete mv18-pg18"
+echo "  resumed and done on 19 (computes now: $computes_now)"
+
+step "a second way back (moved, back, forward again, back again): the version it leaves kept under the next free name, each copy deleted at its own time"
+mvsql 'insert into items values (502, $$written on 19 again$$)'
+# a person's Database of the next name, not made (its parent is not there): it has no record, but the name is theirs and is passed over
+printf 'apiVersion: peat.zabaca.com/v1alpha1\nkind: Database\nmetadata: { name: mv18-pg19-2, namespace: shop }\nspec: { parent: not-made-yet }\n' | k apply -f - >/dev/null
+t0=$(date +%s); until k -n shop get database mv18-pg19-2 -o jsonpath='{.status.message}' 2>/dev/null | grep -q 'no database not-made-yet'; do [ "$(since "$t0")" -lt 60 ] || fail "the person's mv18-pg19-2 was not left waiting: $(k -n shop get database mv18-pg19-2 -o jsonpath='{.status.message}')"; sleep 2; done
+back2=$(peatc move mv18 -n shop --back 2>&1) || fail "the second way back failed: $back2"
+echo "  $(tail -1 <<< "$back2" | cut -c1-200)"
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.move.state}/{.status.pgVersion}/{.status.move.newerDatabase}')" = 'back/18/mv18-pg19-3' ] || fail "the second way back is not back on 18 with mv18-pg19-3 kept (mv18-pg19-2 is a person's): $(k -n shop get database mv18 -o jsonpath='{.status.move.state}/{.status.pgVersion}/{.status.move.newerDatabase}: {.status.message}')"
+first_kept=$(k -n shop get database mv18-pg19 -o json 2>/dev/null | jq -r '.metadata.annotations["peat.zabaca.com/delete-after"] // ""')
+[ -n "$first_kept" ] || fail 'the first way back copy mv18-pg19 is gone, or does not carry its own delete time'
+t0=$(date +%s); until mvsql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'mv18 did not answer after the second way back'; sleep 3; done
+case "$(mvsql 'show server_version_num')" in 18*) ;; *) fail 'mv18 answers, but not on Postgres 18, after the second way back';; esac
+[ "$(mvsql 'select count(*) from items where id > 500')" = 0 ] || fail 'a row written on 19 is on mv18 after the second way back'
+[ -z "$(k -n shop get database mv18-pg19-2 -o jsonpath='{.status.tenant}')" ] && [ "$(k -n shop get database mv18-pg19-2 -o jsonpath='{.spec.parent}')" = not-made-yet ] || fail "the person's mv18-pg19-2 was made into the copy"
+new2sql() { PGPASSWORD="$mv_password" psql "host=mv18-pg19-3.peat-db.svc hostaddr=127.0.0.1 port=15432 user=app dbname=app sslmode=verify-full sslrootcert=$work/shop-ca.crt connect_timeout=30" -XAtq -v ON_ERROR_STOP=1 -c "$1"; }
+t0=$(date +%s); until new2sql 'select 1' >/dev/null 2>&1; do [ "$(since "$t0")" -lt 240 ] || fail 'the second kept copy mv18-pg19-3 did not answer'; sleep 3; done
+[ "$(new2sql 'select note from items where id = 502')" = 'written on 19 again' ] || fail 'the row written on 19 again is not in mv18-pg19-3'
+echo "  back on 18 again, past a person's unmade mv18-pg19-2; the row written on 19 since is in mv18-pg19-3, and mv18-pg19 is kept until $first_kept"
+k -n shop delete database mv18-pg19-2 --wait=false >/dev/null
+# the first copy is no longer named in mv18's status: its own time deletes it
+k -n shop annotate database mv18-pg19 --overwrite peat.zabaca.com/delete-after=2026-01-01T00:00:00Z >/dev/null
+t0=$(date +%s); while k -n shop get database mv18-pg19 >/dev/null 2>&1; do [ "$(since "$t0")" -lt 120 ] || fail 'the first way back copy was not deleted at its own delete time'; sleep 3; done
+k -n shop get database mv18-pg19-3 >/dev/null 2>&1 || fail 'the second way back copy went with the first'
+echo "  mv18-pg19 deleted at its own time; mv18-pg19-3 kept"
+
+step "forward a third time, then its old copy deleted when keepOldFor ends"
+k -n shop patch database mv18 --type merge -p '{"spec":{"keepOldFor":"30s"}}' >/dev/null
+peatc move mv18 -n shop --pg 19 >/dev/null 2>&1 || fail "the third move failed: $(k -n shop get database mv18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
+[ "$(k -n shop get database mv18 -o jsonpath='{.status.pgVersion}/{.status.phase}')" = '19/Ready' ] || fail 'the third move did not leave mv18 Ready on 19'
+echo "  on 19 again; waiting for keepOldFor (30 s) to delete mv18-pg18"
 t0=$(date +%s); while k -n shop get database mv18-pg18 >/dev/null 2>&1; do [ "$(since "$t0")" -lt 180 ] || fail 'the old copy was not deleted after its keepOldFor'; sleep 5; done
 held_old=$(k -n peat get configmap -l peat-held=true -o jsonpath='{range .items[?(@.data.name=="mv18-pg18")]}{.data.deleteAfter}{end}')
 [ -n "$held_old" ] || fail "the old copy's data was not held as a deleted database's"

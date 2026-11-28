@@ -120,6 +120,29 @@ describe('keeping them', () => {
     expect(spec.moveVerify).toBe('full')
     expect(lines.at(-1)).toBe('shop/orders: done: moved to Postgres 19 under its own name')
   })
+  test('a way back answered at once: a refusal prints its reason and exits 1, whatever state the move it would leave is in; a way back done exits 0', async () => {
+    made('orders', 'shop', { pgVersion: 19 })
+    const o = k.get(DB, 'databases', 'shop', 'orders')
+    o.status.move = { to: 19, state: 'done', message: 'moved to Postgres 19 under its own name' }
+    const at = '2026-12-01T12:00:00.000Z'
+    setTimeout(() => { const x = k.get(DB, 'databases', 'shop', 'orders'); x.status.answered = { moveBack: at }; x.status.move.backRefused = `${at}: its old copy orders-pg18 is gone`; x.status.message = `the way back was refused: its old copy orders-pg18 is gone` }, 20)
+    expect(await peat('move', 'orders', '--back')).toBe(1)
+    expect(lines.at(-1)).toBe('shop/orders: the way back was refused: its old copy orders-pg18 is gone')
+    // an earlier request's refusal is not this one's: the way back asked now is followed to its end
+    made('items', 'shop', { pgVersion: 19 })
+    const i = k.get(DB, 'databases', 'shop', 'items')
+    i.status.move = { to: 19, state: 'done', backRefused: '2026-11-30T00:00:00.000Z: an older refusal', message: 'moved to Postgres 19 under its own name' }
+    i.status.answered = { moveBack: '2026-11-30T00:00:00.000Z' }
+    setTimeout(() => { const x = k.get(DB, 'databases', 'shop', 'items'); x.status.answered = { moveBack: at }; x.status.phase = 'Ready'; x.status.move = { ...x.status.move, state: 'back', message: 'back on Postgres 18 as of the move; what was written since is in items-pg19-2' } }, 20)
+    expect(await peat('move', 'items', '--back')).toBe(0)
+    expect(lines.at(-1)).toBe('shop/items: back: back on Postgres 18 as of the move; what was written since is in items-pg19-2')
+  })
+  test('a way back asked while a move is under way says it waits for that move', async () => {
+    made('orders', 'shop', { pgVersion: 18 })
+    k.get(DB, 'databases', 'shop', 'orders').status.move = { to: 19, state: 'copying', message: 'moving to Postgres 19' }
+    expect(await peat('move', 'orders', '--back', '--no-wait')).toBe(0)
+    expect(lines[0]).toBe('shop/orders: a move to Postgres 19 is under way (copying): the way back is taken up when it ends')
+  })
   test('a move to a version not above the one it runs is refused before anything is asked', async () => {
     made('orders', 'shop', { pgVersion: 19 })
     expect(await peat('move', 'orders', '--pg', '19')).toBe(1)

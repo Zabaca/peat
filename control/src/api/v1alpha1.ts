@@ -254,6 +254,7 @@ export const databaseStatus: Schema = obj('The database as it is.', {
     verify: str('How the copy was checked: counts (row counts) or full (every row).', { enum: ['counts', 'full'] }),
     oldDatabase: str('The old copy, kept stopped.'),
     oldTimeline: str('During a way back: the old copy\'s timeline, the one the name goes back to.'), newerTimeline: str('During a way back: the timeline it leaves, kept in the newer copy.'),
+    backRefused: str('The last way back refused: its request and why.'),
     newerDatabase: str('After a way back: the version it left, kept stopped as a database of its own (what was written since the move).'), deleteNewerAfter: str('When that copy is deleted.', { format: 'date-time' }), deleteOldAfter: str('When the old copy is deleted (its data then held as any deleted database\'s).', { format: 'date-time' }),
     message: str('What it found.'),
     pods: list("The pods the control layer asks to exec into for this step (its own compute, the move's target, the old copy): the operator grants exec on those of them that are this database's, while it needs them.", { type: 'string' }),
