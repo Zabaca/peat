@@ -595,9 +595,13 @@ k -n peat logs "pod/$new_ctl" --tail=-1 2>/dev/null | grep -q 'move back shop/mv
 echo "  back on 18, finished by the control layer restarted in it (its last pass $(k -n shop get database mv18 -o jsonpath='{.status.move.seconds}') s, $back_s s in all with the hold), as frozen at the move (500 rows); the row written on 19 since is in the kept copy mv18-pg19"
 
 step "a move resumed after the control layer restarts mid-move, then its old copy deleted when keepOldFor ends"
-# asked again (the move to 19 ended in a way back), with a keepOldFor of seconds
-k -n shop patch database mv18 --type merge -p '{"spec":{"keepOldFor":"30s","requests":{"retryMove":"r1"}}}' >/dev/null
-t0=$(date +%s); until case "$(k -n shop get database mv18 -o jsonpath='{.status.move.request}/{.status.move.state}')" in r1/preparing|r1/copying) true;; *) false;; esac; do
+# asked again by the command as a person would after a way back (its spec still names 19): it asks a retry, never waits on nothing;
+# with a keepOldFor of seconds
+k -n shop patch database mv18 --type merge -p '{"spec":{"keepOldFor":"30s"}}' >/dev/null
+peatc move mv18 -n shop --pg 19 --no-wait >/dev/null || fail 'peat move --pg 19 after the way back failed'
+r1=$(k -n shop get database mv18 -o jsonpath='{.spec.requests.retryMove}')
+[ -n "$r1" ] || fail 'peat move --pg 19 after the way back did not ask the move again (requests.retryMove)'
+t0=$(date +%s); until case "$(k -n shop get database mv18 -o jsonpath='{.status.move.request}/{.status.move.state}')" in "$r1"/preparing|"$r1"/copying) true;; *) false;; esac; do
   [ "$(since "$t0")" -lt 120 ] || fail "the retried move did not start: $(k -n shop get database mv18 -o jsonpath='{.status.move.state}: {.status.move.message}')"
   sleep 1
 done

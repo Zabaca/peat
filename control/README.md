@@ -205,7 +205,8 @@ hand). The status says so: back on Postgres N as of the move; what was written s
 refused only when it cannot be done: no move to go back from (or one under way), the old copy or its timeline gone, or the name
 `<name>-pg<newer>` taken (a kept copy of an earlier way back: delete it first). After a way back `spec.pgVersion` still names the
 newer version (the API server refuses to lower it, the guard against an accidental downgrade) while `status.pgVersion` says what runs.
-Moving forward again is a new move from what the database holds now, asked with `requests.retryMove` (`peat move <db> --retry`): it
+Moving forward again is a new move from what the database holds now, asked with `requests.retryMove` (`peat move <db> --retry`, or
+`peat move <db> --pg <newer>`, which asks the same when the spec already names that version, as it does after a way back): it
 copies the old version's database into a new timeline of the newer one, and does not take up `<name>-pg<newer>`, which stays, with its
 own keep period, beside it. A
 restore of a moved database to a moment before its move is refused, and names the old copy, which holds that history. A replica does
