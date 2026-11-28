@@ -5,7 +5,7 @@ kind: Platform
 metadata:
   name: peat
 spec:
-  release: release-2026-12-01
+  release: release-2026-11-28
   objectStore:
     endpoint: https://s3.example.com
     region: us-east-1
