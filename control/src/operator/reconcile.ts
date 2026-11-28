@@ -264,6 +264,15 @@ export async function reconcile(k: Kube, deps: Deps = {}): Promise<PassResult> {
   const recordedNs = (p.status as any)?.namespaces
   const sameNamespaces = (a: Record<string, string>, b: Record<string, string>) => (['platform', 'computes', 'gateways', 'databases'] as const).every((f) => a[f] === b[f])
   if (recordedNs && !sameNamespaces(recordedNs, spec.namespaces)) return failed(`the namespaces cannot change: the platform runs in ${JSON.stringify(recordedNs)}; set them back`, recordedComputes)
+  // the operator's rights on Secrets (and exec) are bound by the install file in the namespaces its --namespaces named: a Platform of
+  // other namespaces would fail every pass on a refused grant with no reason given, so it is refused here, by the API server's own answer
+  const order = ['platform', 'computes', 'gateways', 'databases'] as const
+  const uncovered: string[] = []
+  for (const f of order) {
+    const review = ok(await k.request('POST', '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews', { apiVersion: 'authorization.k8s.io/v1', kind: 'SelfSubjectAccessReview', spec: { resourceAttributes: { namespace: spec.namespaces[f], verb: 'list', resource: 'secrets' } } }), `ask whether the operator may list the Secrets of ${spec.namespaces[f]}`)
+    if (review.json?.status?.allowed !== true && !uncovered.includes(spec.namespaces[f])) uncovered.push(spec.namespaces[f])
+  }
+  if (uncovered.length) return failed(`the install's --namespaces do not cover ${uncovered.join(', ')}: install with --namespaces ${order.map((f) => spec.namespaces[f]).join(',')}`, recordedComputes)
   // records kubernetes needs the storage controller's record kinds, which come with the storage image that keeps them
   if (spec.controller.records === 'kubernetes') {
     const served = await k.request('GET', `/apis/${RECORDS_GROUP}/v1alpha1`)

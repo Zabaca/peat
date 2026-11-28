@@ -480,6 +480,18 @@ describe('a one-machine trial', () => {
 })
 
 describe('the install file', () => {
+  test('a Platform of namespaces the install did not bind the operator\'s rights in is refused with the flag to install with, and nothing is made', async () => {
+    k.noSecretsIn.add('shop-db')
+    k.put(platform({ namespaces: { databases: 'shop-db' } }))
+    const r = await reconcile(k)
+    expect(r.phase).toBe('Failed')
+    expect(statusOf()).toMatchObject({ phase: 'Failed', message: "the install's --namespaces do not cover shop-db: install with --namespaces peat,peat-compute,peat-gateway,shop-db" })
+    expect(k.all('statefulsets')).toEqual([])
+    expect(k.all('roles')).toEqual([])
+    // the same Platform once the install covers it
+    k.noSecretsIn.delete('shop-db')
+    expect((await reconcile(k)).phase).toBe('Installing')
+  })
   test('the operator holds every right it grants the control layer (the API server refuses to grant one it does not hold)', async () => {
     const m = installManifests('img') as any[]
     const clusterRole = (name: string) => m.find((x) => x.kind === 'ClusterRole' && x.metadata.name === name)
