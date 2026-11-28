@@ -32,7 +32,7 @@ git clone --depth 1 https://github.com/Zabaca/peat
 peat/control/examples/try-it.sh
 ```
 
-It makes a throwaway kind cluster, installs Peat, makes a database, writes and reads it with `psql`, puts it to sleep and wakes it by connecting, then prints how to connect yourself and how to delete the cluster (`kind delete cluster --name peat-try`).
+It makes a throwaway kind cluster, installs the latest release (`release-2026-11-28`), makes a database, writes and reads it with `psql`, puts it to sleep and wakes it by connecting, then prints how to connect yourself and how to delete the cluster and the two small files it keeps in `$TMPDIR` (`kind delete cluster --name peat-try`; the cluster's name is `CLUSTER` if you set it). To run another release: `RELEASE=<release tag, or a commit of main with published images> peat/control/examples/try-it.sh`; to run another Kubernetes version: `NODE_IMAGE=kindest/node:v1.30.13 peat/control/examples/try-it.sh` (releases are listed at [github.com/Zabaca/peat/releases](https://github.com/Zabaca/peat/releases)).
 
 On a real cluster: [Install on a real cluster](control/README.md#install-on-a-real-cluster).
 
