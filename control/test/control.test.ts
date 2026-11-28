@@ -228,6 +228,17 @@ describe('a read replica, reached as any database', () => {
   })
 })
 
+describe("a database's own idle time", () => {
+  test('the rows the gateways read carry its own spec.idleAfter, in whole minutes (at least one), else the platform\'s; for every database the rows list', () => {
+    const idle = control.slice(control.indexOf('const idleMinutesFor'), control.indexOf('function clusterRow'))
+    expect(idle).toContain("if (typeof own !== 'string' || !own) return IDLE_MINUTES")
+    expect(idle).toContain('return String(Math.max(1, Math.round(durationMs(own) / 60_000)))')
+    expect(control).toContain('[SLEEP_IDLE_MINUTES]: idleMinutes,')
+    expect(control).toContain('clusterRow(d, pods, deps.get(d.name), idleMinutesFor(objects.get(d.name)))')
+    expect(control).toContain("idleMinutesFor((await dbObjects()).find((o) => o.metadata.name === name)))")
+  })
+})
+
 describe('who may call which route', () => {
   test('a gateway reaches only what its program calls (never a delete, a restore, the trim, an upgrade or a registration), the safekeepers one question and the storage controller its hook', () => {
     const routes = callerRoutes()

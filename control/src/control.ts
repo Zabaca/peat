@@ -2057,7 +2057,18 @@ async function recoverDatabase(name: string, dry: boolean): Promise<{ status: nu
 
 // ---- what the gateway copy reads: a database as a CloudNativePG "Cluster" (annotations and status), so that the gateway program runs on it as it is
 // A database as a CloudNativePG "Cluster" (annotations and status), built from its record, its Deployment's replicas and its compute pods.
-function clusterRow(d: Db, pods: any[], replicas: number | undefined) {
+/**
+ * A database's idle time in whole minutes, as the gateways read it from its row: its own spec.idleAfter (a primary, a branch or a replica
+ * alike), else the platform's (IDLE_MINUTES, the Platform's computes.idleAfter); at least one. A change to it reaches the gateways at their
+ * next look at the rows, on a database that is awake too.
+ */
+const idleMinutesFor = (o: any): string => {
+  const own = o?.spec?.idleAfter
+  if (typeof own !== 'string' || !own) return IDLE_MINUTES
+  try { return String(Math.max(1, Math.round(durationMs(own) / 60_000))) } catch { return IDLE_MINUTES }
+}
+
+function clusterRow(d: Db, pods: any[], replicas: number | undefined, idleMinutes: string = IDLE_MINUTES) {
   const mine = pods.filter((p) => p.metadata.labels?.compute === d.name && !p.metadata.deletionTimestamp).sort((a, b) => (a.metadata.creationTimestamp < b.metadata.creationTimestamp ? 1 : -1))
   // a pod on a machine that stopped answering still reads Ready until Kubernetes notices (about 50 s): a machine this layer has declared dead does not count
   const pod = mine.find((p) => !nodeStates.get(p.spec?.nodeName)?.dead) ?? mine[0]
@@ -2069,7 +2080,7 @@ function clusterRow(d: Db, pods: any[], replicas: number | undefined) {
       name: d.name,
       // changes whenever a compute is made or removed, so that a sleep decided on an older reading is refused
       resourceVersion: `${pod ? pod.metadata.uid : 'none'}:${ready}:${awake ? 1 : 0}`,
-      annotations: { [SLEEP_ENABLED]: 'true', [SLEEP_IDLE_MINUTES]: IDLE_MINUTES, [HIBERNATION]: awake ? 'off' : 'on' },
+      annotations: { [SLEEP_ENABLED]: 'true', [SLEEP_IDLE_MINUTES]: idleMinutes, [HIBERNATION]: awake ? 'off' : 'on' },
     },
     status: { readyInstances: ready, ...(pod ? { currentPrimary: pod.metadata.name } : {}) },
   }
@@ -2083,7 +2094,8 @@ async function clusters(): Promise<any[]> {
     const dbs = await listDbs()
     const pods = ok(await kube('GET', `/api/v1/namespaces/${CNS}/pods?labelSelector=app%3Dpeat-compute`), 'list pods').json.items as any[]
     const deps = new Map((ok(await kube('GET', `/apis/apps/v1/namespaces/${CNS}/deployments?labelSelector=peat-compute-deploy`), 'list deployments').json.items as any[]).map((x) => [x.metadata.labels.compute as string, x.spec.replicas as number]))
-    return dbs.map((d) => clusterRow(d, pods, deps.get(d.name)))
+    const objects = new Map((await dbObjects()).map((o) => [String(o.metadata.name), o]))
+    return dbs.map((d) => clusterRow(d, pods, deps.get(d.name), idleMinutesFor(objects.get(d.name))))
   })()
   clustersCache = { at: Date.now(), rows }
   rows.catch(() => { if (clustersCache?.rows === rows) clustersCache = undefined })
@@ -2098,7 +2110,7 @@ async function clusterOne(name: string): Promise<any | null> {
     kube('GET', depPath(name)),
   ])
   ok(pods, 'list pods')
-  return clusterRow(d, pods.json.items as any[], dep.status === 200 ? dep.json.spec.replicas : 0)
+  return clusterRow(d, pods.json.items as any[], dep.status === 200 ? dep.json.spec.replicas : 0, idleMinutesFor((await dbObjects()).find((o) => o.metadata.name === name)))
 }
 
 // The routes the gateways listen on, as the Service rows the gateway program reads (it reads Services; here they are built from the database records, so no Service exists per database).
